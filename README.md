@@ -19,7 +19,7 @@
 
 | 角色 | 谁 | 职责 | 工具 |
 | --- | --- | --- | --- |
-| `lead` | 当前 DSH 会话 | 拆解流程、决定下一个执行者、汇总交付；不写业务代码 | `squad_start` / `squad_dispatch` / `squad_status` / `squad_wait` / `squad_finish` |
+| `lead` | 当前 DSH 会话 | 拆解流程、审核并批准 PLAN、决定下一个执行者、汇总交付；不写业务代码 | `squad_start` / `squad_dispatch` / `squad_approve_plan` / `squad_status` / `squad_wait` / `squad_finish` |
 | `brain` | codex | 出方案、实现计划、编号化验收标准；最终逐条验收，只有它能给 approved | `squad_report` |
 | `worker` | zcode / qoder | 按 PLAN 实现、写测试、跑验收命令、记录证据；返工按编号缺陷修复 | `squad_report` |
 
@@ -28,8 +28,9 @@
 ### 预算与上限
 
 - **方案预算**：brain 的计划正文默认 ≤ 80 行，测试数 ≤ `max(6, 验收条数×2)`，除非任务确实更复杂并在 PLAN.md 说明理由。
-- **返工上限**：同一任务最多 6 轮返工；第 7 次 `phase="rework"` 会被 `squad_dispatch` 直接拒绝，Lead 必须停下来向用户报告。
-- **计划预算与返工上限都在角色章程/插件常量里**，可按需调整（`MAX_REWORK_ROUNDS`）。
+- **设计返工上限**：Lead 先审方案再实现——初始设计 + 最多 **3 轮设计返工**（合计 4 次 `phase="design"` 派单），**第 5 次被 `squad_dispatch` 直接拒绝**；与实现返工预算相互独立、分别计数。
+- **实现返工上限**：同一任务最多 **3 轮返工**；**第 4 次** `phase="rework"` 会被 `squad_dispatch` 直接拒绝，Lead 必须停下来向用户报告。
+- **预算常量都在插件常量里**，可按需调整（`MAX_DESIGN_REWORK_ROUNDS` / `MAX_REWORK_ROUNDS`）。
 
 ## 使用
 
@@ -37,14 +38,17 @@
 
 > 用智能体小队把这个需求做掉：……
 
-Lead 的固定流程：
+Lead 的固定流程（**先审方案再实现**）：
 
 1. `squad_start` 建任务与共享记忆；**默认同时创建 worktree + 新分支，并把会话切过去**；
 2. `squad_dispatch(codex, phase=design)` → brain 写 `PLAN.md` 与验收标准；
-3. `squad_dispatch(zcode, phase=implement)` → worker 在 worktree 里实现并写 `REPORT.md`；
-4. `squad_dispatch(codex, phase=review)` → brain 对照 PLAN 逐条验收；
-5. 不通过 → `squad_dispatch(zcode, phase=rework)`：**同一会话**继续，只补缺陷；
-6. brain `approved` 后调用 `squad_finish`：提交 worktree 改动、切回源目录、给出分支与合并命令。
+3. **Lead 审核 `PLAN.md`**：有问题就把编号缺陷派回 brain（`phase="design"` 返工，最多 3 轮）；方案合格后调用 **`squad_approve_plan`** 批准（归档 `PLAN-APPROVED.md`）。有 brain 参与的任务，批准前 `implement`/`rework` 派单会被拒绝；无 brain 任务豁免；
+4. `squad_dispatch(zcode, phase=implement)` → worker 在 worktree 里实现并写 `REPORT.md`；
+5. `squad_dispatch(codex, phase=review)` → brain 对照 PLAN 逐条验收；
+6. 不通过 → `squad_dispatch(zcode, phase=rework)`：**同一会话**继续，只补缺陷；
+7. brain `approved` 后调用 `squad_finish`：提交 worktree 改动、切回源目录、给出分支与合并命令。
+
+> 两种批准相互独立：`squad_approve_plan`（Lead）批准的是**方案**，`REVIEW.md` 的 `VERDICT: APPROVED`（brain）批准的是**实现**；前者不能替代后者，收尾仍只认 brain 验收。
 
 ## Worktree 分支开发（默认开启）
 
@@ -195,7 +199,7 @@ token：GLM implement 26,295 / rework 26,459（cache 主导）；Codex 设计 + 
 - `role`：`brain` | `worker`（可编辑字段保存在设置文件；bundle 只作 seed 与 charter/context 补充）。
 - **worktree 始终启用**（无开关）：每次 `squad_start` 以 Git 元数据（git-dir/git-common-dir）判断，已在 linked worktree 内则复用当前 checkout，否则在 `<仓库>/<设置目录>/squad-<任务号>` 创建新分支；非 Git 仓库或普通创建失败才退回原地开发并在结果中说明。目录切换失败会显式恢复源目录，恢复失败则 start 直接停止。
 - **运行中不重派**：目标（本地子代理或 team 队友）处于 running/provisioning 时拒绝再次派单或切换执行方式，避免同时保留两个活动执行者；空闲时同绑定续跑、改绑定（模型/执行方式）则下一次新建。
-- **验收门禁快照**：任务建立时把"是否需要 brain 验收"写入 STATE；此后修改角色不能绕过该任务的 REVIEW 要求。
+- **验收门禁快照**：任务建立时把"是否需要 brain 验收"与"是否需要 Lead 批准 PLAN"（`planRequired`）写入 STATE；此后修改角色不能绕过该任务的 REVIEW 要求或 PLAN 批准门禁。
 - `worktreeAutoCommit`：默认 `true`；设为 `false` 则 `squad_finish` 只收尾、不提交，改动留在 worktree 里。
 - `provider`：DSH subagent provider 名。留空时 `fork → fork`、`fresh → spawn`（进程内 DeepSeek 智能体）。装了 `@deepseek-ai/dsh-subagent-acp` 之类的 provider 后，可把 codex / zcode / qoder 分别指到真实的本地 CLI：
 
@@ -215,12 +219,24 @@ token：GLM implement 26,295 / rework 26,459（cache 主导）；Codex 设计 + 
 ├── current.json              # 当前任务指针
 └── t-<id>/
     ├── TASK.md               # 目标 / 验收标准 / 约束 / 成员（Lead 写）
+    ├── BRIEF.md              # 每次派单重写的一次性简报（外部 agent 必读）
     ├── PLAN.md               # 方案 + 编号验收标准（brain 写）
+    ├── PLAN-R<n>.md          # 第 n 次设计的方案归档（1–4）
+    ├── PLAN-APPROVED.md      # Lead 批准时的方案定稿归档（squad_approve_plan 写）
     ├── REVIEW.md             # 逐条验收结论 + 证据（brain 写）
+    ├── REVIEW-R<round>.md    # 每轮验收归档
     ├── REPORT.md             # 改动 / 命令 / 测试证据（worker 写）
     ├── JOURNAL.md            # 追加式流水（所有人写）
-    └── STATE.json            # phase / round / dispatch 记录
+    ├── STATE.json            # phase / round / planRequired / planRounds / planApproved / dispatch 记录
+    └── FINAL.md              # 收尾摘要（squad_finish 写）
 ```
+
+### PLAN 归档与门禁
+
+- **external 执行者**：每次成功的 design 派单在返回前同步读取 `PLAN.md` 并归档为 `PLAN-R<n>.md`（n = 派单前 planRounds + 1）；归档失败会显式报错（说明已派单）、planRounds 不增加、不自动重派。
+- **local / team 执行者**：design 派单投递成功即计数写 STATE，不逐轮归档；仅在 `squad_approve_plan` 批准时把当前 PLAN.md 补归档为当前轮次 `PLAN-R<n>.md`（已存在的历史归档不改写）。
+- **设计预算**：初始设计 + 3 轮返工 = 4 次成功 design 派单；第 5 次拒绝。PLAN 已批准后 design 一律拒绝。
+- **实现门禁**：`planRequired`（任务建立时按参与者是否含 brain 快照，之后改角色不生效）且未批准时，implement/rework 在写 BRIEF/STATE/调用执行器之前即被拒绝，错误信息指向 `squad_approve_plan`；无 brain 任务豁免。旧 STATE 无这些字段时按验收门禁快照回退（gate 显式 false 才豁免），不按当前 roster 放宽。
 
 每次派单的消息只带任务号、阶段、轮次、目录和本轮任务，不复制历史对话；队友先读文件再动手。这样跨 agent 的“共享记忆”是可审计的文件，而不是互相复制的 transcript。
 
@@ -234,9 +250,10 @@ token：GLM implement 26,295 / rework 26,459（cache 主导）；Codex 设计 + 
 
 | 工具 | 调用者 | 作用 |
 | --- | --- | --- |
-| `squad_start` | Lead | 建任务、写 TASK.md/JOURNAL.md、设为 current |
-| `squad_dispatch` | Lead | 首次创建 / 之后续跑指定队友，推进 phase 与 round |
-| `squad_status` | Lead | 任务、阶段、轮次、成员状态、记忆文件、最近派单 |
+| `squad_start` | Lead | 建任务、写 TASK.md/JOURNAL.md、快照 plan 门禁（planRequired/planRounds/planApproved）、设为 current |
+| `squad_dispatch` | Lead | 首次创建 / 之后续跑指定队友，推进 phase 与 round；design 受 4 次预算与已批准限制，implement/rework 受 PLAN 批准门禁 |
+| `squad_approve_plan` | Lead（仅 Lead 可见） | 审核通过 PLAN.md：补归档当前轮次 `PLAN-R<n>.md`，写 `PLAN-APPROVED.md` 与 `planApproved`/`planApprovedAt`；缺 PLAN、已收尾或已批准时拒绝 |
+| `squad_status` | Lead | 任务、阶段、轮次、PLAN 门禁（planRequired / planRounds/4 / planApproved / planApprovedAt）、成员状态、记忆文件、最近派单 |
 | `squad_wait` | Lead | 有界阻塞等待团队变化（通常不需要，报告会唤醒 Lead） |
 | `squad_finish` | Lead | 校验无队友运行 + brain approved，提交 worktree，切回源目录，写 FINAL.md |
 | `squad_report` | brain / worker | 把结果、阻塞或验收结论发回 Lead 并写 JOURNAL |

@@ -18,6 +18,12 @@ window.__ModuleLoader__.load({
       subtitle: '配置三个小队成员与 worktree 目录。保存后立即对下一次派单生效。',
       flowTitle: '执行流程',
       flowLead: 'Lead（当前会话）',
+      flowLeadSub: 'design → 审核 PLAN → implement → review',
+      flowPlanReview: 'Lead 审核 PLAN',
+      flowPlanReviewSub: 'squad_approve_plan 批准',
+      flowDesign: 'design',
+      flowPlanLoop: '设计返工 ≤3 轮（第 4 次设计为止）',
+      flowApprove: '批准 → implement',
       flowExternal: '外部一次性',
       flowLocal: '本地可续跑',
       flowTeam: 'Team 可续跑',
@@ -85,6 +91,12 @@ window.__ModuleLoader__.load({
       subtitle: 'Configure the three squad members and the worktree directory. Saves apply to the next dispatch.',
       flowTitle: 'Pipeline',
       flowLead: 'Lead (this session)',
+      flowLeadSub: 'design → review plan → implement → review',
+      flowPlanReview: 'Lead reviews PLAN',
+      flowPlanReviewSub: 'approve via squad_approve_plan',
+      flowDesign: 'design',
+      flowPlanLoop: 'design rework ≤3 rounds (4 dispatches max)',
+      flowApprove: 'approve → implement',
       flowExternal: 'external · one-shot',
       flowLocal: 'local · continuable',
       flowTeam: 'team · continuable',
@@ -214,14 +226,22 @@ window.__ModuleLoader__.load({
     function Topology({ draft, t }) {
       const mode = (agent) =>
         agent.executor === 'external' ? t.flowExternal : agent.executor === 'local' ? t.flowLocal : t.flowTeam
-      const nodes = draft.agents
-      const labels = nodes.map((agent) => `${agent.displayName} · ${agent.role}`)
+      // The first brain sits on the top row (design target); the rest below.
+      const brainIndex = draft.agents.findIndex((agent) => agent.role === 'brain')
+      const nodes = [...draft.agents]
+      if (brainIndex > 0) {
+        nodes.splice(brainIndex, 1)
+        nodes.unshift(draft.agents[brainIndex])
+      }
+      const rowY = (index) => 18 + index * 56
       const sub = nodes.map((agent) => mode(agent))
+      const lastY = rowY(nodes.length - 1)
+      const planLabelY = 160
       return h(
         'svg',
         {
           className: 'asq-svg',
-          viewBox: '0 0 640 190',
+          viewBox: '0 0 760 230',
           role: 'img',
           'aria-label': t.flowTitle,
         },
@@ -230,23 +250,42 @@ window.__ModuleLoader__.load({
           orient: 'auto', markerUnits: 'strokeWidth',
         }, h('path', { d: 'M0,0 L8,4 L0,8 z', fill: 'var(--dsw-alias-label-secondary)' }))),
         // Lead node
-        h('rect', { x: 16, y: 65, width: 130, height: 60, rx: 8, fill: 'var(--dsw-alias-interactive-bg-hover)', stroke: 'var(--dsw-alias-border-l2)' }),
-        h('text', { x: 81, y: 90, textAnchor: 'middle', fontSize: 13, fill: 'var(--dsw-alias-text-primary)' }, t.flowLead),
-        h('text', { x: 81, y: 108, textAnchor: 'middle', fontSize: 10, fill: 'var(--dsw-alias-label-secondary)' }, 'design → implement → review'),
+        h('rect', { x: 16, y: 18, width: 150, height: 50, rx: 8, fill: 'var(--dsw-alias-interactive-bg-hover)', stroke: 'var(--dsw-alias-border-l2)' }),
+        h('text', { x: 91, y: 38, textAnchor: 'middle', fontSize: 13, fill: 'var(--dsw-alias-text-primary)' }, t.flowLead),
+        h('text', { x: 91, y: 55, textAnchor: 'middle', fontSize: 9, fill: 'var(--dsw-alias-label-secondary)' }, t.flowLeadSub),
+        // Lead reviews PLAN node
+        h('rect', { x: 16, y: 150, width: 150, height: 50, rx: 8, fill: 'var(--dsw-alias-interactive-bg-hover)', stroke: 'var(--dsw-alias-border-l2)' }),
+        h('text', { x: 91, y: 170, textAnchor: 'middle', fontSize: 12, fill: 'var(--dsw-alias-text-primary)' }, t.flowPlanReview),
+        h('text', { x: 91, y: 187, textAnchor: 'middle', fontSize: 9, fill: 'var(--dsw-alias-label-secondary)' }, t.flowPlanReviewSub),
         // Agent nodes
         ...nodes.map((agent, index) => {
-          const y = 20 + index * 60
+          const y = rowY(index)
           const label = `${agent.displayName} (${agent.id})`
           return h('g', { key: agent.id },
-            h('path', { d: `M146,95 C200,95 210,${y + 22} 246,${y + 22}`, fill: 'none', stroke: 'var(--dsw-alias-label-secondary)', markerEnd: 'url(#asq-arrow)' }),
-            h('rect', { x: 250, y, width: 230, height: 44, rx: 8, fill: 'var(--dsw-alias-bg-module)', stroke: 'var(--dsw-alias-border-l2)' }),
-            h('text', { x: 365, y: y + 18, textAnchor: 'middle', fontSize: 12, fill: 'var(--dsw-alias-text-primary)' }, label),
-            h('text', { x: 365, y: y + 33, textAnchor: 'middle', fontSize: 10, fill: 'var(--dsw-alias-label-secondary)' }, sub[index]),
+            h('rect', { x: 470, y, width: 240, height: 44, rx: 8, fill: 'var(--dsw-alias-bg-module)', stroke: 'var(--dsw-alias-border-l2)' }),
+            h('text', { x: 590, y: y + 18, textAnchor: 'middle', fontSize: 12, fill: 'var(--dsw-alias-text-primary)' }, label),
+            h('text', { x: 590, y: y + 33, textAnchor: 'middle', fontSize: 10, fill: 'var(--dsw-alias-label-secondary)' }, sub[index]),
           )
         }),
-        // review / rework loop
-        h('path', { d: 'M480,95 C540,95 540,30 365,30 C300,30 260,40 250,42', fill: 'none', stroke: 'var(--dsw-alias-label-secondary)', strokeDasharray: '4 3', markerEnd: 'url(#asq-arrow)' }),
-        h('text', { x: 545, y: 62, fontSize: 10, fill: 'var(--dsw-alias-label-secondary)' }, t.flowReview),
+        // Lead → brain (design)
+        h('path', { d: 'M166,43 C280,43 380,40 468,40', fill: 'none', stroke: 'var(--dsw-alias-label-secondary)', markerEnd: 'url(#asq-arrow)' }),
+        h('text', { x: 300, y: 34, textAnchor: 'middle', fontSize: 10, fill: 'var(--dsw-alias-label-secondary)' }, t.flowDesign),
+        // brain → Lead review (PLAN.md)
+        h('path', { d: 'M470,55 C330,95 240,130 168,158', fill: 'none', stroke: 'var(--dsw-alias-label-secondary)', markerEnd: 'url(#asq-arrow)' }),
+        h('text', { x: 295, y: 105, textAnchor: 'middle', fontSize: 10, fill: 'var(--dsw-alias-label-secondary)' }, 'PLAN.md'),
+        // design rework loop (back to the brain, dashed)
+        h('path', { d: `M166,178 C320,222 420,150 468,62`, fill: 'none', stroke: 'var(--dsw-alias-label-secondary)', strokeDasharray: '4 3', markerEnd: 'url(#asq-arrow)' }),
+        h('text', { x: 320, y: 218, textAnchor: 'middle', fontSize: 10, fill: 'var(--dsw-alias-label-secondary)' }, t.flowPlanLoop),
+        // approve → implement (to every non-brain row)
+        ...nodes.map((agent, index) => (agent.role === 'brain' ? null : h('path', {
+          key: `approve-${agent.id}`,
+          d: `M166,163 C260,163 360,${rowY(index) + 22} 468,${rowY(index) + 22}`,
+          fill: 'none', stroke: 'var(--dsw-alias-label-secondary)', markerEnd: 'url(#asq-arrow)',
+        }))).filter(Boolean),
+        h('text', { x: 290, y: planLabelY - 12, textAnchor: 'middle', fontSize: 10, fill: 'var(--dsw-alias-label-secondary)' }, t.flowApprove),
+        // review / rework loop (workers → brain, dashed)
+        h('path', { d: `M712,${lastY + 30} C744,${lastY + 30} 744,40 712,40`, fill: 'none', stroke: 'var(--dsw-alias-label-secondary)', strokeDasharray: '4 3', markerEnd: 'url(#asq-arrow)' }),
+        h('text', { x: 748, y: (40 + lastY + 30) / 2, textAnchor: 'end', fontSize: 10, fill: 'var(--dsw-alias-label-secondary)' }, t.flowReview),
       )
     }
 

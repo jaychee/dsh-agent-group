@@ -456,8 +456,34 @@ export function registerRoutes({ ctx, store, models }) {
     { kind: 'exact', path: SETTINGS_PATH, handler },
     { kind: 'exact', path: MODELS_PATH, handler },
   ]
-  for (const route of routes) webServer.register(route)
+  // `register()` returns the only disposer; the service has no `unregister`.
+  // A previous plugin generation may have leaked these exact routes because an
+  // older build discarded the disposer. Keep that handler (it serves the same
+  // paths and store) instead of failing activation; a restart clears it.
+  const disposers = []
+  for (const route of routes) {
+    try {
+      disposers.push(webServer.register(route))
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      if (!message.includes('duplicate exact route')) {
+        for (const dispose of disposers) {
+          try {
+            dispose()
+          } catch {}
+        }
+        throw error
+      }
+      ctx.logger?.('agent-squad')?.warn?.(
+        `route ${route.path} already registered by a previous generation; reusing it`,
+      )
+    }
+  }
   return () => {
-    for (const route of routes) webServer.unregister?.(route)
+    for (const dispose of disposers) {
+      try {
+        dispose()
+      } catch {}
+    }
   }
 }
