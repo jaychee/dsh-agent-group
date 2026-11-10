@@ -1,0 +1,47 @@
+# Agent Squad bundle layer.
+# The squad tools are a thin role layer over the shipped experimental Agent Teams
+# runtime, so this bundle mounts that runtime itself: a profile that installs only
+# this bundle still gets named, continuable teammates and durable team state.
+
+- insert:
+    - id: agent-squad-team-runtime
+      name: '@deepseek-ai/dsh-experimental-agent-team'
+      config:
+        maxMembers: 8
+        maxTasks: 256
+        maxMessageBytes: 65536
+        disposalTimeoutMs: 5000
+
+    - id: agent-squad-worktree-runtime
+      name: '@deepseek-ai/dsh-experimental-worktree'
+      config:
+        directory: .agents/worktrees
+        namePrefix: squad-
+
+    - id: agent-squad
+      name: 'dsh-agent-squad'
+      config:
+        # Repo-relative directory for plugin-created squad worktrees; the
+        # settings page stores the live value in ~/.dsh/agent-squad/settings.json.
+        worktreeDir: .agents/worktrees
+        # Hybrid: Lead stays DeepSeek; codex is an external one-shot consultant;
+        # workers are local pinned-model children (GLM, continuable). These rows
+        # only seed the settings file on first run.
+        agents:
+          - name: codex
+            role: brain
+            provider: codex
+            context: fresh
+            description: 负责方案设计与验收标准，并对实现做最终验收。
+          - name: zcode
+            role: worker
+            provider: ''
+            model: zai-coding-cn/glm-5.3
+            context: fresh
+            description: 按已批准方案实现并运行测试（GLM 本地子代理，可续跑）。
+          - name: qoder
+            role: worker
+            provider: ''
+            model: zai-coding-cn/glm-5.3
+            context: fresh
+            description: 第二执行者，负责并行任务或前端偏重的改动（GLM 本地子代理）。

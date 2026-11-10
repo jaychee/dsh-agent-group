@@ -1,0 +1,37 @@
+{
+  "name": "dsh-agent-squad",
+  "version": "0.4.0",
+  "private": true,
+  "description": "Role-based local agent team for DeepSeek Harness: a Lead delegates design, implementation and acceptance to named teammates and reuses each teammate's conversation across rework rounds.",
+  "type": "module",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./settings": "./settings.js",
+    "./http": "./http.js",
+    "./worktree": "./worktree.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "settings.js",
+    "http.js",
+    "worktree.js",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "icon.svg",
+    "README.md"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": ["@deepseek-ai/dsh-client-ui-settings"]
+    }
+  }
+}

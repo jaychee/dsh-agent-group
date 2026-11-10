@@ -1,0 +1,10 @@
+{
+  "meta": {
+    "title": "智能体小队",
+    "description": "按角色组织的本地多智能体团队：Lead 把方案设计、实现与验收分别交给 codex、zcode、qoder，返工时继续各自的同一段对话。"
+  },
+  "settings": {
+    "title": "智能体小队",
+    "description": "配置小队成员（执行方式、模型）与 worktree 目录。保存后对下一次派单生效。"
+  }
+}

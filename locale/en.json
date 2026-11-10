@@ -1,0 +1,10 @@
+{
+  "meta": {
+    "title": "Agent Squad",
+    "description": "Role-based local agent team: the Lead assigns design, implementation and acceptance to codex, zcode and qoder, and rework resumes each teammate's own conversation."
+  },
+  "settings": {
+    "title": "Agent Squad",
+    "description": "Configure the squad members (executor, model) and the worktree directory. Saves apply to the next dispatch."
+  }
+}
