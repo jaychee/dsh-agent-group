@@ -12,7 +12,7 @@
 插件本身很薄：它挂在 DSH 内置的实验性 **Agent Teams** 运行时（`ctx.agentTeams`）上，补上 DSH 缺的三件事：
 
 1. **命名 + 角色**：三个固定 teammate（codex / zcode / qoder），角色决定系统提示里的职责章程与可见工具；
-2. **共享记忆**：每个任务一个 `.agent-squad/<task>/` 目录，TASK / PLAN / REVIEW / REPORT / JOURNAL 五份文件，所有成员读写同一份；
+2. **共享记忆**：每个任务一个 `.agent-squad/<task>/` 目录，TASK / PLAN / PLAN-APPROVED / REVIEW / REPORT / JOURNAL 承载任务、设计草稿、批准规格、验收、交付证据与历史，所有成员读写同一份；
 3. **会话复用**：队友是 Lead 的持久、可续跑子会话；重复 `squad_dispatch` 同一个队友 = 往同一会话追加消息，返工天然复用上一轮上下文。
 
 ## 角色
@@ -20,10 +20,24 @@
 | 角色 | 谁 | 职责 | 工具 |
 | --- | --- | --- | --- |
 | `lead` | 当前 DSH 会话 | 拆解流程、审核并批准 PLAN、决定下一个执行者、汇总交付；不写业务代码 | `squad_start` / `squad_dispatch` / `squad_approve_plan` / `squad_status` / `squad_wait` / `squad_finish` |
-| `brain` | codex | 出方案、实现计划、编号化验收标准；最终逐条验收，只有它能给 approved | `squad_report` |
-| `worker` | zcode / qoder | 按 PLAN 实现、写测试、跑验收命令、记录证据；返工按编号缺陷修复 | `squad_report` |
+| `brain` | codex | 写可执行规格与 AC 验证命令；最终逐条验收，只有它能给 approved | `squad_report` |
+| `worker` | zcode / qoder | 按 PLAN-APPROVED.md 实现、写测试、跑验收命令、记录证据；返工按编号缺陷修复 | `squad_report` |
 
 角色章程可以在插件配置里整段替换（`brainCharter` / `workerCharter`），单个 agent 也可以用 `charter` 覆盖。默认章程为中文；Lead 策略额外要求**面向用户始终使用用户的语言**，章程语言不影响回复语言。
+
+### 可执行规格与交付
+
+- 把目标写成可执行规格，存入 PLAN.md：逐个列出新增、修改、删除的文件路径，每个文件写明改动位置、改动要点及对应 AC 编号。
+- 逐项写出接口名称与精确签名、参数类型与默认值、返回类型与返回值；错误必须写明错误类型、触发条件与完整消息。没有接口变更时明确写“无接口变更”，并列出须保留的接口与错误行为。
+- 列出边界输入与精确期望值；逐项指定测试文件、测试名、输入和期望输出。每条 AC 必须给出可直接执行的验证命令、执行目录、退出码与通过条件，并映射到改动文件和测试名。
+- 在“假设与待确认”中显式列出假设及影响；未确定且影响实现的事项标为待确认，不能让 worker 猜测。禁止使用“适当”“合理”“类似”“等等”“参考现有实现”替代具体规格。
+- 写完后自检“一个没有上下文的 worker 能否只靠 PLAN 完成”，把结论写入 PLAN.md；不能时补全规格，或列入“假设与待确认”并标明阻塞项，不得宣称方案可执行。
+- 被要求验收时，以 PLAN-APPROVED.md 为唯一权威规格，逐条核对 AC 并在 REVIEW.md 写明 AC 编号、文件路径、测试名、验证命令、退出码、关键输出与结论；亲自运行或检查测试，不接受没有证据的声明。
+- PLAN-APPROVED.md 是实现、返工与验收的唯一权威规格；PLAN.md 只用于设计，不能覆盖批准归档。
+- 仅任务快照豁免方案门禁且无批准归档时，按 TASK.md 与 Lead 本轮派单执行；仍须逐条 AC 留证。
+- AC 映射：沿用 TASK.md 的 AC 编号；未编号时按条目顺序从 AC1 开始编号。PLAN.md 为每条 AC 指定改动文件、测试名、验证命令与期望值；REPORT.md/REVIEW.md 按批准方案逐条记录 AC 编号、文件路径、测试名、命令、退出码、关键输出与结论。
+- 只做方案定义的最小改动；不得引入方案未定义的接口、文件或依赖，不重新设计、不改名、不扩大范围。
+- 规格缺失、矛盾或明显错误时立即停止实现，报 "blocked"，引用 PLAN-APPROVED.md 的具体章节与 AC 编号，并列出缺失项或冲突原文；需要批准归档而文件缺失时明确引用文件名；豁免任务引用 TASK.md 章节或 Lead 派单条目。不得自行补全规格或改用 PLAN.md。
 
 ### 预算与上限
 
@@ -42,9 +56,9 @@ Lead 的固定流程（**先审方案再实现**）：
 
 1. `squad_start` 建任务与共享记忆；**默认同时创建 worktree + 新分支，并把会话切过去**；
 2. `squad_dispatch(codex, phase=design)` → brain 写 `PLAN.md` 与验收标准；
-3. **Lead 审核 `PLAN.md`**：有问题就把编号缺陷派回 brain（`phase="design"` 返工，最多 3 轮）；方案合格后调用 **`squad_approve_plan`** 批准（归档 `PLAN-APPROVED.md`）。有 brain 参与的任务，批准前 `implement`/`rework` 派单会被拒绝；无 brain 任务豁免；
-4. `squad_dispatch(zcode, phase=implement)` → worker 在 worktree 里实现并写 `REPORT.md`；
-5. `squad_dispatch(codex, phase=review)` → brain 对照 PLAN 逐条验收；
+3. **Lead 审核 `PLAN.md`**：假装自己是没有上下文的 worker，无法只靠 PLAN 实现的点一律按 D1 起连续编号，写明章节、缺失或矛盾、最小补全要求，再派回 brain。有问题就把编号缺陷派回 brain（`phase="design"` 返工，最多 3 轮）；方案合格后调用 **`squad_approve_plan`** 批准（归档 `PLAN-APPROVED.md`）。有 brain 参与的任务，批准前 `implement`/`rework` 派单会被拒绝；无 brain 任务豁免；
+4. `squad_dispatch(zcode, phase=implement)` → worker 按 PLAN-APPROVED.md 在 worktree 里实现并写 `REPORT.md`，逐条 AC 给证据；
+5. `squad_dispatch(codex, phase=review)` → brain 对照 PLAN-APPROVED.md 逐条验收；
 6. 不通过 → `squad_dispatch(zcode, phase=rework)`：**同一会话**继续，只补缺陷；
 7. brain `approved` 后调用 `squad_finish`：提交 worktree 改动、切回源目录、给出分支与合并命令。
 
@@ -67,7 +81,7 @@ Lead 的固定流程（**先审方案再实现**）：
 `agents[].provider` 非空且不是 `spawn`/`fork` 时，`squad_dispatch` 不再走 Team 队友，而是直接调用宿主 `ctx.subagents.startActivation({ provider, delivery: 'caller' })`：
 
 - Lead 的调用阻塞到外部 agent 返回，结果直接回到 Lead；外部 agent 不进入 Team roster，也不能 `squad_report`、不能续跑；
-- 每次派发前生成 `BRIEF.md`（≤30 行），外部 agent 只读共享文件，返工必须重发 BRIEF + 编号缺陷；
+- 每次派发前生成 `BRIEF.md`（≤30 行），外部 agent 只读共享文件，返工必须重发 BRIEF + 编号缺陷；实现、返工与验收指向 PLAN-APPROVED.md，并要求 AC 映射；
 - 外部 agent 的 cwd 是 worktree，因此本任务的共享记忆放在 **worktree 内** 的 `.agent-squad/`（沙箱可写）；
 - 已适配 Codex：`provider: codex`，需先安装 `@deepseek-ai/dsh-subagent-codex`（bundle）；
 - ZCode 需要 `@deepseek-ai/dsh-subagent-acp`（不是 bundle，要单独插入 provider 行）；本 pilot 用直连 ACP 桥测量。
@@ -220,12 +234,12 @@ token：GLM implement 26,295 / rework 26,459（cache 主导）；Codex 设计 + 
 └── t-<id>/
     ├── TASK.md               # 目标 / 验收标准 / 约束 / 成员（Lead 写）
     ├── BRIEF.md              # 每次派单重写的一次性简报（外部 agent 必读）
-    ├── PLAN.md               # 方案 + 编号验收标准（brain 写）
+    ├── PLAN.md               # 设计草稿 + 编号验收标准（brain 写）
     ├── PLAN-R<n>.md          # 第 n 次设计的方案归档（1–4）
-    ├── PLAN-APPROVED.md      # Lead 批准时的方案定稿归档（squad_approve_plan 写）
+    ├── PLAN-APPROVED.md      # 实现、返工与验收的唯一权威规格（squad_approve_plan 写）
     ├── REVIEW.md             # 逐条验收结论 + 证据（brain 写）
     ├── REVIEW-R<round>.md    # 每轮验收归档
-    ├── REPORT.md             # 改动 / 命令 / 测试证据（worker 写）
+    ├── REPORT.md             # 逐条 AC 的文件 / 测试 / 命令 / 退出码 / 输出 / 结论
     ├── JOURNAL.md            # 追加式流水（所有人写）
     ├── STATE.json            # phase / round / planRequired / planRounds / planApproved / dispatch 记录
     └── FINAL.md              # 收尾摘要（squad_finish 写）

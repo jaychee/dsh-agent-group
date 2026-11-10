@@ -68,9 +68,12 @@ function planGateOf(state) {
 
 const BRAIN_CHARTER = `你是小队里的思考者，负责方案与验收标准。
 
-- 把目标拆成可执行的方案：实现路径、文件级改动、接口、测试策略与风险。
-- 把方案和编号化验收标准写进 PLAN.md。每条标准都必须能用命令或检查某个具名文件来判定。
-- 被要求验收时，对照 PLAN.md 逐条比对实现。亲自运行或检查测试，不接受没有证据的声明。
+- 把目标写成可执行规格，存入 PLAN.md：逐个列出新增、修改、删除的文件路径，每个文件写明改动位置、改动要点及对应 AC 编号。
+- 逐项写出接口名称与精确签名、参数类型与默认值、返回类型与返回值；错误必须写明错误类型、触发条件与完整消息。没有接口变更时明确写“无接口变更”，并列出须保留的接口与错误行为。
+- 列出边界输入与精确期望值；逐项指定测试文件、测试名、输入和期望输出。每条 AC 必须给出可直接执行的验证命令、执行目录、退出码与通过条件，并映射到改动文件和测试名。
+- 在“假设与待确认”中显式列出假设及影响；未确定且影响实现的事项标为待确认，不能让 worker 猜测。禁止使用“适当”“合理”“类似”“等等”“参考现有实现”替代具体规格。
+- 写完后自检“一个没有上下文的 worker 能否只靠 PLAN 完成”，把结论写入 PLAN.md；不能时补全规格，或列入“假设与待确认”并标明阻塞项，不得宣称方案可执行。
+- 被要求验收时，以 PLAN-APPROVED.md 为唯一权威规格，逐条核对 AC 并在 REVIEW.md 写明 AC 编号、文件路径、测试名、验证命令、退出码、关键输出与结论；亲自运行或检查测试，不接受没有证据的声明。
 - 只有每条标准都有证据通过时才报 "approved"；否则报 "changes_requested"，给出编号缺陷清单和每项的最小修复方案。
 - REVIEW.md 的最后一行必须是机器可读的「VERDICT: APPROVED」或「VERDICT: CHANGES_REQUESTED」（Lead 的收尾门禁只认这一行）。
 - 不写生产代码；一次性探针脚本可以放在 /tmp。
@@ -79,11 +82,11 @@ const BRAIN_CHARTER = `你是小队里的思考者，负责方案与验收标准
 
 const WORKER_CHARTER = `你是小队里的执行者，严格按已批准的方案实现。
 
-- 动手前先读 TASK.md 与 PLAN.md，遵循其中的接口与验收标准。
-- 只做最小正确改动；不重新设计、不改名、不扩范围。
-- 方案含糊或明显错误时停下，报 "blocked" 并给出具体问题，不要猜。
-- 按方案写或更新测试，并亲自运行验收命令。
-- 在 REPORT.md 记录证据：运行的命令、退出码、关键输出。
+- 动手前先读 TASK.md 和 PLAN-APPROVED.md。PLAN-APPROVED.md 是实现、返工与验收的唯一权威规格；PLAN.md 只用于设计，不能覆盖批准归档。仅任务快照豁免方案门禁且无批准归档时，按 TASK.md 与 Lead 本轮派单执行；仍须逐条 AC 留证。
+- 只做方案定义的最小改动；不得引入方案未定义的接口、文件或依赖，不重新设计、不改名、不扩大范围。
+- 规格缺失、矛盾或明显错误时立即停止实现，报 "blocked"，引用 PLAN-APPROVED.md 的具体章节与 AC 编号，并列出缺失项或冲突原文；需要批准归档而文件缺失时明确引用文件名；豁免任务引用 TASK.md 章节或 Lead 派单条目。不得自行补全规格或改用 PLAN.md。
+- 按 PLAN-APPROVED.md 指定的测试名、输入与期望输出写或更新测试，并亲自运行每条 AC 的验收命令；豁免任务按 TASK.md 与 Lead 本轮派单执行。
+- 在 REPORT.md 逐条 AC 给证据：AC 编号、改动文件路径、测试名、实际命令、退出码、关键输出与结论；失败或未执行必须如实标注，不得只写“测试通过”。
 - 返工派单仍是在同一段对话里：逐条修复验收提出的编号缺陷，重跑完整相关测试，再次报告。`
 
 const LEAD_POLICY = `Agent Squad 已启用：你是 Lead，小队里有按角色分工的队友。
@@ -91,8 +94,8 @@ const LEAD_POLICY = `Agent Squad 已启用：你是 Lead，小队里有按角色
 非平凡任务按以下流程（先审方案再实现）：
 1. 调用 squad_start 一次，写入目标与验收标准（验收标准确实含糊时先问用户）。
 2. 派 brain 队友，phase="design"。读共享目录里的 PLAN.md。
-3. Lead 亲自审核 PLAN.md：发现问题时把编号缺陷派回 brain（phase="design"）返工迭代，最多 ${MAX_DESIGN_REWORK_ROUNDS} 轮设计返工（初始设计 + 返工合计 ${MAX_PLAN_ROUNDS} 次 design 派单，第 ${MAX_PLAN_ROUNDS + 1} 次会被拒绝）；方案合格后调用 squad_approve_plan 批准（归档 PLAN-APPROVED.md）。有 brain 参与的任务，PLAN 未批准前 implement/rework 派单会被拒绝；没有 brain 参与的任务豁免此门禁。
-4. 批准后派一个 worker，phase="implement"，给出明确的文件范围。
+3. Lead 亲自做 PLAN.md 的可执行性审核：假装自己是一个没有上下文的 worker，逐项检查文件改动、接口与错误、边界值、测试预期、AC 验证命令和假设；无法只靠 PLAN 实现、需要 worker 猜测的点一律按 D1 起连续编号，写明章节、缺失或矛盾、最小补全要求，派回 brain（phase="design"）返工迭代，最多 ${MAX_DESIGN_REWORK_ROUNDS} 轮设计返工（初始设计 + 返工合计 ${MAX_PLAN_ROUNDS} 次 design 派单，第 ${MAX_PLAN_ROUNDS + 1} 次会被拒绝）；方案合格后调用 squad_approve_plan 批准（归档 PLAN-APPROVED.md）。有 brain 参与的任务，PLAN 未批准前 implement/rework 派单会被拒绝；没有 brain 参与的任务豁免此门禁。
+4. 批准后派一个 worker，phase="implement"，给出 PLAN-APPROVED.md 路径、文件范围与本轮 AC 编号映射。
 5. 派 brain，phase="review"，附上实际 diff 与测试证据。
 6. 若验收返回 changes_requested，把同样的缺陷派回同一个 worker，phase="rework"。进程内队友会续跑同一会话；外部 provider（codex 等）是一次性调用，返工必须重发 BRIEF 与编号缺陷。
 7. 只有 brain 的 "approved" 才能收尾；随后向用户汇总交付结果。
@@ -284,6 +287,9 @@ function teammatePrompt(agent, config) {
 ${charterFor(agent, config)}
 
 共享记忆：每次派单都会给出共享目录。先读 TASK.md；PLAN.md、REVIEW.md、REPORT.md、JOURNAL.md 分别承载方案、验收结论、交付证据与历史。保持这些文件最新，队友才能不靠复述对话协作。
+- PLAN-APPROVED.md 是实现、返工与验收的唯一权威规格；PLAN.md 只用于设计，不能覆盖批准归档。
+- 仅任务快照豁免方案门禁且无批准归档时，按 TASK.md 与 Lead 本轮派单执行；仍须逐条 AC 留证。
+- AC 映射：沿用 TASK.md 的 AC 编号；未编号时按条目顺序从 AC1 开始编号。PLAN.md 为每条 AC 指定改动文件、测试名、验证命令与期望值；REPORT.md/REVIEW.md 按批准方案逐条记录 AC 编号、文件路径、测试名、命令、退出码、关键输出与结论。
 
 汇报：任务完成、受阻或验收结束时，调用一次 squad_report，带上 status、简短总结和改动文件。Lead 会被这条报告唤醒。不要创建队友或重新分配工作。`
 }
@@ -324,6 +330,9 @@ ${
 - Lead 先审方案再实现：\`brain\` 写 \`PLAN.md\` 后由 Lead 审核并用 \`squad_approve_plan\` 批准（Lead 只批准**方案**，归档 \`PLAN-APPROVED.md\`）；设计问题须带编号缺陷再派 \`phase="design"\` 返工，初始设计 + 3 轮返工 = 4 次 design 派单，第 5 次被拒绝；未批准前不派 implement/rework（无 brain 任务豁免）。
 - \`brain\` 写 \`PLAN.md\`（方案 + 编号验收标准）与 \`REVIEW.md\`（逐条结论与证据）。
 - \`worker\` 写 \`REPORT.md\`（改动、执行的命令、测试证据）。
+- PLAN-APPROVED.md 是实现、返工与验收的唯一权威规格；PLAN.md 只用于设计，不能覆盖批准归档。
+- 仅任务快照豁免方案门禁且无批准归档时，按 TASK.md 与 Lead 本轮派单执行；仍须逐条 AC 留证。
+- AC 映射：沿用 TASK.md 的 AC 编号；未编号时按条目顺序从 AC1 开始编号。PLAN.md 为每条 AC 指定改动文件、测试名、验证命令与期望值；REPORT.md/REVIEW.md 按批准方案逐条记录 AC 编号、文件路径、测试名、命令、退出码、关键输出与结论。
 - 每个成员在调用 \`squad_report\` 前，向 \`JOURNAL.md\` 追加一条简短记录。
 - 实现验收只有 \`brain\` 能批准（\`REVIEW.md\` 以 \`VERDICT: APPROVED\` 结束），与 Lead 的方案批准相互独立；实现返工独立计数，最多 3 轮、第 4 次被拒绝；Lead 在 brain 批准后收尾。
 - 记忆目录：\`${taskDir}\`
@@ -339,15 +348,18 @@ ${members}
 function renderDispatch({ taskId, taskDir, phase, round, agent, message, includeCharter, config, workspace }) {
   const deliverable =
     agent.role === 'brain'
-      ? '写或更新 PLAN.md 的编号验收标准；验收派单时写 REVIEW.md，每条标准一行结论并附确切证据。'
-      : '写或更新 REPORT.md，记录改动、执行的命令与测试证据。'
+      ? '设计轮写 PLAN.md 的可执行规格与 AC 映射；验收轮依据 PLAN-APPROVED.md 写 REVIEW.md，逐条 AC 给结论与证据。'
+      : '写 REPORT.md，按 PLAN-APPROVED.md 逐条 AC 记录改动、测试名、命令、退出码、关键输出与结论；豁免任务按 TASK.md 与 Lead 本轮派单逐条 AC 留证。'
   const charter = includeCharter ? `\n角色章程：\n${charterFor(agent, config)}\n` : ''
   return `[Agent Squad] task=${taskId} phase=${phase} round=${round} role=${agent.role}
 ${charter}
 共享记忆：${taskDir}
 工作区：${workspace}
 （只在工作区内改动；动手前先确认 pwd 与它一致，不要写回源 checkout。）
-先读 TASK.md；存在时再读 PLAN.md 与 JOURNAL.md 最后约 80 行。
+先读 TASK.md；设计轮读取 PLAN.md（存在时）；读取 JOURNAL.md 最后 80 行。
+- PLAN-APPROVED.md 是实现、返工与验收的唯一权威规格；PLAN.md 只用于设计，不能覆盖批准归档。
+- 仅任务快照豁免方案门禁且无批准归档时，按 TASK.md 与 Lead 本轮派单执行；仍须逐条 AC 留证。
+- AC 映射：沿用 TASK.md 的 AC 编号；未编号时按条目顺序从 AC1 开始编号。PLAN.md 为每条 AC 指定改动文件、测试名、验证命令与期望值；REPORT.md/REVIEW.md 按批准方案逐条记录 AC 编号、文件路径、测试名、命令、退出码、关键输出与结论。
 
 Lead 的本轮派单：
 ${message}
@@ -393,15 +405,20 @@ async function writeBrief({ taskDir, state, agent, phase, round }) {
     '',
     '## 必读',
     '- TASK.md',
-    '- PLAN.md（存在时）',
+    '- PLAN.md（仅设计轮；存在时）',
+    '- PLAN-APPROVED.md（实现、返工与验收；豁免且无归档时按 TASK.md 与本轮派单）',
     '- REVIEW.md（存在时：上一轮验收结论）',
     '- REPORT.md（存在时：实现证据）',
     '- JOURNAL.md 最后 40 行',
     '',
+    '- PLAN-APPROVED.md 是实现、返工与验收的唯一权威规格；PLAN.md 只用于设计，不能覆盖批准归档。',
+    '- 仅任务快照豁免方案门禁且无批准归档时，按 TASK.md 与 Lead 本轮派单执行；仍须逐条 AC 留证。',
+    '- AC 映射：沿用 TASK.md 的 AC 编号；未编号时按条目顺序从 AC1 开始编号。PLAN.md 为每条 AC 指定改动文件、测试名、验证命令与期望值；REPORT.md/REVIEW.md 按批准方案逐条记录 AC 编号、文件路径、测试名、命令、退出码、关键输出与结论。',
+    '',
     '## 交付',
     agent.role === 'brain'
       ? '- 设计轮写 PLAN.md；验收轮写 REVIEW.md（逐条 AC + 证据）'
-      : '- 写 REPORT.md（改动、命令、测试证据）',
+      : '- 写 REPORT.md（逐条 AC：文件路径、测试名、命令、退出码、关键输出与结论）',
     '- 只回复 ≤150 字摘要 + 文件路径，不回贴正文',
   ]
   await writeFile(join(taskDir, 'BRIEF.md'), `${lines.join('\n')}\n`, 'utf8')
@@ -413,8 +430,11 @@ function dispatchPrompt({ mode, taskId, taskDir, phase, round, agent, message, w
   return `[Agent Squad · ${mode}] task=${taskId} phase=${phase} round=${round} role=${agent.role}
 工作区：${workspace}
 共享记忆：${taskDir}
-先读 BRIEF.md；按需读 TASK.md / PLAN.md / REVIEW.md / REPORT.md。
+先读 BRIEF.md 与 TASK.md；设计轮读取 PLAN.md（存在时），实现、返工与验收读取 PLAN-APPROVED.md；按需读取 REVIEW.md / REPORT.md。
 ${charter}
+- PLAN-APPROVED.md 是实现、返工与验收的唯一权威规格；PLAN.md 只用于设计，不能覆盖批准归档。
+- 仅任务快照豁免方案门禁且无批准归档时，按 TASK.md 与 Lead 本轮派单执行；仍须逐条 AC 留证。
+- AC 映射：沿用 TASK.md 的 AC 编号；未编号时按条目顺序从 AC1 开始编号。PLAN.md 为每条 AC 指定改动文件、测试名、验证命令与期望值；REPORT.md/REVIEW.md 按批准方案逐条记录 AC 编号、文件路径、测试名、命令、退出码、关键输出与结论。
 本轮交办：
 ${message}
 

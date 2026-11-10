@@ -19,6 +19,38 @@ const BUNDLE_AGENTS = [
   { name: 'qoder', role: 'worker', provider: '', model: 'zai-coding-cn/glm-5.3', context: 'fresh', description: 'worker2' },
 ]
 
+/** Shared S/E/M contract lines and charter items, asserted verbatim (PLAN §2/§3). */
+const S_TEXT = 'PLAN-APPROVED.md 是实现、返工与验收的唯一权威规格；PLAN.md 只用于设计，不能覆盖批准归档。'
+const E_TEXT = '仅任务快照豁免方案门禁且无批准归档时，按 TASK.md 与 Lead 本轮派单执行；仍须逐条 AC 留证。'
+const M_TEXT =
+  'AC 映射：沿用 TASK.md 的 AC 编号；未编号时按条目顺序从 AC1 开始编号。PLAN.md 为每条 AC 指定改动文件、测试名、验证命令与期望值；REPORT.md/REVIEW.md 按批准方案逐条记录 AC 编号、文件路径、测试名、命令、退出码、关键输出与结论。'
+const BRAIN_ITEMS = [
+  '把目标写成可执行规格，存入 PLAN.md：逐个列出新增、修改、删除的文件路径，每个文件写明改动位置、改动要点及对应 AC 编号。',
+  '逐项写出接口名称与精确签名、参数类型与默认值、返回类型与返回值；错误必须写明错误类型、触发条件与完整消息。没有接口变更时明确写“无接口变更”，并列出须保留的接口与错误行为。',
+  '列出边界输入与精确期望值；逐项指定测试文件、测试名、输入和期望输出。每条 AC 必须给出可直接执行的验证命令、执行目录、退出码与通过条件，并映射到改动文件和测试名。',
+  '在“假设与待确认”中显式列出假设及影响；未确定且影响实现的事项标为待确认，不能让 worker 猜测。禁止使用“适当”“合理”“类似”“等等”“参考现有实现”替代具体规格。',
+  '写完后自检“一个没有上下文的 worker 能否只靠 PLAN 完成”，把结论写入 PLAN.md；不能时补全规格，或列入“假设与待确认”并标明阻塞项，不得宣称方案可执行。',
+  '被要求验收时，以 PLAN-APPROVED.md 为唯一权威规格，逐条核对 AC 并在 REVIEW.md 写明 AC 编号、文件路径、测试名、验证命令、退出码、关键输出与结论；亲自运行或检查测试，不接受没有证据的声明。',
+]
+const WORKER_ITEMS = [
+  `动手前先读 TASK.md 和 PLAN-APPROVED.md。${S_TEXT}${E_TEXT}`,
+  '只做方案定义的最小改动；不得引入方案未定义的接口、文件或依赖，不重新设计、不改名、不扩大范围。',
+  '规格缺失、矛盾或明显错误时立即停止实现，报 "blocked"，引用 PLAN-APPROVED.md 的具体章节与 AC 编号，并列出缺失项或冲突原文；需要批准归档而文件缺失时明确引用文件名；豁免任务引用 TASK.md 章节或 Lead 派单条目。不得自行补全规格或改用 PLAN.md。',
+  '按 PLAN-APPROVED.md 指定的测试名、输入与期望输出写或更新测试，并亲自运行每条 AC 的验收命令；豁免任务按 TASK.md 与 Lead 本轮派单执行。',
+  '在 REPORT.md 逐条 AC 给证据：AC 编号、改动文件路径、测试名、实际命令、退出码、关键输出与结论；失败或未执行必须如实标注，不得只写“测试通过”。',
+]
+const assertSEM = (text) => {
+  for (const literal of [S_TEXT, E_TEXT, M_TEXT]) {
+    assert.ok(text.includes(literal), `missing S/E/M literal: ${literal}`)
+  }
+}
+const assertBrief = async (dir) => {
+  const brief = await readFile(join(dir, 'BRIEF.md'), 'utf8')
+  assertSEM(brief)
+  assert.ok(brief.includes('PLAN-APPROVED.md（实现、返工与验收；豁免且无归档时按 TASK.md 与本轮派单）'))
+  assert.ok(brief.trimEnd().split('\n').length <= 30, 'BRIEF exceeds 30 lines')
+}
+
 async function tempRoot() {
   return mkdtemp(join(tmpdir(), 'asq-test-'))
 }
@@ -299,6 +331,9 @@ test('T03 dispatch reads fresh settings and routes external/local/team executors
     assert.match(externalOutput, /已外部派发 codex/)
     assert.match(externalOutput, /planRounds=1\/4/)
     assert.equal(host.activations.at(-1).provider, 'mock-ext')
+    // S/E/M contract reaches the external activation prompt (charter included).
+    assertSEM(host.activations.at(-1).request.prompt.map((block) => block.text).join(''))
+    await assertBrief(firstDir)
     // The external design round is archived synchronously as PLAN-R1.md.
     assert.equal(await readFile(join(firstDir, 'PLAN-R1.md'), 'utf8'), '# PLAN (mock)\n')
     // Plan gate: implement is refused until the Lead approves the PLAN.
@@ -318,6 +353,8 @@ test('T03 dispatch reads fresh settings and routes external/local/team executors
     assert.match(local1, /已创建本地子代理 zcode/)
     const firstChild = host.activations.at(-1).childId
     assert.deepEqual(host.activations.at(-1).request.agentOptions, { provider: 'p', model: 'm1' })
+    assertSEM(host.activations.at(-1).request.prompt.map((block) => block.text).join(''))
+    await assertBrief(firstDir)
 
     // Same binding → resume the same child id.
     const local2 = await tool('squad_dispatch').execute(
@@ -326,6 +363,13 @@ test('T03 dispatch reads fresh settings and routes external/local/team executors
     )
     assert.match(local2, /已续跑本地子代理 zcode/)
     assert.equal(host.sent.at(-1).childId, firstChild)
+    {
+      const resumeText = host.sent.at(-1).content.map((block) => block.text).join('')
+      // includeCharter=false still outputs S/E/M, without the charter block.
+      assertSEM(resumeText)
+      assert.ok(!resumeText.includes('角色章程：'))
+    }
+    await assertBrief(firstDir)
 
     // team: spawnTeammate path, with qoder re-roled to brain first (R08).
     const { createSettingsStore } = await import('../settings.js')
@@ -344,6 +388,8 @@ test('T03 dispatch reads fresh settings and routes external/local/team executors
     )
     assert.match(teamOutput, /已创建 qoder \[brain\]/)
     assert.equal(host.spawned.at(-1).name, 'qoder')
+    assertSEM(host.spawned.at(-1).prompt.map((block) => block.text).join(''))
+    await assertBrief(firstDir)
     // The spawned member's identity section follows the dispatch snapshot
     // (R08), including the section installed by agent/created firing before
     // spawnTeammate resolved.
@@ -479,6 +525,12 @@ test('T03 dispatch reads fresh settings and routes external/local/team executors
     )
     assert.match(resumeOutput, /已续跑 qoder \[worker\]/)
     assert.match(host.sections.at(-1), /qoder.*worker 角色/s)
+    {
+      const resumeText = host.sent.at(-1).content.map((block) => block.text).join('')
+      assertSEM(resumeText)
+      assert.ok(!resumeText.includes('角色章程：'))
+    }
+    await assertBrief(firstDir)
     const reportAfterResume = await tool('squad_report').execute(
       { status: 'done', summary: 'ok2' },
       { agent: qoderAgent, signal: undefined },
@@ -1160,9 +1212,16 @@ test('T07 plan gate: lead review, design budget, squad_approve_plan, archives an
     assert.match(await readFile(join(dirA, 'JOURNAL.md'), 'utf8'), /lead: 审核 PLAN 通过（设计轮次 4\/4）/)
     await assert.rejects(tool('squad_approve_plan').execute({ task_id: taskA }, exec), /已批准/)
 
+    // The approved archive stays authoritative even if the draft drifts later.
+    await writeFile(join(dirA, 'PLAN.md'), '# UNAPPROVED DRAFT\n', 'utf8')
+
     // --- AC4: independence after approval ------------------------------------
     assert.match(await dispatch({ agent: 'zcode', message: 'impl', phase: 'implement' }), /本地子代理 zcode/)
     assert.match(await dispatch({ agent: 'zcode', message: 'fix', phase: 'rework' }), /本地子代理 zcode/)
+    assert.equal(await readFile(join(dirA, 'PLAN-APPROVED.md'), 'utf8'), '# PLAN FINAL\n')
+    assertSEM(host.activations.at(-1).request.prompt.map((block) => block.text).join(''))
+    assertSEM(host.sent.at(-1).content.map((block) => block.text).join(''))
+    await assertBrief(dirA)
     await assert.rejects(design('late'), /PLAN 已批准/)
     // Plan approval does not bypass the REVIEW gate on finish — neither a
     // missing REVIEW nor an explicit CHANGES_REQUESTED verdict.
@@ -1174,6 +1233,22 @@ test('T07 plan gate: lead review, design budget, squad_approve_plan, archives an
     await assert.rejects(
       tool('squad_finish').execute({ summary: 's', task_id: taskA }, exec),
       /CHANGES_REQUESTED/,
+    )
+
+    // A review dispatch still carries S/E/M (charter included, fresh external
+    // call) and the approved archive + REVIEW verdict are untouched.
+    skipPlan = true
+    assert.match(
+      await dispatch({ agent: 'codex', message: 'review', phase: 'review' }),
+      /已外部派发 codex/,
+    )
+    skipPlan = false
+    assertSEM(host.activations.at(-1).request.prompt.map((block) => block.text).join(''))
+    await assertBrief(dirA)
+    assert.equal(await readFile(join(dirA, 'PLAN-APPROVED.md'), 'utf8'), '# PLAN FINAL\n')
+    assert.equal(
+      await readFile(join(dirA, 'REVIEW.md'), 'utf8'),
+      '# REVIEW\n\nVERDICT: CHANGES_REQUESTED\n',
     )
 
     // --- AC3: approve rejections (missing PLAN, zero rounds, closed task) ----
@@ -1203,6 +1278,9 @@ test('T07 plan gate: lead review, design budget, squad_approve_plan, archives an
     assert.equal((await readState(taskD)).planRequired, false)
     assert.match(await dispatch({ agent: 'zcode', message: 'impl', phase: 'implement' }), /本地子代理 zcode/)
     assert.match(await dispatch({ agent: 'zcode', message: 'fix', phase: 'rework' }), /本地子代理 zcode/)
+    // Exempt task's BRIEF still carries the exemption line (E).
+    const briefD = await readFile(join(workspace, '.agent-squad', taskD, 'BRIEF.md'), 'utf8')
+    assert.ok(briefD.includes(E_TEXT))
     const finishD = await tool('squad_finish').execute({ summary: 'no brain', task_id: taskD }, exec)
     assert.match(finishD, /收尾/)
     await assert.rejects(tool('squad_approve_plan').execute({ task_id: taskD }, exec), /已经收尾/)
@@ -1295,6 +1373,7 @@ test('T07 plan gate: lead review, design budget, squad_approve_plan, archives an
     assert.match(taskMd, /4 次 design 派单，第 5 次被拒绝/)
     assert.match(taskMd, /实现验收只有 `brain` 能批准/)
     assert.match(taskMd, /最多 3 轮、第 4 次被拒绝/)
+    assertSEM(taskMd)
 
     // --- AC6/AC7: flow copy, dictionary and SVG wiring in the sources ---------
     const indexSource = await readFile(new URL('../index.js', import.meta.url), 'utf8')
@@ -1315,6 +1394,38 @@ test('T07 plan gate: lead review, design budget, squad_approve_plan, archives an
     assert.match(readme, /先审方案再实现|Lead 审核 PLAN/)
     assert.match(readme, /第 4 次/)
     assert.ok(!/6 轮返工|第 7 次/.test(readme))
+    // --- PLAN §6: verbatim S/E/M and charter items in the changed sections ---
+    const brainSeg = indexSource.slice(
+      indexSource.indexOf('const BRAIN_CHARTER ='),
+      indexSource.indexOf('const WORKER_CHARTER ='),
+    )
+    const workerSeg = indexSource.slice(
+      indexSource.indexOf('const WORKER_CHARTER ='),
+      indexSource.indexOf('const LEAD_POLICY ='),
+    )
+    const leadSeg = indexSource.slice(
+      indexSource.indexOf('const LEAD_POLICY ='),
+      indexSource.indexOf('const DEFAULT_AGENTS ='),
+    )
+    for (const item of BRAIN_ITEMS) assert.ok(brainSeg.includes(item), `BRAIN missing: ${item}`)
+    for (const item of WORKER_ITEMS) assert.ok(workerSeg.includes(item), `WORKER missing: ${item}`)
+    // §4 step 3: full new text from "3. Lead" through "返工迭代，" (the rest of
+    // the line keeps the original budget wording), and step 4 verbatim.
+    assert.ok(
+      leadSeg.includes(
+        '3. Lead 亲自做 PLAN.md 的可执行性审核：假装自己是一个没有上下文的 worker，逐项检查文件改动、接口与错误、边界值、测试预期、AC 验证命令和假设；无法只靠 PLAN 实现、需要 worker 猜测的点一律按 D1 起连续编号，写明章节、缺失或矛盾、最小补全要求，派回 brain（phase="design"）返工迭代，',
+      ),
+      'LEAD step 3 new text missing',
+    )
+    assert.ok(
+      leadSeg.includes('4. 批准后派一个 worker，phase="implement"，给出 PLAN-APPROVED.md 路径、文件范围与本轮 AC 编号映射。'),
+      'LEAD step 4 sentence missing',
+    )
+    for (const item of [...BRAIN_ITEMS, S_TEXT, E_TEXT, M_TEXT]) {
+      assert.ok(readme.includes(item), `README missing: ${item}`)
+    }
+    assert.ok(readme.includes(WORKER_ITEMS[1]), 'README missing worker no-introduce item')
+    assert.ok(readme.includes(WORKER_ITEMS[2]), 'README missing worker blocked item')
   } finally {
     delete process.env.DSH_HOME
     await rm(workspace, { recursive: true, force: true })
