@@ -28,6 +28,7 @@ import { promisify } from 'node:util'
 import { createSettingsStore, seedFromBundle } from './settings.js'
 import { registerRoutes } from './http.js'
 import { createSquadWorktree } from './worktree.js'
+import { createQoderProvider } from './qoder.js'
 
 const runFile = promisify(execFile)
 
@@ -161,6 +162,9 @@ function resolveSettings(input) {
     worktreeDir: text(config.worktreeDir, '.agents/worktrees'),
     worktreeFrom: text(config.worktreeFrom, 'HEAD'),
     worktreeAutoCommit: config.worktreeAutoCommit !== false,
+    qoderCommand: text(config.qoderCommand, 'qoderclicn'),
+    qoderPermissionMode: text(config.qoderPermissionMode, 'accept_edits'),
+    qoderModel: text(config.qoderModel, ''),
   }
 }
 
@@ -1509,6 +1513,21 @@ ${String(args.summary).trim()}
 /** Host plugin entry. */
 export function apply(ctx, input) {
   const config = resolveSettings(input)
+  // Built-in qoder-cli external provider. Registered right after config
+  // resolution (before the settings routes, so the model catalog sees it);
+  // a missing subagents service is skipped, and the returned unregister
+  // function is owned by this plugin's context effect (unload removes it).
+  ctx.effect(
+    () =>
+      ctx.get('subagents')?.registerProvider(
+        createQoderProvider({
+          command: config.qoderCommand,
+          permissionMode: config.qoderPermissionMode,
+          model: config.qoderModel,
+        }),
+      ),
+    'agent-squad: qoder-cli provider',
+  )
   const store = createSettingsStore({
     seed: seedFromBundle(config.agents, config.worktreeDir),
     logger: { warn: (text) => ctx.logger?.('agent-squad')?.warn?.(text) },

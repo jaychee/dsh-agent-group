@@ -84,7 +84,8 @@ Lead 的固定流程（**先审方案再实现**）：
 - 每次派发前生成 `BRIEF.md`（≤30 行），外部 agent 只读共享文件，返工必须重发 BRIEF + 编号缺陷；实现、返工与验收指向 PLAN-APPROVED.md，并要求 AC 映射；
 - 外部 agent 的 cwd 是 worktree，因此本任务的共享记忆放在 **worktree 内** 的 `.agent-squad/`（沙箱可写）；
 - 已适配 Codex：`provider: codex`，需先安装 `@deepseek-ai/dsh-subagent-codex`（bundle）；
-- ZCode 需要 `@deepseek-ai/dsh-subagent-acp`（不是 bundle，要单独插入 provider 行）；本 pilot 用直连 ACP 桥测量。
+- ZCode 需要 `@deepseek-ai/dsh-subagent-acp`（不是 bundle，要单独插入 provider 行）；本 pilot 用直连 ACP 桥测量；
+- **内置 `qoder-cli` 外部 provider**：插件自带适配器，封装已安装的 `qoderclicn`（npm 全局，由宿主 PATH 找到且需已完成登录；可用 `qoderCommand` 指定可执行文件绝对路径）。插件不附带二进制本体。每次执行 `qoderclicn -p <prompt> -w <cwd> --permission-mode <mode>`（`qoderModel` 非空时追加 `-m <model>`），stdout 作为一次性结果返回；非 0 退出码按 error 返回 diagnostic，`dispose` 以 SIGTERM（1 秒后升级 SIGKILL）终止子进程。权限模式默认 `accept_edits`（`qoderPermissionMode` 可改写），`qoderModel` 默认空（不传 `-m`）。外部执行**一次性、不可续跑**，也不能 `squad_report`：每轮派单都会重发完整任务与共享文件路径，返工同样重发。
 
 ### B pilot 实测（2026-11-09）
 
@@ -197,6 +198,9 @@ token：GLM implement 26,295 / rework 26,459（cache 主导）；Codex 设计 + 
     worktreeDir: .agents/worktrees # 首次 seed 的 worktree 目录（此后以设置文件为准）
     worktreeFrom: HEAD             # 从哪个本地提交/分支拉出
     worktreeAutoCommit: true       # squad_finish 时自动提交 worktree 改动
+    qoderCommand: qoderclicn       # qoder-cli provider 调用的可执行文件（默认 PATH 上的 qoderclicn，可填绝对路径）
+    qoderPermissionMode: accept_edits  # 传给 --permission-mode 的权限模式（默认 accept_edits）
+    qoderModel: ''                 # qoder-cli 模型；默认空 = 不传 -m
     agents:                        # 仅作首次 seed；已有合法 settings.json 不会被覆盖
       - name: codex
         role: brain
@@ -224,7 +228,7 @@ token：GLM implement 26,295 / rework 26,459（cache 主导）；Codex 设计 + 
         context: fresh
 ```
 
-> 真实 CLI 的 provider 需要单独安装并注册（例如 ACP 桥），插件只负责按名字选择 provider，不内置任何厂商二进制。
+> 真实 CLI 的 provider 大多需要单独安装并注册（例如 ACP 桥），插件只负责按名字选择 provider，不内置任何厂商二进制。唯一例外是内置的 **qoder-cli 适配器**：适配器本身随插件提供，但 `qoderclicn` 可执行文件仍须自行安装并登录。要启用 qoder 外部执行，在设置页把 qoder 的 `executor` 设为 `external`、`model` 选 `qoder-cli` 并保存（已有合法 settings.json 不会因 bundle 更新被覆盖，升级后须手动改一次并保存）。
 
 ## 共享记忆布局
 
@@ -286,7 +290,7 @@ plugin_manager remove_bundle   dsh-agent-squad
 
 ## 升级与重载
 
-本插件挂载的 Team 运行时与工具都归属于插件上下文。修改 `index.js` 后，用插件管理器禁用再启用 `agent-squad` 即可干净重载（工具全局注册、按 `when` 对 agent 可见；章程分区由插件上下文持有并随重载销毁）。如果旧版本曾在会话里留下作用域注册，升级后需要重启一次 DSH 清除。
+本插件挂载的 Team 运行时与工具都归属于插件上下文。修改 `index.js` 后，用插件管理器禁用再启用 `agent-squad` 即可干净重载（工具全局注册、按 `when` 对 agent 可见；章程分区由插件上下文持有并随重载销毁）。内置的 qoder-cli provider 也随插件上下文注册/注销：重载后它出现在 `GET /agent-squad/models` 的 `externalProviders`（id `qoder-cli`）。实机验证：在设置页把 qoder 的 `executor` 设为 `external`、`model` 选 `qoder-cli` 并保存（前提是宿主 PATH 上已安装并登录 `qoderclicn`），随后给 qoder 派一个小任务，确认派单结果带 `provider=qoder-cli` 且产物落盘。如果旧版本曾在会话里留下作用域注册，升级后需要重启一次 DSH 清除。
 
 ## 验证记录（2026-11-09，端到端）
 

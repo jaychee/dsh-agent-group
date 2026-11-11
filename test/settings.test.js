@@ -1,9 +1,9 @@
 /**
- * Settings-page test suite — exactly seven top-level tests (T01–T07).
+ * Settings-page test suite — exactly eight top-level tests (T01–T08).
  * Run: node --test dsh-agent-squad/test/settings.test.js
  */
 
-import { test } from 'node:test'
+import { test, mock } from 'node:test'
 import assert from 'node:assert/strict'
 import { execFile } from 'node:child_process'
 import { mkdir, mkdtemp, readFile, readdir, realpath, rm, stat, writeFile, chmod } from 'node:fs/promises'
@@ -155,7 +155,7 @@ test('T02 collectModels groups providers and survives single-provider failure', 
         ]
       },
     },
-    subagents: { list: () => ['spawn', 'codex', 'zcode-cli', 'fork'] },
+    subagents: { list: () => ['spawn', 'codex', 'zcode-cli', 'qoder-cli', 'fork'] },
   })
   assert.deepEqual(
     result.groups.map((group) => group.provider),
@@ -171,12 +171,12 @@ test('T02 collectModels groups providers and survives single-provider failure', 
   assert.deepEqual(result.groups[1].models, [])
   assert.deepEqual(
     result.externalProviders.map((entry) => entry.id),
-    ['codex', 'zcode-cli'],
+    ['codex', 'zcode-cli', 'qoder-cli'],
   )
 })
 
-/** Mock host for T03/T07: minimal surface the plugin's apply() touches. */
-function mockHost(workspace, dshHome, hooks = {}) {
+/** Mock host for T03/T07/T08 wiring: minimal surface the plugin's apply() touches. */
+function mockHost(workspace, dshHome, hooks = {}, options = {}) {
   // Tool registrations keep their `when` visibility condition so tests can
   // assert Lead-only registration (squad_approve_plan).
   const registered = []
@@ -186,6 +186,11 @@ function mockHost(workspace, dshHome, hooks = {}) {
   const sections = []
   const members = []
   const createdHandlers = []
+  const disposers = []
+  /** name → provider, maintained by registerProvider/unregister. */
+  const providers = new Map()
+  /** run.id of every provider start that went through startActivation. */
+  const runIds = []
   let childSeq = 0
   const agentsById = new Map()
   const makeAgent = (id, membership) => {
@@ -205,6 +210,57 @@ function mockHost(workspace, dshHome, hooks = {}) {
     }
     agentsById.set(id, agent)
     return agent
+  }
+  const subagents = {
+    registerProvider: (provider) => {
+      if (providers.has(provider.name)) {
+        const error = new Error(
+          `a subagent provider named "${provider.name}" is already registered`,
+        )
+        error.code = 'DUPLICATE_PROVIDER'
+        throw error
+      }
+      providers.set(provider.name, provider)
+      return () => {
+        if (providers.get(provider.name) === provider) providers.delete(provider.name)
+      }
+    },
+    list: () => ['spawn', 'fork', 'mock-ext', ...providers.keys()],
+    startActivation: async ({ provider, childId, request }) => {
+      childSeq += 1
+      const id = childId ?? request?.childId ?? `child-${childSeq}`
+      activations.push({ provider, childId: id, request })
+      // Test hook: external activations run before the (already
+      // resolved) result is awaited, so the mock "agent" can produce
+      // PLAN.md synchronously — exactly what an external brain does.
+      if (provider !== 'spawn' && hooks.onExternal) {
+        await hooks.onExternal(provider, request)
+      }
+      // Providers registered through registerProvider run for real
+      // (e.g. the built-in qoder-cli adapter around a stub CLI).
+      const registeredProvider = providers.get(provider)
+      if (registeredProvider) {
+        const run = await registeredProvider.start({
+          ...request,
+          cwd: request.cwd ?? workspace,
+          signal: request.signal,
+          label: request.label,
+        })
+        runIds.push(run.id)
+        return { childId: id, result: run.result, dispose: run.dispose }
+      }
+      return {
+        childId: id,
+        result: Promise.resolve({
+          stopReason: 'completed',
+          output: [{ type: 'text', text: 'done' }],
+        }),
+        dispose: async () => {},
+      }
+    },
+    sendMessage: async (_from, childId, content) => {
+      sent.push({ childId, content })
+    },
   }
   const ctx = {
     agentTeams: {
@@ -232,30 +288,7 @@ function mockHost(workspace, dshHome, hooks = {}) {
         return { get: () => workspace, set: async () => {} }
       }
       if (name === 'subagents') {
-        return {
-          startActivation: async ({ provider, childId, request }) => {
-            childSeq += 1
-            const id = childId ?? request?.childId ?? `child-${childSeq}`
-            activations.push({ provider, childId: id, request })
-            // Test hook: external activations run before the (already
-            // resolved) result is awaited, so the mock "agent" can produce
-            // PLAN.md synchronously — exactly what an external brain does.
-            if (provider !== 'spawn' && hooks.onExternal) {
-              await hooks.onExternal(provider, request)
-            }
-            return {
-              childId: id,
-              result: Promise.resolve({
-                stopReason: 'completed',
-                output: [{ type: 'text', text: 'done' }],
-              }),
-              dispose: async () => {},
-            }
-          },
-          sendMessage: async (_from, childId, content) => {
-            sent.push({ childId, content })
-          },
-        }
+        return options.noSubagents ? undefined : subagents
       }
       return undefined
     },
@@ -263,11 +296,15 @@ function mockHost(workspace, dshHome, hooks = {}) {
       if (event === 'agent/created') createdHandlers.push(handler)
     },
     effect: (fn) => {
-      fn()
-      return () => {}
+      const dispose = fn()
+      disposers.push(dispose)
+      return dispose
     },
   }
-  return { ctx, registered, activations, sent, spawned, sections, members, agentsById, makeAgent, dshHome }
+  return {
+    ctx, registered, activations, sent, spawned, sections, members, agentsById, makeAgent,
+    dshHome, subagents, providers, runIds, disposers,
+  }
 }
 
 /** T03 — start/dispatch re-read settings; three executors; live children keep their binding. */
@@ -299,6 +336,18 @@ test('T03 dispatch reads fresh settings and routes external/local/team executors
     )
 
     const { apply } = await import('../index.js')
+    // Real qoder-stub CLI: writes the cwd marker file and prints its argv as
+    // JSON, proving the plugin config reaches the provider's spawn.
+    const stubPath = join(dshHome, 'qoder-stub.cjs')
+    await writeFile(
+      stubPath,
+      '#!/usr/bin/env node\n' +
+        "const { writeFileSync } = require('node:fs')\n" +
+        "writeFileSync('qoder-test-output.txt', 'ok\\n')\n" +
+        'process.stdout.write(JSON.stringify(process.argv.slice(2)))\n',
+      'utf8',
+    )
+    await chmod(stubPath, 0o755)
     // The mock external brain writes PLAN.md before its activation resolves.
     const host = mockHost(workspace, dshHome, {
       onExternal: async (_provider, request) => {
@@ -307,7 +356,12 @@ test('T03 dispatch reads fresh settings and routes external/local/team executors
         if (dir) await writeFile(join(dir, 'PLAN.md'), '# PLAN (mock)\n', 'utf8')
       },
     })
-    apply(host.ctx, { agents: BUNDLE_AGENTS })
+    apply(host.ctx, {
+      agents: BUNDLE_AGENTS,
+      qoderCommand: stubPath,
+      qoderPermissionMode: 'custom',
+      qoderModel: 'm1',
+    })
     const tool = (name) =>
       host.registered.find((entry) => entry.definition.name === name).definition
     const lead = { id: 'lead-1', session: { id: 'session-1' } }
@@ -581,6 +635,177 @@ test('T03 dispatch reads fresh settings and routes external/local/team executors
       tool('squad_finish').execute({ summary: 'done?', task_id: secondTaskId }, exec),
       /REVIEW/,
     )
+
+    // --- built-in qoder-cli provider: registration, catalog, dispatch -------
+    assert.ok(host.providers.has('qoder-cli'), 'qoder-cli provider registered')
+    assert.ok(host.subagents.list().includes('qoder-cli'))
+    // Loopback GET /agent-squad/models surfaces the provider as external.
+    {
+      const { createRequestHandler } = await import('../http.js')
+      const { createSettingsStore: mkStore } = await import('../settings.js')
+      const handler = createRequestHandler({
+        store: mkStore({ filePath: settingsPath }),
+        models: { llm: { listProviders: () => [] }, subagents: host.subagents },
+      })
+      const res = {
+        statusCode: 0,
+        headers: null,
+        body: '',
+        writeHead(code, headers) {
+          this.statusCode = code
+          this.headers = headers
+        },
+        end(text) {
+          this.body = String(text ?? '')
+        },
+      }
+      await handler(
+        {
+          method: 'GET',
+          url: '/agent-squad/models',
+          headers: { host: 'localhost:57954' },
+          socket: { remoteAddress: '127.0.0.1', localPort: 57954 },
+        },
+        res,
+      )
+      assert.equal(res.statusCode, 200)
+      const body = JSON.parse(res.body)
+      assert.ok(
+        body.externalProviders.some(
+          (entry) => entry.id === 'qoder-cli' && entry.label === 'qoder-cli',
+        ),
+      )
+    }
+
+    // External dispatch through the real stub CLI: settings say qoder runs on
+    // the built-in provider with the custom command/mode/model.
+    snapshot = await settingsStore.read()
+    await settingsStore.save({
+      expectedRevision: snapshot.revision,
+      agents: snapshot.agents.map((agent) => {
+        if (agent.id === 'qoder') {
+          return { ...agent, role: 'worker', executor: 'external', model: 'qoder-cli' }
+        }
+        if (agent.id === 'codex') return { ...agent, role: 'brain' }
+        return agent
+      }),
+      worktree: snapshot.worktree,
+    })
+    const qoderStart = await tool('squad_start').execute(
+      { goal: 'qoder test', acceptance: 'ok', agents: ['qoder'] },
+      exec,
+    )
+    assert.match(qoderStart, /已创建/)
+    const sentBeforeQoder = host.sent.length
+    const spawnedBeforeQoder = host.spawned.length
+    const runsBefore = host.runIds.length
+    const qoderOut = await tool('squad_dispatch').execute(
+      { agent: 'qoder', message: 'qoder test', phase: 'implement' },
+      exec,
+    )
+    assert.match(qoderOut, /已外部派发 qoder/)
+    assert.match(qoderOut, /provider=qoder-cli/)
+    assert.equal(host.activations.at(-1).provider, 'qoder-cli')
+    const qoderPrompt = host.activations
+      .at(-1)
+      .request.prompt.map((block) => block.text)
+      .join('')
+    const stubArgs = JSON.parse(qoderOut.split('输出：\n')[1])
+    assert.deepEqual(stubArgs, [
+      '-p', qoderPrompt,
+      '-w', workspace,
+      '--permission-mode', 'custom',
+      '-m', 'm1',
+    ])
+    assert.equal(await readFile(join(workspace, 'qoder-test-output.txt'), 'utf8'), 'ok\n')
+    // Second one-shot dispatch: fresh run id, still no sendMessage/spawnTeammate.
+    await tool('squad_dispatch').execute(
+      { agent: 'qoder', message: 'qoder test again', phase: 'implement' },
+      exec,
+    )
+    assert.equal(host.activations.at(-1).provider, 'qoder-cli')
+    assert.equal(host.runIds.length, runsBefore + 2)
+    assert.notEqual(host.runIds.at(-1), host.runIds.at(-2))
+    assert.equal(host.sent.length, sentBeforeQoder)
+    assert.equal(host.spawned.length, spawnedBeforeQoder)
+    // The effect's disposer unregisters the provider exactly once.
+    const qoderDispose = host.disposers[0]
+    assert.equal(typeof qoderDispose, 'function')
+    qoderDispose()
+    assert.ok(!host.providers.has('qoder-cli'))
+    assert.ok(!host.subagents.list().includes('qoder-cli'))
+    qoderDispose() // idempotent no-op
+
+    // Independent hosts: no subagents service is skipped; missing/blank/
+    // non-string qoder config falls back to the defaults AND the defaults
+    // actually reach the spawned command line. An isolated PATH stub named
+    // `qoderclicn` captures the resolved script and argv — never a vendor CLI.
+    {
+      const bareRoot = await tempRoot()
+      const bare = mockHost(bareRoot, dshHome, {}, { noSubagents: true })
+      apply(bare.ctx, {}) // must not throw
+      assert.equal(bare.providers.size, 0)
+      await rm(bareRoot, { recursive: true, force: true })
+
+      const stubDir = await mkdtemp(join(tmpdir(), 'asq-qoder-bin-'))
+      const stubPath = join(stubDir, 'qoderclicn')
+      await writeFile(
+        stubPath,
+        '#!/usr/bin/env node\n' +
+          "const { writeFileSync } = require('node:fs')\n" +
+          "writeFileSync('qoder-default-output.txt', JSON.stringify({ script: process.argv[1], argv: process.argv.slice(2) }) + '\\n')\n",
+        'utf8',
+      )
+      await chmod(stubPath, 0o755)
+      const pathBefore = process.env.PATH
+      process.env.PATH = `${stubDir}${pathBefore ? `:${pathBefore}` : ''}`
+      const casesRoot = await tempRoot()
+      try {
+        const cases = [
+          ['omitted', undefined],
+          ['blank-command', { qoderCommand: '   ' }],
+          ['blank-permission', { qoderPermissionMode: '' }],
+          ['blank-model', { qoderModel: '' }],
+          ['nonstring-command', { qoderCommand: 42 }],
+          ['nonstring-permission', { qoderPermissionMode: {} }],
+          ['nonstring-model', { qoderModel: 9 }],
+        ]
+        for (const [label, config] of cases) {
+          const root = await mkdtemp(join(casesRoot, `${label}-`))
+          const host = mockHost(root, dshHome)
+          apply(host.ctx, config)
+          const provider = host.providers.get('qoder-cli')
+          assert.ok(provider, label)
+          const run = await provider.start({
+            prompt: [{ type: 'text', text: 'defaults probe' }],
+            parent: { id: 'lead-1' },
+            cwd: root,
+          })
+          const result = await run.result
+          assert.equal(result.stopReason, 'completed', label)
+          const captured = JSON.parse(await readFile(join(root, 'qoder-default-output.txt'), 'utf8'))
+          // The provider spawned the DEFAULT command, resolved to the PATH stub.
+          assert.ok(captured.script.endsWith('/qoderclicn'), label)
+          // Default permission mode, and no -m flag for the empty default model.
+          assert.deepEqual(
+            captured.argv,
+            ['-p', 'defaults probe', '-w', root, '--permission-mode', 'accept_edits'],
+            label,
+          )
+          assert.equal(await run.dispose(), undefined, label)
+          if (label === 'omitted') {
+            const dispose = host.disposers[0]
+            dispose()
+            assert.ok(!host.providers.has('qoder-cli'))
+            dispose() // unregister once is enough; repeat is a no-op
+          }
+        }
+      } finally {
+        process.env.PATH = pathBefore
+        await rm(stubDir, { recursive: true, force: true })
+        await rm(casesRoot, { recursive: true, force: true })
+      }
+    }
   } finally {
     delete process.env.DSH_HOME
     await rm(workspace, { recursive: true, force: true })
@@ -1430,5 +1655,339 @@ test('T07 plan gate: lead review, design budget, squad_approve_plan, archives an
     delete process.env.DSH_HOME
     await rm(workspace, { recursive: true, force: true })
     await rm(dshHome, { recursive: true, force: true })
+  }
+})
+
+/** T08 — qoder-cli provider: arg builder defaults/overrides and full process lifecycle. */
+test('T08 qoder provider builds args and handles process lifecycle', async () => {
+  const { createQoderProvider, buildQoderArgs } = await import('../qoder.js')
+  const { PassThrough } = await import('node:stream')
+  const { EventEmitter, getEventListeners } = await import('node:events')
+
+  // --- arg builder: defaults, empty strings, frozen config -----------------
+  assert.deepEqual(buildQoderArgs('hi', '/tmp/a b'), [
+    '-p', 'hi', '-w', '/tmp/a b', '--permission-mode', 'accept_edits',
+  ])
+  assert.deepEqual(buildQoderArgs('', '', { model: '' }), [
+    '-p', '', '-w', '', '--permission-mode', 'accept_edits',
+  ])
+  assert.deepEqual(
+    buildQoderArgs('a\nb;$(x)', '/tmp/a b', Object.freeze({ permissionMode: 'custom', model: 'm1' })),
+    ['-p', 'a\nb;$(x)', '-w', '/tmp/a b', '--permission-mode', 'custom', '-m', 'm1'],
+  )
+
+  // --- constructor defaults: shape, capabilities, one-shot -----------------
+  const bare = createQoderProvider()
+  assert.equal(bare.name, 'qoder-cli')
+  assert.equal(bare.inheritsParentContext, false)
+  assert.deepEqual(bare.capabilities, {
+    agentOptions: false,
+    agentPreset: false,
+    outputSchema: false,
+    depthLimit: false,
+  })
+  assert.equal(bare.prepareContinuable, undefined)
+
+  // --- spawn double: EventEmitter child + PassThrough stdio -----------------
+  const makeChild = () => {
+    const child = new EventEmitter()
+    child.stdout = new PassThrough()
+    child.stderr = new PassThrough()
+    child.pid = 4321
+    child.kills = []
+    child.kill = (signal) => {
+      child.kills.push(signal)
+      return true
+    }
+    return child
+  }
+  const spawnCalls = []
+  const spawnImpl = (command, args, options) => {
+    const child = makeChild()
+    spawnCalls.push({ command, args, options, child })
+    return child
+  }
+  const text = (t) => ({ type: 'text', text: t })
+  const baseRequest = (over = {}) => ({
+    prompt: [text('A'), text('B')],
+    parent: { id: 'lead-1' },
+    cwd: '/tmp/a b',
+    ...over,
+  })
+  const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
+  const startRun = async (provider, over) => {
+    const run = await provider.start(baseRequest(over))
+    return { run, child: spawnCalls.at(-1).child }
+  }
+  const flush = () => new Promise((resolve) => setImmediate(resolve))
+
+  const defaultProvider = createQoderProvider({ spawnImpl })
+  const run1 = await startRun(defaultProvider)
+  assert.deepEqual(spawnCalls.at(-1), {
+    command: 'qoderclicn',
+    args: ['-p', 'A\nB', '-w', '/tmp/a b', '--permission-mode', 'accept_edits'],
+    options: { cwd: '/tmp/a b', stdio: ['ignore', 'pipe', 'pipe'], shell: false },
+    child: spawnCalls.at(-1).child,
+  })
+  assert.match(run1.run.id, UUID_RE)
+  const customProvider = createQoderProvider({
+    command: '/tmp/qoder',
+    permissionMode: 'custom',
+    model: 'm1',
+    spawnImpl,
+  })
+  const run2 = await startRun(customProvider)
+  assert.equal(spawnCalls.at(-1).command, '/tmp/qoder')
+  assert.deepEqual(spawnCalls.at(-1).args, [
+    '-p', 'A\nB', '-w', '/tmp/a b', '--permission-mode', 'custom', '-m', 'm1',
+  ])
+  assert.match(run2.run.id, UUID_RE)
+  assert.notEqual(run1.run.id, run2.run.id)
+
+  // --- success: split multibyte stdout, stderr excluded, exit≠settle -------
+  {
+    const { run, child } = await startRun(defaultProvider)
+    const bytes = Buffer.from('你好\n', 'utf8')
+    // Split inside the FIRST multibyte character (你 = 3 bytes): only a real
+    // UTF-8 decoder on the stream reassembles '你好\n' correctly.
+    child.stdout.write(bytes.subarray(0, 1))
+    child.stdout.write(bytes.subarray(1))
+    child.stderr.write('warning\n')
+    child.emit('exit', 0)
+    let settled = false
+    run.result.then(() => {
+      settled = true
+    })
+    await flush()
+    assert.equal(settled, false) // exit alone must not settle the result
+    child.emit('close', 0, null)
+    assert.deepEqual(await run.result, {
+      output: [{ type: 'text', text: '你好\n' }],
+      stopReason: 'completed',
+    })
+    // Completed: dispose reuses one cached cleanup Promise and never kills.
+    const doneDispose = run.dispose()
+    assert.equal(run.dispose(), doneDispose)
+    assert.equal(await doneDispose, undefined)
+    assert.deepEqual(child.kills, [])
+  }
+  {
+    const { run, child } = await startRun(defaultProvider)
+    child.emit('close', 0, null)
+    assert.deepEqual(await run.result, {
+      output: [{ type: 'text', text: '' }],
+      stopReason: 'completed',
+    })
+    const doneDispose = run.dispose()
+    assert.equal(run.dispose(), doneDispose)
+    assert.equal(await doneDispose, undefined)
+    assert.deepEqual(child.kills, [])
+  }
+
+  // --- failure table: non-zero exit / signal / no status --------------------
+  {
+    const cases = [
+      { code: 2, signal: null, stderr: ' denied\n', diagnostic: 'Qoder CLI exited with code 2: denied' },
+      { code: 1, signal: null, stderr: '', diagnostic: 'Qoder CLI exited with code 1' },
+      { code: null, signal: 'SIGTERM', stderr: '', diagnostic: 'Qoder CLI terminated by signal SIGTERM' },
+      { code: null, signal: null, stderr: '', diagnostic: 'Qoder CLI exited without status' },
+    ]
+    for (const item of cases) {
+      const { run, child } = await startRun(defaultProvider)
+      child.stdout.write('partial')
+      if (item.stderr !== '') child.stderr.write(item.stderr)
+      child.emit('close', item.code, item.signal)
+      const result = await run.result
+      assert.deepEqual(result.output, [{ type: 'text', text: 'partial' }])
+      assert.equal(result.stopReason, 'error')
+      assert.equal(result.diagnostic, item.diagnostic)
+    }
+  }
+
+  // --- errors: spawn throw and child error ----------------------------------
+  {
+    const throwing = createQoderProvider({
+      spawnImpl: () => {
+        throw new Error('ENOENT')
+      },
+    })
+    const controller = new AbortController() // not aborted yet
+    const run = await throwing.start(baseRequest({ signal: controller.signal }))
+    assert.deepEqual(await run.result, {
+      output: [{ type: 'text', text: '' }],
+      stopReason: 'error',
+      diagnostic: 'Qoder CLI error: ENOENT',
+    })
+    // No abort listener may remain on a settled run.
+    assert.equal(getEventListeners(controller.signal, 'abort').length, 0)
+    // Never spawned: dispose still reuses one cached cleanup Promise.
+    const thrownDispose = run.dispose()
+    assert.equal(run.dispose(), thrownDispose)
+    assert.equal(await thrownDispose, undefined)
+    assert.equal(getEventListeners(controller.signal, 'abort').length, 0)
+    // A late abort must not re-arm anything either.
+    controller.abort()
+    assert.equal(getEventListeners(controller.signal, 'abort').length, 0)
+    assert.deepEqual(await run.result, {
+      output: [{ type: 'text', text: '' }],
+      stopReason: 'error',
+      diagnostic: 'Qoder CLI error: ENOENT',
+    })
+  }
+  {
+    const { run, child } = await startRun(defaultProvider)
+    child.emit('error', new Error('ENOENT'))
+    const result = await run.result
+    assert.deepEqual(result.output, [{ type: 'text', text: '' }])
+    assert.equal(result.stopReason, 'error')
+    assert.equal(result.diagnostic, 'Qoder CLI error: ENOENT')
+    child.emit('close', 0, null) // late close must not rewrite the result
+    const again = await run.result
+    assert.equal(again.stopReason, 'error')
+    assert.equal(again.diagnostic, 'Qoder CLI error: ENOENT')
+  }
+
+  // --- cancel: dispose settles aborted, SIGTERM then close ------------------
+  {
+    const { run, child } = await startRun(defaultProvider)
+    child.stdout.write('partial')
+    const first = run.dispose()
+    const second = run.dispose()
+    assert.equal(second, first) // one cleanup Promise for concurrent dispose
+    assert.deepEqual(child.kills, ['SIGTERM'])
+    assert.deepEqual(await run.result, {
+      output: [{ type: 'text', text: 'partial' }],
+      stopReason: 'aborted',
+    })
+    child.emit('close', null, 'SIGTERM')
+    assert.equal(await first, undefined)
+    assert.equal(run.dispose(), first) // still the same promise
+    assert.deepEqual(child.kills, ['SIGTERM'])
+  }
+
+  // --- no-pid spawn failure AFTER dispose: cleanup resolves without close ----
+  {
+    const { run, child } = await startRun(defaultProvider)
+    child.pid = undefined // spawn-failure shape: no process, kill→false
+    child.kill = (signal) => {
+      child.kills.push(signal)
+      return false
+    }
+    const disposed = run.dispose()
+    child.emit('error', new Error('ENOENT')) // no close will ever arrive
+    assert.equal(await disposed, undefined)
+    const result = await run.result
+    assert.equal(result.stopReason, 'aborted') // first terminal state kept
+    assert.equal(result.output[0].text, '')
+    assert.equal(result.diagnostic, undefined)
+    const again = run.dispose()
+    assert.equal(await again, undefined)
+    assert.deepEqual(child.kills, ['SIGTERM']) // later dispose kills nothing
+  }
+
+  // --- cancel escalation: 1000ms without close adds SIGKILL -----------------
+  {
+    const { run, child } = await startRun(defaultProvider)
+    child.stdout.write('partial')
+    mock.timers.enable({ apis: ['setTimeout'] })
+    const disposed = run.dispose()
+    try {
+      assert.deepEqual(child.kills, ['SIGTERM'])
+      mock.timers.tick(1000)
+      assert.deepEqual(child.kills, ['SIGTERM', 'SIGKILL'])
+      child.emit('close', null, 'SIGKILL')
+      mock.timers.tick(1000) // no leftover timer fires again
+      assert.deepEqual(child.kills, ['SIGTERM', 'SIGKILL'])
+      assert.equal(await disposed, undefined)
+    } finally {
+      mock.timers.reset()
+    }
+    const result = await run.result
+    assert.equal(result.stopReason, 'aborted')
+    assert.equal(result.output[0].text, 'partial')
+    assert.equal(result.diagnostic, undefined)
+  }
+
+  // --- abort DURING spawn: the returned child must still be cancelled -------
+  {
+    const controller = new AbortController()
+    const child = makeChild()
+    const racing = createQoderProvider({
+      spawnImpl: () => {
+        controller.abort() // fires before spawn returns
+        return child
+      },
+    })
+    mock.timers.enable({ apis: ['setTimeout'] })
+    try {
+      const run = await racing.start(baseRequest({ signal: controller.signal }))
+      assert.deepEqual(child.kills, ['SIGTERM']) // child got terminated
+      assert.deepEqual(await run.result, {
+        output: [{ type: 'text', text: '' }],
+        stopReason: 'aborted',
+      })
+      const first = run.dispose()
+      const second = run.dispose()
+      assert.equal(second, first) // one cleanup Promise
+      let fulfilled = false
+      first.then(() => {
+        fulfilled = true
+      })
+      await flush()
+      assert.equal(fulfilled, false) // not resolved before close
+      mock.timers.tick(999)
+      assert.deepEqual(child.kills, ['SIGTERM']) // no escalation yet
+      mock.timers.tick(1)
+      assert.deepEqual(child.kills, ['SIGTERM', 'SIGKILL'])
+      child.emit('close', 0, null) // late success must not complete a cancelled run
+      assert.equal(await first, undefined)
+      const again = await run.result
+      assert.equal(again.stopReason, 'aborted')
+      assert.equal(again.diagnostic, undefined)
+      assert.equal(run.dispose(), first)
+      mock.timers.tick(1000)
+      assert.deepEqual(child.kills, ['SIGTERM', 'SIGKILL']) // later dispose kills nothing
+    } finally {
+      mock.timers.reset()
+    }
+  }
+
+  // --- kill failure surfaces the termination error ---------------------------
+  {
+    const { run, child } = await startRun(defaultProvider)
+    child.kill = (signal) => {
+      child.kills.push(signal)
+      throw new Error('denied')
+    }
+    await assert.rejects(run.dispose(), { message: 'Qoder CLI termination failed: denied' })
+  }
+
+  // --- abort signal: pre-aborted skips spawn; abort mid-run ≡ dispose -------
+  {
+    const spawnCount = spawnCalls.length
+    const controller = new AbortController()
+    controller.abort()
+    const run = await defaultProvider.start(baseRequest({ signal: controller.signal }))
+    assert.equal(spawnCalls.length, spawnCount) // no spawn for a dead signal
+    assert.deepEqual(await run.result, {
+      output: [{ type: 'text', text: '' }],
+      stopReason: 'aborted',
+    })
+    const deadDispose = run.dispose()
+    assert.equal(run.dispose(), deadDispose)
+    assert.equal(await deadDispose, undefined)
+  }
+  {
+    const controller = new AbortController()
+    const { run, child } = await startRun(defaultProvider, { signal: controller.signal })
+    child.stdout.write('partial')
+    controller.abort()
+    assert.deepEqual(child.kills, ['SIGTERM'])
+    assert.deepEqual(await run.result, {
+      output: [{ type: 'text', text: 'partial' }],
+      stopReason: 'aborted',
+    })
+    child.emit('close', null, 'SIGTERM')
+    assert.equal(await run.dispose(), undefined)
   }
 })
