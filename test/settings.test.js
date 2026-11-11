@@ -1,14 +1,14 @@
 /**
- * Settings-page test suite — exactly eight top-level tests (T01–T08).
+ * Settings-page test suite — exactly nine top-level tests (T01–T09).
  * Run: node --test dsh-agent-squad/test/settings.test.js
  */
 
 import { test, mock } from 'node:test'
 import assert from 'node:assert/strict'
 import { execFile } from 'node:child_process'
-import { mkdir, mkdtemp, readFile, readdir, realpath, rm, stat, writeFile, chmod } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, readdir, realpath, rm, stat, symlink, writeFile, chmod } from 'node:fs/promises'
 import { homedir, tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import { promisify } from 'node:util'
 
 const run = promisify(execFile)
@@ -191,6 +191,10 @@ function mockHost(workspace, dshHome, hooks = {}, options = {}) {
   const providers = new Map()
   /** run.id of every provider start that went through startActivation. */
   const runIds = []
+  /** Every workingDirectory get/set call, in order (T09). */
+  const cwdCalls = []
+  const baseWorkingDirectory =
+    options.workingDirectory ?? { get: () => workspace, set: async () => {} }
   let childSeq = 0
   const agentsById = new Map()
   const makeAgent = (id, membership) => {
@@ -226,7 +230,7 @@ function mockHost(workspace, dshHome, hooks = {}, options = {}) {
       }
     },
     list: () => ['spawn', 'fork', 'mock-ext', ...providers.keys()],
-    startActivation: async ({ provider, childId, request }) => {
+    startActivation: async ({ provider, childId, request, signal }) => {
       childSeq += 1
       const id = childId ?? request?.childId ?? `child-${childSeq}`
       activations.push({ provider, childId: id, request })
@@ -243,7 +247,7 @@ function mockHost(workspace, dshHome, hooks = {}, options = {}) {
         const run = await registeredProvider.start({
           ...request,
           cwd: request.cwd ?? workspace,
-          signal: request.signal,
+          signal: signal ?? request.signal,
           label: request.label,
         })
         runIds.push(run.id)
@@ -285,7 +289,16 @@ function mockHost(workspace, dshHome, hooks = {}, options = {}) {
     tools: { register: (definition, options) => registered.push({ definition, when: options?.when }) },
     get: (name) => {
       if (name === 'workingDirectory') {
-        return { get: () => workspace, set: async () => {} }
+        return {
+          get: (session) => {
+            cwdCalls.push({ op: 'get', session })
+            return baseWorkingDirectory.get(session)
+          },
+          set: async (agent, directory, signal) => {
+            cwdCalls.push({ op: 'set', directory })
+            return baseWorkingDirectory.set(agent, directory, signal)
+          },
+        }
       }
       if (name === 'subagents') {
         return options.noSubagents ? undefined : subagents
@@ -303,7 +316,7 @@ function mockHost(workspace, dshHome, hooks = {}, options = {}) {
   }
   return {
     ctx, registered, activations, sent, spawned, sections, members, agentsById, makeAgent,
-    dshHome, subagents, providers, runIds, disposers,
+    dshHome, subagents, providers, runIds, disposers, cwdCalls,
   }
 }
 
@@ -1989,5 +2002,1058 @@ test('T08 qoder provider builds args and handles process lifecycle', async () =>
     })
     child.emit('close', null, 'SIGTERM')
     assert.equal(await run.dispose(), undefined)
+  }
+})
+
+// --- T09 helpers: real temp Git repositories and strict wrappers ------------
+
+/** Create a temp Git repository with local identity and one commit. */
+async function makeGitRepo(parent, name, message, files = {}) {
+  const dir = join(parent, name)
+  await mkdir(dir, { recursive: true })
+  await run('git', ['-C', dir, 'init', '-q'])
+  await run('git', ['-C', dir, 'config', 'user.email', 't@t'])
+  await run('git', ['-C', dir, 'config', 'user.name', 't'])
+  for (const [file, content] of Object.entries(files)) {
+    await mkdir(dirname(join(dir, file)), { recursive: true })
+    await writeFile(join(dir, file), content, 'utf8')
+  }
+  await run('git', ['-C', dir, 'add', '-A'])
+  await run('git', ['-C', dir, 'commit', '-q', '-m', message])
+  return realpath(dir)
+}
+
+async function writeSquadSettings(dshHome, qoderExecutor) {
+  await mkdir(join(dshHome, 'agent-squad'), { recursive: true })
+  await writeFile(
+    join(dshHome, 'agent-squad', 'settings.json'),
+    JSON.stringify(
+      {
+        version: 1,
+        revision: 1,
+        agents: [
+          { id: 'codex', displayName: 'codex', role: 'brain', executor: 'external', model: 'mock-ext', description: 'b' },
+          { id: 'zcode', displayName: 'zcode', role: 'worker', executor: 'local', model: 'p/m1', description: 'w' },
+          {
+            id: 'qoder',
+            displayName: 'qoder',
+            role: 'worker',
+            executor: qoderExecutor ?? 'team',
+            model: qoderExecutor === 'external' ? 'qoder-cli' : '',
+            description: 'w2',
+          },
+        ],
+        worktree: { directory: '.agents/worktrees' },
+      },
+      null,
+      2,
+    ),
+    'utf8',
+  )
+}
+
+const gitOut = async (dir, args) => (await run('git', ['-C', dir, ...args])).stdout.trim()
+const readOptional = async (path) => readFile(path, 'utf8').catch(() => undefined)
+const gitSnapshot = async (repo) => ({
+  worktrees: await gitOut(repo, ['worktree', 'list', '--porcelain']),
+  branches: await gitOut(repo, ['branch', '--list']),
+})
+
+/** Remove every squad worktree/branch a test created under .agents/worktrees. */
+async function cleanupSquadArtifacts(repos) {
+  for (const repo of repos) {
+    const list = await gitOut(repo, ['worktree', 'list', '--porcelain']).catch(() => '')
+    for (const line of list.split('\n')) {
+      if (!line.startsWith('worktree ')) continue
+      const path = line.slice('worktree '.length).trim()
+      if (path.includes('.agents')) {
+        await run('git', ['-C', repo, 'worktree', 'remove', '--force', path]).catch(() => {})
+      }
+    }
+    const branches = await gitOut(repo, ['branch', '--list', 'squad-*']).catch(() => '')
+    for (const branch of branches.split('\n')) {
+      const name = branch.replace(/^\*?\s*/, '').trim()
+      if (name) await run('git', ['-C', repo, 'branch', '-D', name]).catch(() => {})
+    }
+  }
+}
+
+/** T09 — one task across multiple independent Git repositories (PLAN §30–§36). */
+test('T09 multi-repository lifecycle, validation, rollback and compatibility', async () => {
+  const root = await tempRoot()
+  const dshHome = await tempRoot()
+  process.env.DSH_HOME = dshHome
+  const labeled = async (name, fn) => {
+    try {
+      await fn()
+    } catch (error) {
+      error.message = `[${name}] ${error.message}`
+      throw error
+    }
+  }
+  try {
+    // --- start-dispatch-status (PLAN §31) -----------------------------------
+    await labeled('start-dispatch-status', async () => {
+      const caller = join(root, 's1-caller')
+      await mkdir(caller, { recursive: true })
+      const repoA = await makeGitRepo(caller, 'a/shared repo', 'base A', { 'README.md': 'seed A\n' })
+      const repoB = await makeGitRepo(root, 's1-b/shared repo', 'base B', { 'README.md': 'seed B\n' })
+      await writeFile(join(repoA, 'dirty.txt'), 'uncommitted\n', 'utf8')
+      await writeSquadSettings(dshHome)
+      let currentDir = caller
+      const cwdService = { get: () => currentDir, set: async (_a, d) => { currentDir = d } }
+      const host = mockHost(caller, dshHome, {}, { workingDirectory: cwdService })
+      const { apply } = await import('../index.js')
+      apply(host.ctx, { agents: BUNDLE_AGENTS })
+      const tool = (name) =>
+        host.registered.find((entry) => entry.definition.name === name).definition
+      const lead = { id: 'lead-1', session: { id: 'session-1' } }
+      const exec = { agent: lead, signal: undefined }
+
+      // schema.repos is a non-empty array of non-empty strings.
+      const startSchema = tool('squad_start').parameters.properties.repos
+      assert.equal(startSchema.type, 'array')
+      assert.equal(startSchema.minItems, 1)
+      assert.equal(startSchema.items.minLength, 1)
+
+      try {
+        const startOutput = await tool('squad_start').execute(
+          { goal: 'multi', acceptance: 'ok', repos: ['a/shared repo', repoB] },
+          exec,
+        )
+        const taskId = /任务 (t-\S+) 已创建/.exec(startOutput)[1]
+        const taskRoot = join(repoA, '.agents', 'worktrees', `squad-${taskId}`)
+        const wtA = join(taskRoot, '1-shared-repo')
+        const wtB = join(taskRoot, '2-shared-repo')
+        const branch = `squad-${taskId}`
+        const baseA = await gitOut(repoA, ['rev-parse', 'HEAD'])
+        const baseB = await gitOut(repoB, ['rev-parse', 'HEAD'])
+        assert.notEqual(baseA, baseB)
+        // Exact layout, unified branch, per-repo base, primary alias.
+        const state = JSON.parse(await readFile(join(taskRoot, '.agent-squad', taskId, 'STATE.json'), 'utf8'))
+        assert.equal(state.taskRoot, taskRoot)
+        assert.equal(state.worktree.path, wtA)
+        assert.deepEqual(
+          state.worktrees.map((wt) => [wt.repo, wt.path, wt.branch, wt.baseCommit]),
+          [
+            [repoA, wtA, branch, baseA],
+            [repoB, wtB, branch, baseB],
+          ],
+        )
+        assert.equal(state.worktrees[0].repositoryRoot, repoA)
+        assert.equal(currentDir, taskRoot)
+        assert.equal(host.cwdCalls.at(-1).directory, taskRoot)
+        // Five deduplicated current pointers (task root, both worktrees,
+        // primary source, caller source), all with the same content.
+        const expectedPointer = { taskId, memoryRoot: join(taskRoot, '.agent-squad'), worktree: wtA, taskRoot }
+        const pointerPaths = [
+          join(taskRoot, '.agent-squad', 'current.json'),
+          join(wtA, '.agent-squad', 'current.json'),
+          join(wtB, '.agent-squad', 'current.json'),
+          join(repoA, '.agent-squad', 'current.json'),
+          join(caller, '.agent-squad', 'current.json'),
+        ]
+        for (const pointerPath of pointerPaths) {
+          assert.deepEqual(JSON.parse(await readFile(pointerPath, 'utf8')), expectedPointer, pointerPath)
+        }
+        // TASK.md and status list every repository, path and base SHA.
+        const taskMd = await readFile(join(taskRoot, '.agent-squad', taskId, 'TASK.md'), 'utf8')
+        for (const text of [taskMd, startOutput]) {
+          assert.ok(text.includes(`仓库：${repoA} | worktree：${wtA} | 分支：${branch} | 基线：${baseA}`))
+          assert.ok(text.includes(`仓库：${repoB} | worktree：${wtB} | 分支：${branch} | 基线：${baseB}`))
+        }
+        assert.ok(taskMd.includes(taskRoot))
+        // The dirty source file did not leak into the new worktree.
+        await assert.rejects(stat(join(wtA, 'dirty.txt')))
+
+        // Approve the PLAN (brain participates) before implement dispatches.
+        await writeFile(join(taskRoot, '.agent-squad', taskId, 'PLAN.md'), '# PLAN T09\n', 'utf8')
+        await tool('squad_approve_plan').execute({ task_id: taskId }, exec)
+
+        // external dispatch: request cwd is the task root; prompt lists repos.
+        await tool('squad_dispatch').execute(
+          { agent: 'codex', message: 'review it', phase: 'review' },
+          exec,
+        )
+        assert.equal(host.activations.at(-1).request.cwd, taskRoot)
+        const externalPrompt = host.activations.at(-1).request.prompt.map((b) => b.text).join('')
+        assert.ok(externalPrompt.includes(`仓库：${repoA}`))
+        assert.ok(externalPrompt.includes(`仓库：${repoB}`))
+
+        // local dispatch: request cwd is the task root; prompt lists repos.
+        await tool('squad_dispatch').execute(
+          { agent: 'zcode', message: 'implement', phase: 'implement' },
+          exec,
+        )
+        assert.equal(host.activations.at(-1).request.cwd, taskRoot)
+        const localPrompt = host.activations.at(-1).request.prompt.map((b) => b.text).join('')
+        assert.ok(localPrompt.includes(`仓库：${repoA}`))
+        assert.ok(localPrompt.includes(`仓库：${repoB}`))
+
+        // team dispatch (new + resume): teammate cwd moves to the task root.
+        const setsBefore = host.cwdCalls.filter((c) => c.op === 'set').length
+        await tool('squad_dispatch').execute(
+          { agent: 'qoder', message: 'parallel', phase: 'implement' },
+          exec,
+        )
+        const spawnedPrompt = host.spawned.at(-1).prompt.map((b) => b.text).join('')
+        assert.ok(spawnedPrompt.includes(`仓库：${repoA}`))
+        assert.ok(host.cwdCalls.filter((c) => c.op === 'set').length > setsBefore)
+        await tool('squad_dispatch').execute(
+          { agent: 'qoder', message: 'again', phase: 'implement' },
+          exec,
+        )
+        assert.ok(host.cwdCalls.some((c) => c.op === 'set' && c.directory === taskRoot))
+
+        // qoder-cli external dispatch: -w is the task root, never --add-dir.
+        const stubDir = await mkdtemp(join(tmpdir(), 'asq-qoder-t9-'))
+        const stubPath = join(stubDir, 'qoder-argv.cjs')
+        await writeFile(stubPath, '#!/usr/bin/env node\nprocess.stdout.write(JSON.stringify(process.argv.slice(2)))\n', 'utf8')
+        await chmod(stubPath, 0o755)
+        try {
+          const host2 = mockHost(caller, dshHome, {}, { workingDirectory: cwdService })
+          apply(host2.ctx, { agents: BUNDLE_AGENTS, qoderCommand: stubPath })
+          const tool2 = (name) =>
+            host2.registered.find((entry) => entry.definition.name === name).definition
+          await writeSquadSettings(dshHome, 'external')
+          const qoderOut = await tool2('squad_dispatch').execute(
+            { agent: 'qoder', message: 'argv probe', phase: 'review', task_id: taskId },
+            exec,
+          )
+          const argv = JSON.parse(qoderOut.split('输出：\n')[1])
+          const wIndex = argv.indexOf('-w')
+          assert.equal(argv[wIndex + 1], taskRoot)
+          assert.ok(!argv.includes('--add-dir'))
+          assert.equal(host2.activations.at(-1).request.cwd, taskRoot)
+        } finally {
+          await rm(stubDir, { recursive: true, force: true })
+        }
+
+        const statusOut = await tool('squad_status').execute({}, exec)
+        assert.ok(statusOut.includes(`工作区：${taskRoot}`))
+        assert.ok(statusOut.includes(repoA) && statusOut.includes(repoB))
+        assert.ok(statusOut.includes(baseA) && statusOut.includes(baseB))
+      } finally {
+        await cleanupSquadArtifacts([repoA, repoB])
+      }
+    })
+
+    // --- invalid-and-conflicts (PLAN §32 + §39) ------------------------------
+    await labeled('invalid-and-conflicts', async () => {
+      const caller = join(root, 's2-caller')
+      await mkdir(caller, { recursive: true })
+      const repoC = await makeGitRepo(caller, 'repo-c', 'base C', { 'README.md': 'seed C\n' })
+      await mkdir(join(repoC, 'sub'), { recursive: true })
+      const notRepo = join(caller, 'not-repo')
+      await mkdir(notRepo, { recursive: true })
+      const plainFile = join(caller, 'plain-file')
+      await writeFile(plainFile, 'x', 'utf8')
+      const bare = await mkdtemp(join(tmpdir(), 'asq-bare-'))
+      await run('git', ['-C', bare, 'init', '-q', '--bare'])
+      const repoE = await makeGitRepo(caller, 'repo-e', 'base E', { 'README.md': 'seed E\n' })
+      const repoF = await makeGitRepo(caller, 'repo-f', 'base F', { 'README.md': 'seed F\n' })
+      const repoG = await makeGitRepo(caller, 'repo-g', 'base G', { 'README.md': 'seed G\n' })
+      const repoH = await makeGitRepo(caller, 'repo-h', 'base H', { 'README.md': 'seed H\n' })
+      await run('git', ['-C', repoC, 'worktree', 'add', join(root, 's2-linked-c'), '-b', 'probe-linked'])
+      await symlink(repoC, join(caller, 'repo-c-link'))
+      await writeSquadSettings(dshHome)
+      let currentDir = caller
+      const host = mockHost(caller, dshHome, {}, {
+        workingDirectory: { get: () => currentDir, set: async (_a, d) => { currentDir = d } },
+      })
+      const { apply, createSquadWorktrees } = { ...(await import('../index.js')), ...(await import('../worktree.js')) }
+      apply(host.ctx, { agents: BUNDLE_AGENTS })
+      const tool = (name) =>
+        host.registered.find((entry) => entry.definition.name === name).definition
+      const lead = { id: 'lead-1', session: { id: 'session-1' } }
+      const exec = { agent: lead, signal: undefined }
+
+      const cases = [
+        { repos: [], message: 'repos must be a non-empty array of non-empty strings' },
+        { repos: null, message: 'repos must be a non-empty array of non-empty strings' },
+        { repos: [''], message: 'repos must be a non-empty array of non-empty strings' },
+        { repos: [7], message: 'repos must be a non-empty array of non-empty strings' },
+        { repos: ['missing'], message: `repository does not exist: ${join(caller, 'missing')}` },
+        { repos: [plainFile], message: `not a usable Git repository: ${plainFile}` },
+        { repos: [notRepo], message: `not a usable Git repository: ${notRepo}` },
+        { repos: [bare], message: `not a usable Git repository: ${bare}` },
+        { repos: ['repo-c', 'repo-c'], message: `duplicate repository: ${repoC}` },
+        { repos: ['repo-c', 'repo-c-link'], message: `duplicate repository: ${repoC}` },
+        { repos: [repoC, join(repoC, 'sub')], message: `duplicate repository: ${repoC}` },
+        { repos: [repoC, join(root, 's2-linked-c')], message: `duplicate repository: ${await realpath(join(root, 's2-linked-c'))}` },
+      ]
+      const pointerBefore = await readOptional(join(caller, '.agent-squad', 'current.json'))
+      const snapshotC = await gitSnapshot(repoC)
+      for (const item of cases) {
+        await assert.rejects(
+          tool('squad_start').execute({ goal: 'x', acceptance: 'y', repos: item.repos }, exec),
+          { message: item.message },
+        )
+        assert.deepEqual(await gitSnapshot(repoC), snapshotC)
+        assert.equal(await readOptional(join(caller, '.agent-squad', 'current.json')), pointerBefore)
+      }
+      await run('git', ['-C', repoC, 'worktree', 'remove', '--force', join(root, 's2-linked-c')])
+      await run('git', ['-C', repoC, 'branch', '-D', 'probe-linked'])
+
+      // Direct createSquadWorktrees conflicts with a fixed task id.
+      const taskRoot = join(repoE, '.agents', 'worktrees', 'squad-t9-conflict')
+      const wctx = { get: () => ({ set: async () => {} }) }
+      const base = { ctx: wctx, lead: { id: 'lead' }, sourceDirectory: caller, taskId: 't9-conflict', directory: '.agents/worktrees' }
+      // D06: cancellation is checked after each preflight validation stage.
+      const cancelled = new AbortController()
+      cancelled.abort()
+      const signal = cancelled.signal
+      const beforeAbort = await Promise.all([gitSnapshot(repoE), gitSnapshot(repoF)])
+      for (const item of cases.slice(0, -1)) {
+        await assert.rejects(createSquadWorktrees({ ...base, repos: item.repos, signal }),
+          { message: item.message }, 'D06: repository validation precedes cancellation')
+      }
+      for (const [overrides, message] of [
+        [{ directory: '../bad' }, 'worktree directory must not contain "." or ".." segments: ../bad'],
+        [{ base: 'nope' }, `base revision is not a commit in ${repoE}: nope`],
+        [{ ctx: { get: () => ({}) } }, 'workingDirectory service is unavailable; cannot enter the squad worktree'],
+        [{ ctx: { get: () => ({ set: true }) } }, 'workingDirectory service is unavailable; cannot enter the squad worktree'],
+        [{}, 'worktree creation aborted'],
+      ]) {
+        await assert.rejects(createSquadWorktrees({ ...base, repos: [repoE, repoF], ...overrides, signal }),
+          { message }, 'D06: directory/base/cwd validation precedes cancellation')
+      }
+      assert.deepEqual(await Promise.all([gitSnapshot(repoE), gitSnapshot(repoF)]), beforeAbort, 'D06: zero Git mutations')
+      assert.equal(await readOptional(join(caller, '.agent-squad', 'current.json')), pointerBefore)
+      await assert.rejects(stat(join(repoE, '.agents')), { code: 'ENOENT' })
+      const snapshotE = await gitSnapshot(repoE)
+      const snapshotF = await gitSnapshot(repoF)
+      const assertClean = async () => {
+        assert.deepEqual(await gitSnapshot(repoE), snapshotE)
+        assert.deepEqual(await gitSnapshot(repoF), snapshotF)
+        assert.equal(await readOptional(join(caller, '.agent-squad', 'current.json')), pointerBefore)
+      }
+      // Existing taskRoot directory.
+      await mkdir(taskRoot, { recursive: true })
+      await assert.rejects(createSquadWorktrees({ ...base, repos: [repoE, repoF], signal }), {
+        message: `worktree target already exists: ${taskRoot}`,
+      }, 'D06: target validation precedes cancellation')
+      await assert.rejects(createSquadWorktrees({ ...base, repos: [repoE, repoF] }), {
+        message: `worktree target already exists: ${taskRoot}`,
+      })
+      await rm(join(repoE, '.agents'), { recursive: true, force: true })
+      await assertClean()
+      // Registered but missing sub-path target.
+      const regPath = join(taskRoot, '1-repo-e')
+      await run('git', ['-C', repoE, 'worktree', 'add', regPath, '-b', 'reg-probe'])
+      await rm(regPath, { recursive: true, force: true })
+      await rm(join(repoE, '.agents'), { recursive: true, force: true })
+      await assert.rejects(createSquadWorktrees({ ...base, repos: [repoE, repoF] }), {
+        message: `worktree target already exists: ${regPath}`,
+      })
+      await run('git', ['-C', repoE, 'worktree', 'prune'])
+      await run('git', ['-C', repoE, 'branch', '-D', 'reg-probe'])
+      await assertClean()
+      // D05: a registered root remains owned even when its disk entry is gone.
+      await run('git', ['-C', repoE, 'worktree', 'add', taskRoot, '-b', 'reg-root-probe'])
+      await rm(taskRoot, { recursive: true, force: true })
+      const registeredRootSnapshot = await gitSnapshot(repoE)
+      await assert.rejects(createSquadWorktrees({ ...base, repos: [repoE, repoF] }), {
+        message: `worktree target already exists: ${taskRoot}`,
+      }, 'D05: registered task root must be rejected')
+      assert.deepEqual(await gitSnapshot(repoE), registeredRootSnapshot, 'D05: registration is untouched')
+      assert.deepEqual(await gitSnapshot(repoF), snapshotF)
+      await run('git', ['-C', repoE, 'worktree', 'prune'])
+      await run('git', ['-C', repoE, 'branch', '-D', 'reg-root-probe'])
+      await assertClean()
+      // D02: inject a competing owner after preflight, before exclusive mkdir.
+      const { mkdirSync, writeFileSync } = await import('node:fs')
+      const sentinel = join(taskRoot, 'other-owner.txt')
+      let switches = 0
+      const raceCtx = { get: () => {
+        mkdirSync(taskRoot, { recursive: true })
+        writeFileSync(sentinel, 'owned by another start\n')
+        return { set: async () => { switches += 1 } }
+      } }
+      await assert.rejects(createSquadWorktrees({ ...base, ctx: raceCtx, repos: [repoE, repoF] }), {
+        message: `worktree target already exists: ${taskRoot}`,
+      }, 'D02: unowned task root must not be rolled back')
+      assert.equal(await readFile(sentinel, 'utf8'), 'owned by another start\n', 'D02: sentinel preserved')
+      assert.equal(switches, 0, 'D02: no rollback cwd call')
+      await assertClean()
+      await rm(taskRoot, { recursive: true, force: true })
+      // Branch already exists in the second repository.
+      await run('git', ['-C', repoF, 'branch', 'squad-t9-conflict'])
+      await assert.rejects(createSquadWorktrees({ ...base, repos: [repoE, repoF], signal }), {
+        message: `worktree branch already exists in ${repoF}: squad-t9-conflict`,
+      }, 'D06: branch validation precedes cancellation')
+      await assert.rejects(createSquadWorktrees({ ...base, repos: [repoE, repoF] }), {
+        message: `worktree branch already exists in ${repoF}: squad-t9-conflict`,
+      })
+      await run('git', ['-C', repoF, 'branch', '-D', 'squad-t9-conflict'])
+      await assertClean()
+      // Repository without commits / unknown base revision.
+      const repoEmpty = join(caller, 'repo-empty')
+      await mkdir(repoEmpty, { recursive: true })
+      await run('git', ['-C', repoEmpty, 'init', '-q'])
+      await assert.rejects(createSquadWorktrees({ ...base, repos: [repoEmpty, repoF] }), {
+        message: `base revision is not a commit in ${await realpath(repoEmpty)}: HEAD`,
+      })
+      await assert.rejects(createSquadWorktrees({ ...base, repos: [repoE, repoF], base: 'nope' }), {
+        message: `base revision is not a commit in ${repoE}: nope`,
+      })
+      await assertClean()
+      // Directory validation reuses the strict legacy messages.
+      await assert.rejects(createSquadWorktrees({ ...base, repos: [repoE, repoF], directory: '../bad' }), {
+        message: 'worktree directory must not contain "." or ".." segments: ../bad',
+      })
+      await assert.rejects(createSquadWorktrees({ ...base, repos: [repoE, repoF], directory: '/abs' }), {
+        message: 'worktree directory must be relative to the repository: /abs',
+      })
+      await assert.rejects(createSquadWorktrees({ ...base, repos: [repoE, repoF], directory: '.git' }), {
+        message: 'worktree directory must not be inside .git',
+      })
+      const outside = join(root, 's2-outside')
+      await mkdir(outside, { recursive: true })
+      await symlink(outside, join(repoE, 'esc-link'))
+      await assert.rejects(createSquadWorktrees({ ...base, repos: [repoE, repoF], directory: 'esc-link' }), {
+        message: `worktree destination escapes the repository or enters .git: ${join(repoE, 'esc-link', 'squad-t9-conflict')}`,
+      })
+      await assertClean()
+
+      // Invalid memoryDir for multi-repository start: refused with zero artifacts.
+      const hostM = mockHost(caller, dshHome, {}, {
+        workingDirectory: { get: () => currentDir, set: async (_a, d) => { currentDir = d } },
+      })
+      apply(hostM.ctx, { agents: BUNDLE_AGENTS, memoryDir: '../outside' })
+      const toolM = (name) =>
+        hostM.registered.find((entry) => entry.definition.name === name).definition
+      await assert.rejects(
+        toolM('squad_start').execute(
+          { goal: 'x', acceptance: 'y', repos: [repoG, repoH] },
+          { agent: lead, signal: undefined },
+        ),
+        { message: 'multi-repository memory directory must stay inside the task root: ../outside' },
+      )
+      await assert.rejects(stat(join(repoG, '.agents')))
+      await assert.rejects(stat(join(repoH, '.agents')))
+    })
+
+    // --- rollback (PLAN §33) --------------------------------------------------
+    await labeled('rollback', async () => {
+      const caller = join(root, 's3-caller')
+      await mkdir(caller, { recursive: true })
+      const repoI = await makeGitRepo(root, 's3-i', 'base I', { 'README.md': 'seed I\n' })
+      const repoJ = await makeGitRepo(root, 's3-j', 'base J', { 'README.md': 'seed J\n' })
+      await writeSquadSettings(dshHome)
+      const realGit = (await run('which', ['git'])).stdout.trim()
+      const wrapperDir = await mkdtemp(join(tmpdir(), 'asq-git-bin-'))
+      const wrapper = join(wrapperDir, 'git')
+      await writeFile(
+        wrapper,
+        [
+          '#!/bin/sh',
+          'if [ "$ASQ_T09_INJECT" = "1" ] && [ "$1" = "-C" ] && [ "$2" = "__REPO_J__" ] && [ "$3" = "worktree" ] && [ "$4" = "add" ]; then',
+          '  echo injected add failure >&2',
+          '  exit 73',
+          'fi',
+          'if [ "$ASQ_T09_REMOVE_FAIL" = "1" ] && [ "$2" = "__REPO_J__" ] && [ "$3" = "worktree" ] && [ "$4" = "remove" ]; then',
+          '  echo injected remove failure >&2',
+          '  exit 74',
+          'fi',
+          'exec "__REALGIT__" "$@"',
+          '',
+        ]
+          .join('\n')
+          .replaceAll('__REPO_J__', repoJ)
+          .replace('__REALGIT__', realGit),
+        'utf8',
+      )
+      await chmod(wrapper, 0o755)
+      const pathBefore = process.env.PATH
+      process.env.PATH = `${wrapperDir}:${pathBefore}`
+      const snapshotI = await gitSnapshot(repoI)
+      const snapshotJ = await gitSnapshot(repoJ)
+      const assertRolledBack = async (currentDir, caller) => {
+        assert.deepEqual(await gitSnapshot(repoI), snapshotI)
+        assert.deepEqual(await gitSnapshot(repoJ), snapshotJ)
+        const worktreesDir = join(repoI, '.agents', 'worktrees')
+        let leftovers = []
+        try {
+          leftovers = (await readdir(worktreesDir)).filter((name) => name.startsWith('squad-'))
+        } catch (error) {
+          if (error?.code !== 'ENOENT') throw error
+        }
+        assert.deepEqual(leftovers, [])
+        assert.equal(currentDir(), caller)
+        assert.equal(await readOptional(join(caller, '.agent-squad', 'current.json')), undefined)
+        assert.equal(await readOptional(join(repoI, '.agent-squad', 'current.json')), undefined)
+      }
+      try {
+        // R1: injected failure on the second repository's worktree add.
+        process.env.ASQ_T09_INJECT = '1'
+        let currentDir = caller
+        const mkHost = (setImpl) => {
+          const service = { get: () => currentDir, set: setImpl(() => currentDir, (_agent, directory) => { currentDir = directory }) }
+          const h = mockHost(caller, dshHome, {}, { workingDirectory: service })
+          return h
+        }
+        let host = mkHost((_get, set) => set)
+        const { apply } = await import('../index.js')
+        apply(host.ctx, { agents: BUNDLE_AGENTS })
+        const tool = (name) =>
+          host.registered.find((entry) => entry.definition.name === name).definition
+        const lead = { id: 'lead-1', session: { id: 'session-1' } }
+        const exec = { agent: lead, signal: undefined }
+        await assert.rejects(
+          tool('squad_start').execute(
+            { goal: 'x', acceptance: 'y', repos: [repoI, repoJ] },
+            exec,
+          ),
+          (error) => /multi-repository creation failed/.test(error.message) && error.message.includes('injected add failure'),
+        )
+        await assertRolledBack(() => currentDir, caller)
+        delete process.env.ASQ_T09_INJECT
+
+        // R2: the first cwd switch fails, the restore succeeds.
+        host = mkHost((_get, set) => {
+          let calls = 0
+          return async (_agent, directory) => {
+            calls += 1
+            if (calls === 1) throw new Error('switch failed')
+            set(_agent, directory)
+          }
+        })
+        apply(host.ctx, { agents: BUNDLE_AGENTS })
+        const toolR2 = (name) =>
+          host.registered.find((entry) => entry.definition.name === name).definition
+        await assert.rejects(
+          toolR2('squad_start').execute(
+            { goal: 'x', acceptance: 'y', repos: [repoI, repoJ] },
+            exec,
+          ),
+          (error) => /multi-repository creation failed/.test(error.message) && error.message.includes('switch failed'),
+        )
+        await assertRolledBack(() => currentDir, caller)
+
+        // R3: initialization after a successful creation fails → full cleanup
+        // and byte-identical source pointers.
+        host = mkHost((_get, set) => async (_agent, directory) => {
+          set(_agent, directory)
+          if (/squad-t-/.test(directory)) {
+            await mkdir(join(directory, '.agent-squad', 'current.json'), { recursive: true })
+          }
+        })
+        apply(host.ctx, { agents: BUNDLE_AGENTS })
+        const toolR3 = (name) =>
+          host.registered.find((entry) => entry.definition.name === name).definition
+        await assert.rejects(
+          toolR3('squad_start').execute(
+            { goal: 'x', acceptance: 'y', repos: [repoI, repoJ] },
+            exec,
+          ),
+          (error) => /multi-repository creation failed/.test(error.message) && /EISDIR/.test(error.message),
+        )
+        await assertRolledBack(() => currentDir, caller)
+
+        // R4: even the cwd restore fails — fatal rollback error, but the Git
+        // cleanup still runs.
+        host = mkHost(() => async () => {
+          throw new Error('unavailable')
+        })
+        apply(host.ctx, { agents: BUNDLE_AGENTS })
+        const toolR4 = (name) =>
+          host.registered.find((entry) => entry.definition.name === name).definition
+        await assert.rejects(
+          toolR4('squad_start').execute(
+            { goal: 'x', acceptance: 'y', repos: [repoI, repoJ] },
+            exec,
+          ),
+          (error) =>
+            error.fatal === true &&
+            /multi-repository creation failed/.test(error.message) &&
+            /multi-repository rollback failed: cwd: unavailable/.test(error.message),
+        )
+        assert.deepEqual(await gitSnapshot(repoI), snapshotI)
+        assert.deepEqual(await gitSnapshot(repoJ), snapshotJ)
+
+        // D01: file snapshots and directory ownership are independent.
+        for (const variant of ['current.json', '.gitignore', 'absent', 'existing-empty']) {
+          for (const source of [repoI, caller]) {
+            const memory = join(source, '.agent-squad')
+            await rm(memory, { recursive: true, force: true })
+            if (variant !== 'absent') await mkdir(memory)
+            if (variant === 'current.json' || variant === '.gitignore') {
+              await writeFile(join(memory, variant), Buffer.from([0x23, 0x20, 0xff, 0x0d, 0x0a, 0x00]))
+            }
+          }
+          currentDir = caller
+          host = mkHost((_get, set) => async (_agent, directory) => {
+            set(_agent, directory)
+            if (/squad-t-/.test(directory)) {
+              await mkdir(join(directory, '.agent-squad', 'current.json'), { recursive: true })
+            }
+          })
+          apply(host.ctx, { agents: BUNDLE_AGENTS })
+          await assert.rejects(tool('squad_start').execute({ goal: 'D01', acceptance: 'ok', repos: [repoI, repoJ] }, exec),
+            /multi-repository creation failed:.*EISDIR/, `D01: ${variant}`)
+          assert.deepEqual(await gitSnapshot(repoI), snapshotI)
+          assert.deepEqual(await gitSnapshot(repoJ), snapshotJ)
+          assert.equal(currentDir, caller)
+          for (const source of [repoI, caller]) {
+            const memory = join(source, '.agent-squad')
+            if (variant === 'absent') {
+              await assert.rejects(stat(memory), { code: 'ENOENT' }, 'D01: new empty directory removed')
+            } else {
+              assert.deepEqual(await readdir(memory), variant === 'existing-empty' ? [] : [variant], 'D01: existing directory preserved')
+              if (variant !== 'existing-empty') {
+                assert.deepEqual(await readFile(join(memory, variant)), Buffer.from([0x23, 0x20, 0xff, 0x0d, 0x0a, 0x00]), 'D01: exact Buffer restored')
+              }
+            }
+          }
+        }
+
+        // D07/D08: observe publication and inject source plus Git/cwd failures.
+        const fsp = (await import('node:fs/promises')).default
+        const { syncBuiltinESMExports } = await import('node:module')
+        const originalWrite = fsp.writeFile
+        for (const mode of ['publish-order', 'restore-only', 'restore-and-git']) {
+          const oldBytes = Buffer.from('  {"taskId":"old-task"}\r\n')
+          for (const source of [repoI, caller]) {
+            await mkdir(join(source, '.agent-squad'), { recursive: true })
+            await writeFile(join(source, '.agent-squad', 'current.json'), oldBytes)
+            await writeFile(join(source, '.agent-squad', '.gitignore'), '*\n')
+          }
+          currentDir = caller
+          let failedRoot
+          let restoring = false
+          const publications = []
+          host = mkHost((_get, set) => async (_agent, directory) => {
+            if (directory === caller && mode === 'restore-and-git') throw new Error('injected cwd restore failure')
+            set(_agent, directory)
+            if (directory !== caller) failedRoot = directory
+          })
+          apply(host.ctx, { agents: BUNDLE_AGENTS })
+          fsp.writeFile = async (path, ...args) => {
+            if (String(path).endsWith('/STATE.json') && mode !== 'publish-order') {
+              restoring = true
+              if (mode === 'restore-and-git') process.env.ASQ_T09_REMOVE_FAIL = '1'
+              throw new Error('injected init failure')
+            }
+            if (path === join(caller, '.agent-squad', 'current.json') && restoring && mode !== 'publish-order') {
+              throw new Error('injected source restore failure')
+            }
+            if (!restoring && [repoI, caller].some((source) => path === join(source, '.agent-squad', 'current.json'))) {
+              const taskId = JSON.parse(args[0]).taskId
+              const taskDir = join(failedRoot, '.agent-squad', taskId)
+              publications.push(await Promise.all(['TASK.md', 'JOURNAL.md', 'STATE.json'].map((file) =>
+                stat(join(taskDir, file)).then((info) => info.isFile(), () => false))))
+            }
+            if (mode === 'publish-order' && path === join(failedRoot, '.agent-squad', 'current.json')) {
+              restoring = true
+              throw new Error('injected publish failure')
+            }
+            return originalWrite(path, ...args)
+          }
+          syncBuiltinESMExports()
+          let failure
+          try {
+            await tool('squad_start').execute({ goal: mode, acceptance: 'ok', repos: [repoI, repoJ] }, exec)
+          } catch (error) {
+            failure = error
+          } finally {
+            fsp.writeFile = originalWrite
+            syncBuiltinESMExports()
+            delete process.env.ASQ_T09_REMOVE_FAIL
+          }
+          assert.ok(failure, `D07/D08: ${mode} must fail`)
+          if (mode === 'publish-order') {
+            assert.match(failure.message, /injected publish failure/)
+            assert.deepEqual(publications, [[true, true, true], [true, true, true]], 'D08: task files complete before each source publication')
+          } else {
+            assert.equal(failure.fatal, true, 'D07: source restoration failure is fatal')
+            assert.match(failure.message, /^multi-repository creation failed: injected init failure; multi-repository rollback failed: /)
+            assert.ok(failure.message.includes(`${caller}: injected source restore failure`), 'D07: actual source named')
+            assert.ok(!failure.message.includes(`${repoI}: injected source restore failure`), 'D07: no wrong attribution')
+            assert.deepEqual(publications, [], 'D08: no publication after failed STATE write')
+            if (mode === 'restore-and-git') {
+              assert.ok(failure.message.includes('cwd: injected cwd restore failure'), 'D07: cwd detail retained')
+              assert.ok(failure.message.includes(`${repoJ}: `) && failure.message.includes('injected remove failure'), 'D07: Git detail retained')
+              assert.equal(await gitOut(repoJ, ['branch', '--list', `squad-${failedRoot.split('squad-').at(-1)}`]) !== '', true)
+            }
+          }
+          assert.deepEqual(await gitSnapshot(repoI), snapshotI, 'D07: other repo cleaned despite restore failure')
+          for (const source of [repoI, caller]) {
+            assert.deepEqual(await readFile(join(source, '.agent-squad', 'current.json')), oldBytes)
+          }
+          await cleanupSquadArtifacts([repoI, repoJ])
+          await rm(failedRoot, { recursive: true, force: true })
+          assert.deepEqual(await gitSnapshot(repoJ), snapshotJ)
+        }
+      } finally {
+        process.env.PATH = pathBefore
+        delete process.env.ASQ_T09_INJECT
+        delete process.env.ASQ_T09_REMOVE_FAIL
+        await rm(wrapperDir, { recursive: true, force: true })
+        await cleanupSquadArtifacts([repoI, repoJ])
+      }
+    })
+
+    // --- finish (PLAN §34; live-qoder §36 via ASQ_LIVE_QODER) ----------------
+    await labeled('finish', async () => {
+      const caller = join(root, 's4-caller')
+      await mkdir(caller, { recursive: true })
+      const repoK = await makeGitRepo(root, 's4-k/repo-k', 'base A', { 'hello.txt': 'before\n' })
+      const repoL = await makeGitRepo(root, 's4-l/repo-l', 'base B', { 'hello.txt': 'before\n' })
+      const live = process.env.ASQ_LIVE_QODER === '1'
+      const stubDir = await mkdtemp(join(tmpdir(), 'asq-qoder-hello-'))
+      const stubPath = join(stubDir, 'qoder-hello.cjs')
+      await writeFile(
+        stubPath,
+        [
+          '#!/usr/bin/env node',
+          "const fs = require('node:fs')",
+          "const path = require('node:path')",
+          'const cwd = process.cwd()',
+          'const slugs = fs.readdirSync(cwd, { withFileTypes: true })',
+          "  .filter((entry) => entry.isDirectory() && /^\\d+-/.test(entry.name))",
+          '  .map((entry) => entry.name)',
+          '  .sort()',
+          "fs.writeFileSync(path.join(cwd, slugs[0], 'hello.txt'), 'A\\n')",
+          "fs.writeFileSync(path.join(cwd, slugs[1], 'hello.txt'), 'B\\n')",
+          "process.stdout.write('two repos updated')",
+          '',
+        ].join('\n'),
+        'utf8',
+      )
+      await chmod(stubPath, 0o755)
+      await writeSquadSettings(dshHome, 'external')
+      let currentDir = caller
+      const cwdService = { get: () => currentDir, set: async (_a, d) => { currentDir = d } }
+      const host = mockHost(caller, dshHome, {}, { workingDirectory: cwdService })
+      const { apply } = await import('../index.js')
+      apply(host.ctx, {
+        agents: BUNDLE_AGENTS,
+        qoderCommand: live ? (process.env.ASQ_QODER_COMMAND || 'qoderclicn') : stubPath,
+      })
+      const tool = (name) =>
+        host.registered.find((entry) => entry.definition.name === name).definition
+      const lead = { id: 'lead-1', session: { id: 'session-1' } }
+      const baseA = await gitOut(repoK, ['rev-parse', 'HEAD'])
+      const baseB = await gitOut(repoL, ['rev-parse', 'HEAD'])
+      try {
+        // Main flow: one qoder dispatch edits both hello.txt files.
+        const startOutput = await tool('squad_start').execute(
+          { goal: 'two repos', acceptance: 'ok', agents: ['qoder'], repos: [repoK, repoL] },
+          { agent: lead, signal: undefined },
+        )
+        const taskId = /任务 (t-\S+) 已创建/.exec(startOutput)[1]
+        const branch = `squad-${taskId}`
+        const taskRoot = join(repoK, '.agents', 'worktrees', `squad-${taskId}`)
+        const controller = new AbortController()
+        const timer = setTimeout(() => controller.abort(), 300000)
+        try {
+          await tool('squad_dispatch').execute(
+            {
+              agent: 'qoder',
+              message: '只把任务根下两个 worktree 里的 hello.txt 分别改为 A\\n（1-repo-k）与 B\\n（2-repo-l）；不要提交，不要改其他文件。',
+              phase: 'implement',
+            },
+            { agent: lead, signal: controller.signal },
+          )
+        } finally {
+          clearTimeout(timer)
+        }
+        assert.equal(await readFile(join(taskRoot, '1-repo-k', 'hello.txt'), 'utf8'), 'A\n')
+        assert.equal(await readFile(join(taskRoot, '2-repo-l', 'hello.txt'), 'utf8'), 'B\n')
+        assert.equal(host.runIds.length, 1)
+        const finishOut = await tool('squad_finish').execute(
+          { summary: 'two repos' },
+          { agent: lead, signal: undefined },
+        )
+        assert.equal(await gitOut(repoK, ['rev-list', '--count', `${baseA}..${branch}`]), '1')
+        assert.equal(await gitOut(repoL, ['rev-list', '--count', `${baseB}..${branch}`]), '1')
+        assert.equal(await gitOut(repoK, ['log', '-1', '--format=%s', branch]), `squad(${taskId}): two repos`)
+        assert.equal(await gitOut(repoL, ['log', '-1', '--format=%s', branch]), `squad(${taskId}): two repos`)
+        assert.equal(await gitOut(repoK, ['rev-parse', 'HEAD']), baseA)
+        assert.equal(await readFile(join(repoK, 'hello.txt'), 'utf8'), 'before\n')
+        const state = JSON.parse(
+          await readFile(join(taskRoot, '.agent-squad', taskId, 'STATE.json'), 'utf8'),
+        )
+        assert.deepEqual(
+          state.commits.map((row) => [row.repo, row.status, row.commit === null]),
+          [[repoK, 'committed', false], [repoL, 'committed', false]],
+        )
+        assert.equal(state.phase, 'done')
+        assert.equal(state.commit, state.commits[0].commit)
+        assert.equal(currentDir, repoK)
+        const finalMd = await readFile(join(taskRoot, '.agent-squad', taskId, 'FINAL.md'), 'utf8')
+        for (const text of [finishOut, finalMd]) {
+          assert.ok(text.includes(`git -C '${repoK}' merge --no-ff '${branch}'`), 'quoted merge command missing')
+          assert.ok(text.includes(`git -C '${repoL}' merge --no-ff '${branch}'`))
+        }
+        if (live) {
+          console.log(
+            `AC7 task=${taskId} cwd=${taskRoot} repo=${repoK} commit=${state.commits[0].commit} repo=${repoL} commit=${state.commits[1].commit}`,
+          )
+        }
+
+        // Dirty + clean → committed / no-change.
+        const startMixed = await tool('squad_start').execute(
+          { goal: 'mixed', acceptance: 'ok', agents: ['qoder'], repos: [repoK, repoL] },
+          { agent: lead, signal: undefined },
+        )
+        const taskMixed = /任务 (t-\S+) 已创建/.exec(startMixed)[1]
+        const rootMixed = join(repoK, '.agents', 'worktrees', `squad-${taskMixed}`)
+        await writeFile(join(rootMixed, '2-repo-l', 'hello.txt'), 'C\n', 'utf8')
+        await tool('squad_finish').execute({ summary: 'mixed' }, { agent: lead, signal: undefined })
+        const stateMixed = JSON.parse(
+          await readFile(join(rootMixed, '.agent-squad', taskMixed, 'STATE.json'), 'utf8'),
+        )
+        assert.deepEqual(
+          stateMixed.commits.map((row) => row.status),
+          ['no-change', 'committed'],
+        )
+        assert.equal(stateMixed.phase, 'done')
+
+        // autoCommit=false → both rows skipped, no new commits.
+        const hostAC = mockHost(caller, dshHome, {}, { workingDirectory: cwdService })
+        apply(hostAC.ctx, { agents: BUNDLE_AGENTS, qoderCommand: stubPath, worktreeAutoCommit: false })
+        const toolAC = (name) =>
+          hostAC.registered.find((entry) => entry.definition.name === name).definition
+        const startAC = await toolAC('squad_start').execute(
+          { goal: 'no commit', acceptance: 'ok', agents: ['qoder'], repos: [repoK, repoL] },
+          { agent: lead, signal: undefined },
+        )
+        const taskAC = /任务 (t-\S+) 已创建/.exec(startAC)[1]
+        const rootAC = join(repoK, '.agents', 'worktrees', `squad-${taskAC}`)
+        const branchAC = `squad-${taskAC}`
+        await writeFile(join(rootAC, '1-repo-k', 'hello.txt'), 'D\n', 'utf8')
+        await writeFile(join(rootAC, '2-repo-l', 'hello.txt'), 'E\n', 'utf8')
+        await toolAC('squad_finish').execute({ summary: 'skipped' }, { agent: lead, signal: undefined })
+        const stateAC = JSON.parse(
+          await readFile(join(rootAC, '.agent-squad', taskAC, 'STATE.json'), 'utf8'),
+        )
+        assert.deepEqual(stateAC.commits.map((row) => row.status), ['skipped', 'skipped'])
+        assert.equal(await gitOut(repoK, ['rev-list', '--count', `HEAD..${branchAC}`]), '0')
+        assert.equal(await gitOut(repoL, ['rev-list', '--count', `HEAD..${branchAC}`]), '0')
+
+        // Pre-commit rejection in the second repo: first commits, second
+        // errors, the task stays open, cwd is restored; retry completes.
+        const hookPath = join(repoL, '.git', 'hooks', 'pre-commit')
+        await writeFile(hookPath, '#!/bin/sh\nexit 1\n', 'utf8')
+        await chmod(hookPath, 0o755)
+        const startHook = await tool('squad_start').execute(
+          { goal: 'hook', acceptance: 'ok', agents: ['qoder'], repos: [repoK, repoL] },
+          { agent: lead, signal: undefined },
+        )
+        const taskHook = /任务 (t-\S+) 已创建/.exec(startHook)[1]
+        const rootHook = join(repoK, '.agents', 'worktrees', `squad-${taskHook}`)
+        const branchHook = `squad-${taskHook}`
+        await writeFile(join(rootHook, '1-repo-k', 'hello.txt'), 'F\n', 'utf8')
+        await writeFile(join(rootHook, '2-repo-l', 'hello.txt'), 'G\n', 'utf8')
+        await assert.rejects(
+          tool('squad_finish').execute({ summary: 'hook' }, { agent: lead, signal: undefined }),
+          (error) => /multi-repository finish failed/.test(error.message) && error.message.includes(repoL),
+        )
+        let stateHook = JSON.parse(
+          await readFile(join(rootHook, '.agent-squad', taskHook, 'STATE.json'), 'utf8'),
+        )
+        assert.deepEqual(
+          stateHook.commits.map((row) => row.status),
+          ['committed', 'error'],
+        )
+        assert.notEqual(stateHook.phase, 'done')
+        assert.equal(currentDir, repoK)
+        assert.equal(await gitOut(repoK, ['rev-list', '--count', `HEAD..${branchHook}`]), '1')
+        await rm(hookPath, { force: true })
+        await tool('squad_finish').execute({ summary: 'hook retry' }, { agent: lead, signal: undefined })
+        stateHook = JSON.parse(
+          await readFile(join(rootHook, '.agent-squad', taskHook, 'STATE.json'), 'utf8'),
+        )
+        assert.deepEqual(
+          stateHook.commits.map((row) => row.status),
+          ['no-change', 'committed'],
+        )
+        assert.equal(stateHook.phase, 'done')
+
+        // D03/D04: every Git stage and both cwd failure modes keep the task open.
+        const realGit = (await run('which', ['git'])).stdout.trim()
+        const finishBin = join(stubDir, 'bin')
+        await mkdir(finishBin)
+        for (const mode of ['status', 'commit', 'head', 'diff', 'cwd-missing', 'cwd-throws']) {
+          currentDir = caller
+          const service = { get: () => currentDir, set: async (_a, directory) => { currentDir = directory } }
+          const failureHost = mockHost(caller, dshHome, {}, { workingDirectory: service })
+          apply(failureHost.ctx, { agents: BUNDLE_AGENTS, worktreeAutoCommit: mode !== 'status' })
+          const failureTool = (name) => failureHost.registered.find((entry) => entry.definition.name === name).definition
+          const started = await failureTool('squad_start').execute(
+            { goal: mode, acceptance: 'ok', agents: ['qoder'], repos: [repoK, repoL] },
+            { agent: lead, signal: undefined },
+          )
+          const id = /任务 (t-\S+) 已创建/.exec(started)[1]
+          const workspace = currentDir
+          const taskDir = join(workspace, '.agent-squad', id)
+          const statePath = join(taskDir, 'STATE.json')
+          const before = JSON.parse(await readFile(statePath, 'utf8'))
+          before.phase = 'review'
+          before.closedAt = 'unchanged-closedAt'
+          before.verdict = 'changes_requested'
+          await writeFile(statePath, JSON.stringify(before))
+          const [first, second] = before.worktrees
+          if (mode === 'commit') await writeFile(join(first.path, 'hello.txt'), 'first dirty\n')
+          await writeFile(join(second.path, 'hello.txt'), 'second dirty\n')
+          const callsPath = join(stubDir, `git-${mode}.jsonl`)
+          await writeFile(join(finishBin, 'git'), [
+            '#!/usr/bin/env node',
+            "const { spawnSync } = require('node:child_process')",
+            "const { appendFileSync } = require('node:fs')",
+            'const args = process.argv.slice(2)',
+            `appendFileSync(${JSON.stringify(callsPath)}, JSON.stringify(args) + '\\n')`,
+            `const mode = ${JSON.stringify(mode)}`,
+            `if (args[1] === ${JSON.stringify(first.path)} && (args[2] === mode || (mode === 'head' && args[2] === 'rev-parse' && args[3] === '--short'))) {`,
+            "  process.stderr.write('injected ' + mode + ' failure\\n'); process.exit(73)",
+            '}',
+            `const result = spawnSync(${JSON.stringify(realGit)}, args, { stdio: 'inherit' })`,
+            'process.exit(result.status ?? 1)',
+            '',
+          ].join('\n'))
+          await chmod(join(finishBin, 'git'), 0o755)
+          if (mode === 'cwd-missing') {
+            const originalGet = failureHost.ctx.get
+            failureHost.ctx.get = (name) => name === 'workingDirectory' ? { get: service.get } : originalGet(name)
+          }
+          if (mode === 'cwd-throws') service.set = async () => { throw new Error('injected finish cwd failure') }
+          const originalPath = process.env.PATH
+          process.env.PATH = `${finishBin}:${originalPath}`
+          let failure
+          try {
+            await failureTool('squad_finish').execute({ summary: mode }, { agent: lead, signal: undefined })
+          } catch (error) {
+            failure = error
+          } finally {
+            process.env.PATH = originalPath
+          }
+          assert.ok(failure, `D03/D04: ${mode} must reject`)
+          assert.match(failure.message, /^multi-repository finish failed: /)
+          const after = JSON.parse(await readFile(statePath, 'utf8'))
+          for (const field of ['phase', 'closedAt', 'verdict']) {
+            assert.equal(after[field], before[field], `D03/D04: ${mode} preserves ${field}`)
+          }
+          assert.equal(after.commits.length, 2)
+          const final = await readFile(join(taskDir, 'FINAL.md'), 'utf8')
+          assert.ok(final.includes(second.repo) && final.includes(after.commits[1].commit), 'D03/D04: FINAL persisted for both repos')
+          const calls = (await readFile(callsPath, 'utf8')).trim().split('\n').map((line) => JSON.parse(line))
+          for (const wt of [first, second]) {
+            assert.equal(calls.find((args) => args[1] === wt.path)?.[2], 'status', `D03: ${mode} status runs first in each repo`)
+          }
+          if (mode.startsWith('cwd-')) {
+            assert.deepEqual(after.commits.map((row) => row.status), ['no-change', 'committed'])
+            const message = mode === 'cwd-missing'
+              ? 'workingDirectory service is unavailable; cannot enter the squad worktree'
+              : 'injected finish cwd failure'
+            assert.equal(failure.message, `multi-repository finish failed: cwd: ${message}`, 'D04: cwd failure aggregated')
+            assert.equal(currentDir, workspace)
+          } else {
+            assert.deepEqual(after.commits.map((row) => row.status), ['error', mode === 'status' ? 'skipped' : 'committed'], 'D03: continue after first repo error')
+            assert.ok(after.commits[0].error.includes(`injected ${mode} failure`))
+            assert.equal(after.commits[1].error, null)
+            assert.equal(after.commits[0].commit, mode === 'head' ? null : await gitOut(first.path, ['rev-parse', '--short', 'HEAD']))
+            assert.ok(final.includes(`injected ${mode} failure`), 'D03: FINAL retains error')
+            assert.equal(currentDir, repoK, 'D03: cwd restored after failure')
+          }
+        }
+      } finally {
+        await rm(stubDir, { recursive: true, force: true })
+        await cleanupSquadArtifacts([repoK, repoL])
+      }
+    })
+
+    // --- single-and-legacy (PLAN §35) ----------------------------------------
+    await labeled('single-and-legacy', async () => {
+      const caller = join(root, 's5-caller')
+      await mkdir(caller, { recursive: true })
+      const repoM = await makeGitRepo(root, 's5-m', 'base M', { 'README.md': 'seed M\n' })
+      const repoN = await makeGitRepo(root, 's5-n', 'base N', { 'README.md': 'seed N\n' })
+      const notRepo = join(caller, 'not-repo')
+      await mkdir(notRepo, { recursive: true })
+      await writeSquadSettings(dshHome)
+      let currentDir = caller
+      const cwdService = { get: () => currentDir, set: async (_a, d) => { currentDir = d } }
+      const host = mockHost(caller, dshHome, {}, { workingDirectory: cwdService })
+      const { apply } = await import('../index.js')
+      apply(host.ctx, { agents: BUNDLE_AGENTS })
+      const tool = (name) =>
+        host.registered.find((entry) => entry.definition.name === name).definition
+      const lead = { id: 'lead-1', session: { id: 'session-1' } }
+      const exec = { agent: lead, signal: undefined }
+
+      // Explicit single repository: no slug layer, cwd = worktree, memory
+      // inside the worktree.
+      const startSingle = await tool('squad_start').execute(
+        { goal: 'single', acceptance: 'ok', agents: ['qoder'], repos: [repoM] },
+        exec,
+      )
+      const singleId = /任务 (t-\S+) 已创建/.exec(startSingle)[1]
+      const singleRoot = join(repoM, '.agents', 'worktrees', `squad-${singleId}`)
+      let singleState = JSON.parse(
+        await readFile(join(singleRoot, '.agent-squad', singleId, 'STATE.json'), 'utf8'),
+      )
+      assert.equal(singleState.taskRoot, singleRoot)
+      assert.equal(singleState.worktree.path, singleRoot)
+      assert.equal(singleState.worktrees.length, 1)
+      assert.equal(singleState.worktrees[0].repo, repoM)
+      assert.equal(currentDir, singleRoot)
+      await stat(join(singleRoot, '.agent-squad', singleId, 'TASK.md'))
+
+      // Omitted repos in a Git directory: identical single-repository layout.
+      currentDir = repoN
+      const startOmitted = await tool('squad_start').execute(
+        { goal: 'omitted', acceptance: 'ok', agents: ['qoder'] },
+        exec,
+      )
+      const omittedId = /任务 (t-\S+) 已创建/.exec(startOmitted)[1]
+      const omittedRoot = join(repoN, '.agents', 'worktrees', `squad-${omittedId}`)
+      const omittedState = JSON.parse(
+        await readFile(join(omittedRoot, '.agent-squad', omittedId, 'STATE.json'), 'utf8'),
+      )
+      assert.equal(omittedState.taskRoot, omittedRoot)
+      assert.equal(omittedState.worktrees.length, 1)
+      assert.equal(omittedState.worktrees[0].repo, repoN)
+      assert.equal(currentDir, omittedRoot)
+
+      // Explicit single non-Git input is refused (no in-place degrade).
+      await assert.rejects(
+        tool('squad_start').execute(
+          { goal: 'bad', acceptance: 'ok', repos: [notRepo] },
+          exec,
+        ),
+        { message: `not a usable Git repository: ${notRepo}` },
+      )
+
+      // Legacy STATE without worktrees/taskRoot still dispatches and finishes.
+      const legacyStatePath = join(omittedRoot, '.agent-squad', omittedId, 'STATE.json')
+      const legacyState = JSON.parse(await readFile(legacyStatePath, 'utf8'))
+      delete legacyState.worktrees
+      delete legacyState.taskRoot
+      await writeFile(legacyStatePath, JSON.stringify(legacyState, null, 2), 'utf8')
+      const legacyStatus = await tool('squad_status').execute({}, exec)
+      assert.ok(legacyStatus.includes(omittedRoot))
+      assert.match(
+        await tool('squad_dispatch').execute(
+          { agent: 'qoder', message: 'legacy implement', phase: 'implement', task_id: omittedId },
+          exec,
+        ),
+        /已创建 qoder/,
+      )
+      const legacyFinish = await tool('squad_finish').execute(
+        { summary: 'legacy' },
+        { agent: lead, signal: undefined },
+      )
+      assert.match(legacyFinish, /收尾/)
+      assert.equal(currentDir, repoN)
+      singleState = JSON.parse(await readFile(legacyStatePath, 'utf8'))
+      assert.equal(singleState.phase, 'done')
+      await cleanupSquadArtifacts([repoM, repoN])
+    })
+  } finally {
+    delete process.env.DSH_HOME
+    await rm(root, { recursive: true, force: true })
+    await rm(dshHome, { recursive: true, force: true })
   }
 })

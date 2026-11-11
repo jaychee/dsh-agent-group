@@ -19,7 +19,7 @@
 
 import { execFile } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
-import { appendFile, mkdir, readFile, readdir, stat, writeFile } from 'node:fs/promises'
+import { appendFile, mkdir, readFile, readdir, rm, rmdir, stat, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { setTimeout as delay } from 'node:timers/promises'
@@ -27,7 +27,7 @@ import { promisify } from 'node:util'
 
 import { createSettingsStore, seedFromBundle } from './settings.js'
 import { registerRoutes } from './http.js'
-import { createSquadWorktree } from './worktree.js'
+import { createSquadWorktree, createSquadWorktrees, rollbackSquadWorktrees } from './worktree.js'
 import { createQoderProvider } from './qoder.js'
 
 const runFile = promisify(execFile)
@@ -50,7 +50,7 @@ const MAX_DESIGN_REWORK_ROUNDS = 3
 const MAX_PLAN_ROUNDS = 1 + MAX_DESIGN_REWORK_ROUNDS
 
 /** Liveness marker surfaced by squad_status; changes whenever behavior changes. */
-const PLUGIN_MARKER = 'agent-squad/zh-v5'
+const PLUGIN_MARKER = 'agent-squad/zh-v6'
 
 /**
  * Plan-gate snapshot for one STATE. New tasks persist all four fields at
@@ -208,8 +208,9 @@ function sessionDirectory(ctx, agent) {
 
 /**
  * Shared-memory root for one agent. The pointer file makes the root stable when
- * the session moves into a worktree: the worktree keeps a pointer back to the
- * source checkout's memory directory.
+ * the session moves into a squad task root (multi-repository tasks) or a
+ * worktree: the checkout keeps a pointer back to the task-root memory
+ * directory, so every member resolves the same shared memory.
  */
 async function memoryDirectory(ctx, agent, config) {
   const base = config.memoryDir || DEFAULT_MEMORY_DIR
@@ -217,6 +218,45 @@ async function memoryDirectory(ctx, agent, config) {
   const pointer = await readJson(join(cwd, base, 'current.json'))
   if (pointer?.memoryRoot) return pointer.memoryRoot
   return resolve(cwd, base)
+}
+
+/**
+ * Every repository row of a STATE, in input order: new multi-repository
+ * tasks carry `worktrees`; single-repository and legacy states fall back to
+ * the `worktree` object (with `repo` defaulted); in-place tasks give [].
+ */
+function worktreesOf(state) {
+  if (Array.isArray(state.worktrees)) return state.worktrees
+  if (state.worktree) return [{ ...state.worktree, repo: state.worktree.repositoryRoot }]
+  return []
+}
+
+/** Working cwd for a task: task root, else worktree, else the fallback. */
+function workspaceOf(state, fallback) {
+  return state.taskRoot ?? state.worktree?.path ?? fallback
+}
+
+/** A memoryDir usable for multi-repository task roots (relative, no escape). */
+function memoryDirectorySafe(dir) {
+  if (typeof dir !== 'string' || dir.trim() === '') return false
+  const normalized = dir.replace(/\\/g, '/')
+  if (
+    normalized.startsWith('/') ||
+    normalized.startsWith('//') ||
+    /^[a-zA-Z]:/.test(normalized) ||
+    normalized.includes('\0')
+  ) {
+    return false
+  }
+  for (const segment of normalized.split('/')) {
+    if (segment === '' || segment === '.' || segment === '..') return false
+  }
+  return normalized !== '.git' && !normalized.startsWith('.git/')
+}
+
+/** POSIX single-quote wrap so copy-paste commands survive spaces (PLAN §29). */
+function shellQuote(value) {
+  return `'${String(value).replace(/'/g, `'\\''`)}'`
 }
 
 /** Create the memory directory and keep it out of git in both source and worktree. */
@@ -298,10 +338,33 @@ ${charterFor(agent, config)}
 汇报：任务完成、受阻或验收结束时，调用一次 squad_report，带上 status、简短总结和改动文件。Lead 会被这条报告唤醒。不要创建队友或重新分配工作。`
 }
 
-function renderTask({ taskId, goal, acceptance, constraints, participants, taskDir, worktree }) {
+function repoLines(worktrees) {
+  return worktrees.map(
+    (wt) => `仓库：${wt.repo} | worktree：${wt.path} | 分支：${wt.branch} | 基线：${wt.baseCommit}`,
+  )
+}
+
+function renderTask({ taskId, goal, acceptance, constraints, participants, taskDir, worktree, worktrees = [], workspace }) {
   const members = participants
     .map((agent) => `| ${agent.displayName} (${agent.name}) | ${agent.role} | ${agent.executor}${agent.model ? ` · ${agent.model}` : ''} | ${clip(agent.description, 80) || '—'} |`)
     .join('\n')
+  const effectiveWorkspace = workspace ?? worktree?.path
+  let workspaceBlock
+  if (worktrees.length > 1) {
+    workspaceBlock = [
+      `- 工作区（任务根）：\`${effectiveWorkspace}\``,
+      ...repoLines(worktrees).map((line) => `- ${line}`),
+      `- 每个仓库在任务根下各有一个 worktree；源 checkout 的未提交改动不会复制过去，所有改动只写在任务根里。`,
+    ].join('\n')
+  } else if (worktree) {
+    workspaceBlock = `- worktree：\`${worktree.path}\`
+- 分支：\`${worktree.branch}\`
+- 源仓库：\`${worktree.repositoryRoot}\`
+- 基线提交：\`${worktree.baseCommit}\`
+- 源 checkout 的未提交改动不会复制到 worktree；所有改动只写在这个 worktree 里。`
+  } else {
+    workspaceBlock = '- 原地开发（未创建 worktree）。'
+  }
   return `# 小队任务 \`${taskId}\`
 
 ## 目标
@@ -318,15 +381,7 @@ ${constraints || '—'}
 
 ## 工作区
 
-${
-  worktree
-    ? `- worktree：\`${worktree.path}\`
-- 分支：\`${worktree.branch}\`
-- 源仓库：\`${worktree.repositoryRoot}\`
-- 基线提交：\`${worktree.baseCommit}\`
-- 源 checkout 的未提交改动不会复制到 worktree；所有改动只写在这个 worktree 里。`
-    : '- 原地开发（未创建 worktree）。'
-}
+${workspaceBlock}
 
 ## 共享记忆协议
 
@@ -349,17 +404,18 @@ ${members}
 `
 }
 
-function renderDispatch({ taskId, taskDir, phase, round, agent, message, includeCharter, config, workspace }) {
+function renderDispatch({ taskId, taskDir, phase, round, agent, message, includeCharter, config, workspace, worktrees = [] }) {
   const deliverable =
     agent.role === 'brain'
       ? '设计轮写 PLAN.md 的可执行规格与 AC 映射；验收轮依据 PLAN-APPROVED.md 写 REVIEW.md，逐条 AC 给结论与证据。'
       : '写 REPORT.md，按 PLAN-APPROVED.md 逐条 AC 记录改动、测试名、命令、退出码、关键输出与结论；豁免任务按 TASK.md 与 Lead 本轮派单逐条 AC 留证。'
   const charter = includeCharter ? `\n角色章程：\n${charterFor(agent, config)}\n` : ''
+  const repoBlock = worktrees.length > 1 ? `${repoLines(worktrees).join('\n')}\n` : ''
   return `[Agent Squad] task=${taskId} phase=${phase} round=${round} role=${agent.role}
 ${charter}
 共享记忆：${taskDir}
 工作区：${workspace}
-（只在工作区内改动；动手前先确认 pwd 与它一致，不要写回源 checkout。）
+${repoBlock}（只在工作区内改动；动手前先确认 pwd 与它一致，不要写回源 checkout。）
 先读 TASK.md；设计轮读取 PLAN.md（存在时）；读取 JOURNAL.md 最后 80 行。
 - PLAN-APPROVED.md 是实现、返工与验收的唯一权威规格；PLAN.md 只用于设计，不能覆盖批准归档。
 - 仅任务快照豁免方案门禁且无批准归档时，按 TASK.md 与 Lead 本轮派单执行；仍须逐条 AC 留证。
@@ -429,11 +485,12 @@ async function writeBrief({ taskDir, state, agent, phase, round }) {
 }
 
 /** Prompt for an external one-shot or a local pinned-model child. */
-function dispatchPrompt({ mode, taskId, taskDir, phase, round, agent, message, workspace, config, includeCharter = true }) {
+function dispatchPrompt({ mode, taskId, taskDir, phase, round, agent, message, workspace, config, includeCharter = true, worktrees = [] }) {
   const charter = includeCharter ? `\n角色章程：\n${charterFor(agent, config)}\n` : ''
+  const repoBlock = worktrees.length > 1 ? `${repoLines(worktrees).join('\n')}\n` : ''
   return `[Agent Squad · ${mode}] task=${taskId} phase=${phase} round=${round} role=${agent.role}
 工作区：${workspace}
-共享记忆：${taskDir}
+${repoBlock}共享记忆：${taskDir}
 先读 BRIEF.md 与 TASK.md；设计轮读取 PLAN.md（存在时），实现、返工与验收读取 PLAN-APPROVED.md；按需读取 REVIEW.md / REPORT.md。
 ${charter}
 - PLAN-APPROVED.md 是实现、返工与验收的唯一权威规格；PLAN.md 只用于设计，不能覆盖批准归档。
@@ -501,6 +558,13 @@ function createTools(ctx, config, runtime, store) {
           items: { type: 'string' },
           description: 'Subset of configured teammate names. Defaults to every configured agent.',
         },
+        repos: {
+          type: 'array',
+          items: { type: 'string', minLength: 1 },
+          minItems: 1,
+          description:
+            'Explicit list of independent Git repositories for this task; the first entry is the primary repository. Relative paths resolve against the session directory. Omit to use the current repository only.',
+        },
       },
       required: ['goal', 'acceptance'],
     },
@@ -543,6 +607,190 @@ function createTools(ctx, config, runtime, store) {
         : []
       const taskId = newTaskId()
 
+      // --- explicit multi/single repository path (strict, no fallback) -------
+      if (args.repos !== undefined) {
+        if (
+          Array.isArray(args.repos) &&
+          args.repos.length > 1 &&
+          !memoryDirectorySafe(config.memoryDir)
+        ) {
+          throw new Error(
+            `multi-repository memory directory must stay inside the task root: ${config.memoryDir}`,
+          )
+        }
+        const created = await createSquadWorktrees({
+          ctx,
+          lead,
+          sourceDirectory,
+          repos: args.repos,
+          taskId,
+          directory: settings.worktree.directory,
+          base: config.worktreeFrom,
+          signal: exec.signal,
+        })
+        const { taskRoot } = created
+        const worktrees = created.worktrees
+        const multi = worktrees.length > 1
+        const memoryRoot = join(taskRoot, config.memoryDir)
+        const taskDir = join(memoryRoot, taskId)
+        const primarySource = worktrees[0].repo
+        const pointer = { taskId, memoryRoot, worktree: worktrees[0].path, taskRoot }
+        const sourceMemoryDirs = []
+        const pushSourceDir = (dir) => {
+          const full = resolve(dir, config.memoryDir)
+          if (!sourceMemoryDirs.some((item) => item.dir === full)) {
+            sourceMemoryDirs.push({ dir: full, sourceDirectory: dir, created: false })
+          }
+        }
+        pushSourceDir(primarySource)
+        if (resolve(sourceDirectory) !== resolve(primarySource)) pushSourceDir(sourceDirectory)
+        const snapshots = []
+        const snapshotFile = async (location, name) => {
+          const path = join(location.dir, name)
+          let existed = true
+          let bytes = null
+          try {
+            bytes = await readFile(path)
+          } catch (error) {
+            if (error.code === 'ENOENT') existed = false
+            else throw error
+          }
+          snapshots.push({ path, existed, bytes, sourceDirectory: location.sourceDirectory })
+        }
+        try {
+          for (const location of sourceMemoryDirs) {
+            await snapshotFile(location, '.gitignore')
+            await snapshotFile(location, 'current.json')
+          }
+          for (const location of sourceMemoryDirs) {
+            location.created = (await mkdir(location.dir, { recursive: true })) !== undefined
+            await ensureSelfIgnore(location.dir)
+          }
+          await ensureSelfIgnore(memoryRoot)
+          for (const wt of worktrees) await ensureSelfIgnore(join(wt.path, config.memoryDir))
+          await mkdir(taskDir, { recursive: true })
+          await writeFile(
+            join(taskDir, 'TASK.md'),
+            renderTask({
+              taskId,
+              goal: String(args.goal).trim(),
+              acceptance: String(args.acceptance).trim(),
+              constraints: String(args.constraints ?? '').trim(),
+              participants,
+              taskDir,
+              worktree: worktrees[0],
+              worktrees,
+              workspace: taskRoot,
+            }),
+            'utf8',
+          )
+          await writeFile(join(taskDir, 'JOURNAL.md'), `# 日志 · ${taskId}\n\n`, 'utf8')
+          await writeJson(join(taskDir, 'STATE.json'), {
+            taskId,
+            createdAt: new Date().toISOString(),
+            phase: 'design',
+            round: 1,
+            reworkRounds: 0,
+            participants: participants.map((agent) => agent.name),
+            gate: {
+              reviewRequired: participants.some((agent) => agent.role === 'brain'),
+              brainIds: participants.filter((agent) => agent.role === 'brain').map((agent) => agent.name),
+            },
+            planRequired: participants.some((agent) => agent.role === 'brain'),
+            planRounds: 0,
+            planApproved: false,
+            planApprovedAt: null,
+            dispatches: [],
+            worktree: worktrees[0],
+            worktrees,
+            taskRoot,
+          })
+          // Publish only after all three task files are complete.
+          for (const location of sourceMemoryDirs) {
+            await writeJson(join(location.dir, 'current.json'), pointer)
+          }
+          await writeJson(join(memoryRoot, 'current.json'), pointer)
+          for (const wt of worktrees) {
+            await writeJson(join(wt.path, config.memoryDir, 'current.json'), pointer)
+          }
+        } catch (error) {
+          if (!multi) throw error
+          // Multi-repository init/publish failure: restore every touched
+          // source file byte-for-byte, drop newly created empty source memory
+          // dirs, then roll the Git artifacts back (PLAN §23).
+          const restoreDetails = []
+          for (const snap of [...snapshots].reverse()) {
+            try {
+              if (snap.existed) await writeFile(snap.path, snap.bytes)
+              else await rm(snap.path, { force: true })
+            } catch (restoreError) {
+              restoreDetails.push(
+                `${snap.sourceDirectory}: ${restoreError instanceof Error ? restoreError.message : String(restoreError)}`,
+              )
+            }
+          }
+          for (const location of sourceMemoryDirs) {
+            if (!location.created) continue
+            try {
+              if ((await readdir(location.dir)).length === 0) await rmdir(location.dir)
+            } catch (restoreError) {
+              if (restoreError.code !== 'ENOENT') {
+                restoreDetails.push(
+                  `${location.sourceDirectory}: ${restoreError instanceof Error ? restoreError.message : String(restoreError)}`,
+                )
+              }
+            }
+          }
+          try {
+            await rollbackSquadWorktrees({ ctx, lead, sourceDirectory, taskRoot, worktrees })
+          } catch (rollbackFailure) {
+            restoreDetails.push(rollbackFailure.message.replace(/^multi-repository rollback failed: /, ''))
+          }
+          if (restoreDetails.length > 0) {
+            const fatal = new Error(
+              `multi-repository creation failed: ${error.message}; multi-repository rollback failed: ${restoreDetails.join('; ')}`,
+            )
+            fatal.fatal = true
+            throw fatal
+          }
+          throw new Error(`multi-repository creation failed: ${error.message}`)
+        }
+        const lines = [
+          `任务 ${taskId} 已创建。`,
+          multi
+            ? `工作区：${taskRoot}`
+            : `工作区：worktree 分支 ${worktrees[0].branch}`,
+        ]
+        if (multi) {
+          lines.push(...repoLines(worktrees))
+          lines.push(
+            `  主仓库：${primarySource}；每个仓库在任务根下各有一个 worktree，分支都是 ${worktrees[0].branch}。`,
+            '  注意：源 checkout 的未提交改动不会复制到 worktree。当前会话目录已切到任务根，队友 spawn 时继承。',
+          )
+        } else {
+          lines.push(
+            `  路径：${worktrees[0].path}`,
+            `  源仓库：${worktrees[0].repositoryRoot}（基线 ${worktrees[0].baseCommit.slice(0, 8)}）`,
+            '  注意：源 checkout 的未提交改动不会复制到 worktree。当前会话目录已切到 worktree，队友 spawn 时继承。',
+          )
+        }
+        lines.push(`共享记忆：${taskDir}`, '参与成员：')
+        for (const agent of participants) {
+          lines.push(
+            `- ${agent.displayName} (${agent.name}) [${agent.role}] executor=${agent.executor}${agent.model ? ` model=${agent.model}` : ''} — ${clip(agent.description, 80) || '无描述'}`,
+          )
+        }
+        if (missing.length > 0) lines.push(`已忽略未配置的 agent：${missing.join(', ')}`)
+        if (!participants.some((agent) => agent.role === 'brain')) {
+          lines.push('警告：没有 brain 参与，任务豁免 PLAN 审批门禁，也无法获得最终的设计/验收评审。')
+        }
+        lines.push(
+          `下一步：squad_dispatch({ agent: "<name>", phase: "design", message: "<派单内容>" })；Lead 审核 PLAN.md 后用 squad_approve_plan 批准，再进入 implement。`,
+        )
+        return lines.join('\n')
+      }
+
+      // --- default single-repository path (unchanged behavior) --------------
       let worktree
       let worktreeNote
       try {
@@ -587,6 +835,8 @@ function createTools(ctx, config, runtime, store) {
           participants,
           taskDir,
           worktree,
+          worktrees: worktree ? [{ ...worktree, repo: worktree.repositoryRoot }] : [],
+          workspace: worktree ? worktree.path : undefined,
         }),
         'utf8',
       )
@@ -612,6 +862,8 @@ function createTools(ctx, config, runtime, store) {
         planApprovedAt: null,
         dispatches: [],
         worktree: worktree ?? null,
+        worktrees: worktree ? [{ ...worktree, repo: worktree.repositoryRoot }] : [],
+        taskRoot: worktree ? worktree.path : sourceDirectory,
       })
       await writeJson(join(memoryRoot, 'current.json'), {
         taskId,
@@ -713,16 +965,17 @@ function createTools(ctx, config, runtime, store) {
         )
       }
       const round = phase === 'rework' ? Number(state.round ?? 1) + 1 : Number(state.round ?? 1)
-      const worktreePath = state.worktree?.path
-      const workspace = worktreePath ?? sessionDirectory(ctx, lead)
+      const repoRows = worktreesOf(state)
+      const workspace = workspaceOf(state, sessionDirectory(ctx, lead))
+      const hasWorkspace = Boolean(state.worktree || state.taskRoot)
 
       const moveTeammate = async (sessionId) => {
-        if (!worktreePath) return
+        if (!hasWorkspace) return
         const service = ctx.get('workingDirectory')
         const memberAgent = service ? ctx.agents.get(sessionId) : undefined
         if (!service || !memberAgent) return
         try {
-          await service.set(memberAgent, worktreePath, exec.signal)
+          await service.set(memberAgent, workspace, exec.signal)
         } catch {}
       }
 
@@ -737,6 +990,7 @@ function createTools(ctx, config, runtime, store) {
         includeCharter,
         config,
         workspace,
+        worktrees: repoRows,
       })
 
       const executor = target.executor
@@ -836,6 +1090,7 @@ function createTools(ctx, config, runtime, store) {
           workspace,
           config,
           includeCharter: existingChild === undefined,
+          worktrees: repoRows,
         })
         if (existingChild === undefined) {
           const childId = randomUUID()
@@ -856,7 +1111,7 @@ function createTools(ctx, config, runtime, store) {
                 prompt: [{ type: 'text', text: prompt }],
                 parent: lead,
                 agentOptions: { provider: pinned.provider, model: pinned.model },
-                ...(worktreePath ? { cwd: worktreePath } : {}),
+                ...(hasWorkspace ? { cwd: workspace } : {}),
               },
               signal: exec.signal,
               delivery: 'parent',
@@ -897,6 +1152,7 @@ function createTools(ctx, config, runtime, store) {
           message: String(args.message).trim(),
           workspace,
           config,
+          worktrees: repoRows,
         })
         const startedAt = Date.now()
         const tokensBefore =
@@ -907,7 +1163,7 @@ function createTools(ctx, config, runtime, store) {
           request: {
             prompt: [{ type: 'text', text: prompt }],
             parent: lead,
-            ...(worktreePath ? { cwd: worktreePath } : {}),
+            ...(hasWorkspace ? { cwd: workspace } : {}),
           },
           signal: exec.signal,
           delivery: 'caller',
@@ -1136,6 +1392,16 @@ function createTools(ctx, config, runtime, store) {
       const state = (await readJson(join(taskDir, 'STATE.json'))) ?? {}
       const plan = planGateOf(state)
       const members = ctx.agentTeams.listMembers(lead)
+      const repoRows = worktreesOf(state)
+      const workspaceBlock =
+        repoRows.length > 1
+          ? [
+              `工作区：${workspaceOf(state, sessionDirectory(ctx, lead))}`,
+              ...repoLines(repoRows),
+            ]
+          : state.worktree
+            ? [`工作区：worktree ${state.worktree.branch} @ ${state.worktree.path}（源仓库 ${state.worktree.repositoryRoot}）`]
+            : ['工作区：原地开发']
       const lines = [
         `${PLUGIN_MARKER}  task=${taskId}  phase=${state.phase ?? 'unknown'}  round=${state.round ?? '?'}  rework=${state.reworkRounds ?? 0}/${MAX_REWORK_ROUNDS}  created=${state.createdAt ?? '?'}`,
         `PLAN：planRequired=${plan.planRequired}  planRounds=${plan.planRounds}/${MAX_PLAN_ROUNDS}  planApproved=${plan.planApproved}${
@@ -1146,9 +1412,7 @@ function createTools(ctx, config, runtime, store) {
               : ''
         }`,
         `当前目录：${sessionDirectory(ctx, lead)}`,
-        state.worktree
-          ? `工作区：worktree ${state.worktree.branch} @ ${state.worktree.path}（源仓库 ${state.worktree.repositoryRoot}）`
-          : '工作区：原地开发',
+        ...workspaceBlock,
         `共享记忆：${taskDir}`,
         '成员：',
         formatMembers(members),
@@ -1356,6 +1620,125 @@ ${String(args.summary).trim()}
       }
 
       const summary = String(args.summary ?? '').trim() || '任务完成'
+      const repoRows = worktreesOf(state)
+
+      // --- multi-repository finish: commit per repository (PLAN §26–§29) ----
+      if (repoRows.length > 1) {
+        const primarySource = repoRows[0].repo
+        const commits = []
+        const lines = [`任务 ${taskId} 收尾。`]
+        const finalBlocks = []
+        for (const wt of repoRows) {
+          const row = {
+            repo: wt.repo,
+            path: wt.path,
+            branch: wt.branch,
+            baseCommit: wt.baseCommit,
+            commit: null,
+            status: 'error',
+            error: null,
+          }
+          const errors = []
+          try {
+            const dirty = (await git(wt.path, ['status', '--porcelain'])).trim()
+            if (config.worktreeAutoCommit) {
+              if (dirty) {
+                await git(wt.path, ['add', '-A'])
+                await git(wt.path, ['commit', '-m', `squad(${taskId}): ${firstLine(summary)}`])
+                row.status = 'committed'
+              } else {
+                row.status = 'no-change'
+              }
+            } else {
+              row.status = 'skipped'
+            }
+          } catch (error) {
+            errors.push(error instanceof Error ? error.message : String(error))
+          }
+          try {
+            row.commit = (await git(wt.path, ['rev-parse', '--short', 'HEAD'])).trim() || null
+          } catch (error) {
+            errors.push(error instanceof Error ? error.message : String(error))
+          }
+          let statText = ''
+          try {
+            statText = (await git(wt.path, ['diff', '--stat', `${wt.baseCommit}..HEAD`])).trim()
+          } catch (error) {
+            errors.push(error instanceof Error ? error.message : String(error))
+          }
+          if (errors.length > 0) {
+            row.status = 'error'
+            row.error = errors.join('; ')
+          }
+          commits.push(row)
+          const view = `git -C ${shellQuote(wt.repo)} diff ${shellQuote(`${wt.baseCommit}..${wt.branch}`)}`
+          const merge = `git -C ${shellQuote(wt.repo)} merge --no-ff ${shellQuote(wt.branch)}`
+          lines.push(
+            `仓库：${wt.repo}`,
+            `  worktree：${wt.path}`,
+            `  分支：${wt.branch}（基线 ${wt.baseCommit}）`,
+            `  提交：${row.commit ?? '（无）'} 状态：${row.status}${row.error ? ` 错误：${row.error}` : ''}`,
+          )
+          if (statText) {
+            for (const statLine of statText.split('\n')) lines.push(`  ${statLine}`)
+          }
+          lines.push(`  查看：${view}`, `  合并：${merge}`)
+          finalBlocks.push(
+            [
+              `### ${wt.repo}`,
+              '',
+              `- worktree：${wt.path}`,
+              `- 分支：${wt.branch}`,
+              `- 基线：${wt.baseCommit}`,
+              `- 提交：${row.commit ?? '（无）'}`,
+              `- 状态：${row.status}${row.error ? `（错误：${row.error}）` : ''}`,
+              ...(statText ? ['', '```text', statText, '```'] : []),
+              '',
+              `- 查看：\`${view}\``,
+              `- 合并：\`${merge}\``,
+            ].join('\n'),
+          )
+        }
+        state.commits = commits
+        state.commit = commits[0]?.commit ?? null
+        state.finishSummary = summary
+        const details = commits
+          .filter((row) => row.status === 'error')
+          .map((row) => `${row.repo}: ${row.error}`)
+        const workingDirectory = ctx.get('workingDirectory')
+        try {
+          if (typeof workingDirectory?.set !== 'function') {
+            throw new Error('workingDirectory service is unavailable; cannot enter the squad worktree')
+          }
+          await workingDirectory.set(lead, primarySource, undefined)
+          lines.push(`会话已切回源目录：${primarySource}`)
+        } catch (error) {
+          details.push(`cwd: ${error instanceof Error ? error.message : String(error)}`)
+        }
+        if (details.length === 0) {
+          state.phase = 'done'
+          state.closedAt = new Date().toISOString()
+          state.verdict = 'approved'
+        }
+        await writeJson(join(taskDir, 'STATE.json'), state)
+        await writeFile(
+          join(taskDir, 'FINAL.md'),
+          `# 收尾 · ${taskId}\n\n## 摘要\n\n${summary}\n\n## 仓库\n\n${finalBlocks.join('\n\n')}\n`,
+          'utf8',
+        )
+        for (const row of commits) {
+          await appendFile(
+            join(taskDir, 'JOURNAL.md'),
+            `- ${new Date().toISOString()} lead: squad_finish repo=${row.repo} status=${row.status} commit=${row.commit ?? 'none'}\n`,
+            'utf8',
+          ).catch(() => {})
+        }
+        if (details.length > 0) {
+          throw new Error(`multi-repository finish failed: ${details.join('; ')}`)
+        }
+        return lines.join('\n')
+      }
+
       const worktree = state.worktree
       const lines = [`任务 ${taskId} 收尾。`]
       let commit = null

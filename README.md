@@ -60,15 +60,15 @@ Lead 的固定流程（**先审方案再实现**）：
 4. `squad_dispatch(zcode, phase=implement)` → worker 按 PLAN-APPROVED.md 在 worktree 里实现并写 `REPORT.md`，逐条 AC 给证据；
 5. `squad_dispatch(codex, phase=review)` → brain 对照 PLAN-APPROVED.md 逐条验收；
 6. 不通过 → `squad_dispatch(zcode, phase=rework)`：**同一会话**继续，只补缺陷；
-7. brain `approved` 后调用 `squad_finish`：提交 worktree 改动、切回源目录、给出分支与合并命令。
+7. brain `approved` 后调用 `squad_finish`：逐仓提交 worktree 改动、切回主仓库源目录、给出每仓分支与合并命令。
 
 > 两种批准相互独立：`squad_approve_plan`（Lead）批准的是**方案**，`REVIEW.md` 的 `VERDICT: APPROVED`（brain）批准的是**实现**；前者不能替代后者，收尾仍只认 brain 验收。
 
 ## Worktree 分支开发（默认开启）
 
-改项目代码时，`squad_start` 会调用 DSH 的 worktree 运行时：
+改项目代码时，`squad_start` 由插件通过 Git 创建 worktree；省略 `repos` 时默认使用当前仓库：
 
-- 在源仓库的 `.agents/worktrees/` 下创建 checkout（该池自带 `.gitignore`，不污染 git）；
+- 在源仓库的 `.agents/worktrees/` 下创建 checkout；
 - 新分支名 `squad-<taskId>`，基线默认 `HEAD`；
 - 把**当前会话**切到该目录，之后 spawn 的队友继承这个工作目录；
 - 已有队友在派单时也会被显式切到该目录；
@@ -76,13 +76,51 @@ Lead 的固定流程（**先审方案再实现**）：
 
 `brain approved` 后调用 `squad_finish`：默认自动 `git add -A && git commit`，打印 diff stat / 分支 / 合并命令，并把会话切回源目录。合并由你决定（`git merge --no-ff squad-<taskId>`），插件不自动合并。
 
+一个任务跨多个独立 Git 仓库时，传入非空 `repos: string[]`，首项是主仓库。例如在 `/projects` 调用：
+
+```json
+{
+  "goal": "同步修改前后端接口",
+  "acceptance": "两个仓库的验证命令均通过",
+  "repos": ["./frontend", "/projects/backend"]
+}
+```
+
+所有相对路径均基于调用前的 cwd，支持含空格路径、仓库子目录与符号链接入口；不展开 `~`。路径规范化后按 Git common-dir 去重，同仓的 linked checkout 也会判为重复。两个仓库的基线各自解析 `worktreeFrom`，不要求 SHA 相同。
+
+```text
+/projects/frontend/.agents/worktrees/squad-<taskId>/  # taskRoot，所有执行器的 cwd
+├── 1-frontend/                                    # frontend 的 worktree
+│   └── .agent-squad/current.json                  # 指向 taskRoot 中的共享记忆
+├── 2-backend/                                     # backend 的 worktree
+│   └── .agent-squad/current.json
+└── .agent-squad/
+    ├── current.json
+    └── <taskId>/                                  # TASK/JOURNAL/STATE 与方案、报告
+```
+
+每个 worktree 的分支均为 `squad-<taskId>`；子目录名由输入序号与小写仓库名组成，非 ASCII 字母数字连续段替换为 `-`，去掉首尾 `-`，空名用 `repo`。STATE 按顺序记录 `{repo, path, branch, baseCommit}`。主仓库源目录和调用源目录也保存 current 指针，其他源仓库不写入。单仓仍以 worktree 为 cwd，记忆放在 worktree 内；多仓的 local、external、team 执行器统一以 taskRoot 为 cwd，qoder 无需 `--add-dir` 即可访问全部子目录。
+
+- **显式 repos 严格模式**：拒绝空列表、不存在、非 Git、bare、重复仓库，以及目标路径或分支冲突；不退回原地开发。显式单仓校验后沿用原单仓创建逻辑。多仓先完成全部预检，再创建；创建、初始化或发布指针失败时恢复源端文件原字节并回滚本次拥有的 worktree/分支，清理失败标为 fatal 并报告详情。
+- **省略 repos 兼容模式**：保持当前仓库默认行为，已在 linked checkout 时复用；非 fatal 创建失败仍退回原地开发并说明原因，旧 STATE 仍可读取。单仓 cwd 切换失败保留已有 Git 产物，恢复源目录也失败时停止。
+- **多仓收尾**：每仓先查 status，默认只给脏仓 add/commit；干净仓为 `no-change`，关闭自动提交时为 `skipped`。每仓获取短 SHA 和 diff stat，返回文本与 FINAL 给出可复制的 quoted 查看／合并命令。任一仓失败仍处理下一仓，最后尝试切回主仓库源目录，持久化 commits/FINAL 后抛聚合错误；失败时不写完成字段，已成功提交不撤销。修复原因后可重试，已干净仓变为 `no-change`。
+
+在包含本插件的工作区根目录执行以下两条验证命令；普通测试使用临时 CLI stub，实机命令要求已安装并登录 `qoderclicn`，也可用 `ASQ_QODER_COMMAND` 指定可执行文件绝对路径：
+
+```sh
+node --test dsh-agent-squad/test/settings.test.js
+ASQ_LIVE_QODER=1 node --test --test-name-pattern='^T09 ' dsh-agent-squad/test/settings.test.js
+```
+
+测试保持九个顶层用例；实机模式由 qoder 一次派单修改两个临时仓库，各新增一次提交，并输出 `AC7 task=... cwd=... repo=... commit=... repo=... commit=...`。普通单测不能代替该证据。
+
 ## B 模式：外部 provider（一次性）
 
 `agents[].provider` 非空且不是 `spawn`/`fork` 时，`squad_dispatch` 不再走 Team 队友，而是直接调用宿主 `ctx.subagents.startActivation({ provider, delivery: 'caller' })`：
 
 - Lead 的调用阻塞到外部 agent 返回，结果直接回到 Lead；外部 agent 不进入 Team roster，也不能 `squad_report`、不能续跑；
 - 每次派发前生成 `BRIEF.md`（≤30 行），外部 agent 只读共享文件，返工必须重发 BRIEF + 编号缺陷；实现、返工与验收指向 PLAN-APPROVED.md，并要求 AC 映射；
-- 外部 agent 的 cwd 是 worktree，因此本任务的共享记忆放在 **worktree 内** 的 `.agent-squad/`（沙箱可写）；
+- 外部 agent 的 cwd 为任务工作区：单仓是 worktree，多仓是包含所有 worktree 的 taskRoot；共享记忆位于该 cwd 下的 `.agent-squad/`（沙箱可写）；
 - 已适配 Codex：`provider: codex`，需先安装 `@deepseek-ai/dsh-subagent-codex`（bundle）；
 - ZCode 需要 `@deepseek-ai/dsh-subagent-acp`（不是 bundle，要单独插入 provider 行）；本 pilot 用直连 ACP 桥测量；
 - **内置 `qoder-cli` 外部 provider**：插件自带适配器，封装已安装的 `qoderclicn`（npm 全局，由宿主 PATH 找到且需已完成登录；可用 `qoderCommand` 指定可执行文件绝对路径）。插件不附带二进制本体。每次执行 `qoderclicn -p <prompt> -w <cwd> --permission-mode <mode>`（`qoderModel` 非空时追加 `-m <model>`），stdout 作为一次性结果返回；非 0 退出码按 error 返回 diagnostic，`dispose` 以 SIGTERM（1 秒后升级 SIGKILL）终止子进程。权限模式默认 `accept_edits`（`qoderPermissionMode` 可改写），`qoderModel` 默认空（不传 `-m`）。外部执行**一次性、不可续跑**，也不能 `squad_report`：每轮派单都会重发完整任务与共享文件路径，返工同样重发。
@@ -177,7 +215,7 @@ token：GLM implement 26,295 / rework 26,459（cache 主导）；Codex 设计 + 
 - **读写**：页面经 Host 的 loopback 同源 HTTP（`GET/PUT /agent-squad/settings`、`GET /agent-squad/models`）读写；非 loopback socket、非本地 Host（如 `127.attacker.example`）或跨源/异协议 Origin 一律 403。保存走 revision 乐观锁：并发写第二笔返回 **409 REVISION_CONFLICT** 并附服务器当前 settings；页面显示冲突横幅并保留草稿，点"改用服务器版本"经确认才替换。恢复出厂默认只写入草稿，保存才落盘。未保存的草稿在切换设置页后保留（工厂级会话），保存期间编辑冻结，无字段错误的服务器故障（IO/模型目录 503）显示整体错误提示。
 - **生效时机**：`squad_start`/`squad_dispatch` 每次都重读设置，保存立即影响下一次派单；运行中的 child 不追溯（local 改绑模型须等其空闲）。
 - **持久化**：原子写（同目录临时文件 + rename）；损坏文件先备份 `settings.json.corrupt-<ts>`，备份成功才恢复默认（出厂默认 = 有效 bundle seed），备份失败返回 IO 错误并保留原文件。首次从 bundle 配置 seed，已有合法文件不会被 bundle 覆盖。
-- worktree 由插件自建：`git worktree add -b squad-<taskId> <repo>/<directory>/squad-<taskId> <base>`，`squad_finish` 行为不变。
+- worktree 由插件自建：单仓位于 `<repo>/<directory>/squad-<taskId>`；多仓以首仓的该路径为 taskRoot，每仓创建一个子 worktree，`squad_finish` 逐仓处理。directory 始终相对主仓库；多仓的 memoryDir 也必须位于 taskRoot 内。
 
 ### 验证步骤
 
@@ -197,7 +235,7 @@ token：GLM implement 26,295 / rework 26,459（cache 主导）；Codex 设计 + 
     memoryDir: .agent-squad
     worktreeDir: .agents/worktrees # 首次 seed 的 worktree 目录（此后以设置文件为准）
     worktreeFrom: HEAD             # 从哪个本地提交/分支拉出
-    worktreeAutoCommit: true       # squad_finish 时自动提交 worktree 改动
+    worktreeAutoCommit: true       # squad_finish 时逐仓自动提交脏 worktree
     qoderCommand: qoderclicn       # qoder-cli provider 调用的可执行文件（默认 PATH 上的 qoderclicn，可填绝对路径）
     qoderPermissionMode: accept_edits  # 传给 --permission-mode 的权限模式（默认 accept_edits）
     qoderModel: ''                 # qoder-cli 模型；默认空 = 不传 -m
@@ -215,7 +253,7 @@ token：GLM implement 26,295 / rework 26,459（cache 主导）；Codex 设计 + 
 ```
 
 - `role`：`brain` | `worker`（可编辑字段保存在设置文件；bundle 只作 seed 与 charter/context 补充）。
-- **worktree 始终启用**（无开关）：每次 `squad_start` 以 Git 元数据（git-dir/git-common-dir）判断，已在 linked worktree 内则复用当前 checkout，否则在 `<仓库>/<设置目录>/squad-<任务号>` 创建新分支；非 Git 仓库或普通创建失败才退回原地开发并在结果中说明。目录切换失败会显式恢复源目录，恢复失败则 start 直接停止。
+- **worktree 始终启用**（无开关）：省略 repos 时保留单仓复用与失败降级行为；显式 repos 严格校验，多仓始终创建独立子 worktree，即使入口是 linked checkout 也不复用。路径与回滚规则见上方“Worktree 分支开发”。
 - **运行中不重派**：目标（本地子代理或 team 队友）处于 running/provisioning 时拒绝再次派单或切换执行方式，避免同时保留两个活动执行者；空闲时同绑定续跑、改绑定（模型/执行方式）则下一次新建。
 - **验收门禁快照**：任务建立时把"是否需要 brain 验收"与"是否需要 Lead 批准 PLAN"（`planRequired`）写入 STATE；此后修改角色不能绕过该任务的 REVIEW 要求或 PLAN 批准门禁。
 - `worktreeAutoCommit`：默认 `true`；设为 `false` 则 `squad_finish` 只收尾、不提交，改动留在 worktree 里。
@@ -268,12 +306,12 @@ token：GLM implement 26,295 / rework 26,459（cache 主导）；Codex 设计 + 
 
 | 工具 | 调用者 | 作用 |
 | --- | --- | --- |
-| `squad_start` | Lead | 建任务、写 TASK.md/JOURNAL.md、快照 plan 门禁（planRequired/planRounds/planApproved）、设为 current |
+| `squad_start` | Lead | 可选 `repos: string[]`（默认当前仓库，首项为主仓）；建 worktree 集合、写 TASK/JOURNAL/STATE 和 plan 门禁，最后发布 current |
 | `squad_dispatch` | Lead | 首次创建 / 之后续跑指定队友，推进 phase 与 round；design 受 4 次预算与已批准限制，implement/rework 受 PLAN 批准门禁 |
 | `squad_approve_plan` | Lead（仅 Lead 可见） | 审核通过 PLAN.md：补归档当前轮次 `PLAN-R<n>.md`，写 `PLAN-APPROVED.md` 与 `planApproved`/`planApprovedAt`；缺 PLAN、已收尾或已批准时拒绝 |
-| `squad_status` | Lead | 任务、阶段、轮次、PLAN 门禁（planRequired / planRounds/4 / planApproved / planApprovedAt）、成员状态、记忆文件、最近派单 |
+| `squad_status` | Lead | 任务、阶段、轮次、全部仓库/worktree/分支/基线与工作区、PLAN 门禁（planRequired / planRounds/4 / planApproved / planApprovedAt）、成员状态、记忆文件、最近派单 |
 | `squad_wait` | Lead | 有界阻塞等待团队变化（通常不需要，报告会唤醒 Lead） |
-| `squad_finish` | Lead | 校验无队友运行 + brain approved，提交 worktree，切回源目录，写 FINAL.md |
+| `squad_finish` | Lead | 校验无队友运行 + brain approved，逐仓提交并记录结果，切回主仓库源目录，写 FINAL.md 与每仓合并命令；多仓失败可重试 |
 | `squad_report` | brain / worker | 把结果、阻塞或验收结论发回 Lead 并写 JOURNAL |
 
 ## 安装 / 卸载
@@ -319,7 +357,7 @@ plugin_manager remove_bundle   dsh-agent-squad
 - **一个会话 = 一个 Team**。队名永久唯一，所以同一会话里换一个完全无关的新任务时，codex/zcode/qoder 仍是原会话；新任务请开新会话，或接受上下文延续。
 - **worktree 只从本地提交检出**：源 checkout 的未提交改动不会带过去；子模块、依赖安装、LFS 内容也不由插件处理。
 - **不自动合并**：`squad_finish` 只提交分支并给出合并命令，合不合、何时合由你决定。
-- **worktree 生命周期**：收尾后 checkout 与分支保留；删除用 `git worktree remove <path>` + `git branch -D <branch>`，插件不自动清理。
-- 不提供 worktree/沙箱隔离：所有成员共享同一工作目录，写冲突靠 Lead 划分文件范围 + brain 验收兜底。
+- **worktree 生命周期**：收尾成功或失败后，各仓 checkout 与分支均保留；逐仓用 `git -C <repo> worktree remove <path>` + `git -C <repo> branch -D <branch>` 清理。多仓创建事务失败才自动回滚本次产物；失败详情会报告，源文件与已有分支不删除。
+- 所有成员共享同一个任务工作区；多仓工作区包含多个子 worktree，不提供按成员隔离，写冲突靠 Lead 划分文件范围 + brain 验收兜底。
 - 只支持单任务串行推进（`current.json` 只有一个指针）；并行任务需要多开会话。
 - 队友必须主动 `squad_report`；若模型漏报，用 `squad_status` 查看文件与状态，必要时 `squad_wait`。
