@@ -50,7 +50,7 @@ const MAX_DESIGN_REWORK_ROUNDS = 3
 const MAX_PLAN_ROUNDS = 1 + MAX_DESIGN_REWORK_ROUNDS
 
 /** Liveness marker surfaced by squad_status; changes whenever behavior changes. */
-const PLUGIN_MARKER = 'agent-squad/zh-v6'
+const PLUGIN_MARKER = 'agent-squad/zh-v7'
 
 /**
  * Plan-gate snapshot for one STATE. New tasks persist all four fields at
@@ -64,6 +64,21 @@ function planGateOf(state) {
     planRounds: Number(state.planRounds ?? 0),
     planApproved: state.planApproved === true,
     planApprovedAt: state.planApprovedAt ?? null,
+  }
+}
+
+/**
+ * Budget snapshot for one STATE. Limits come from STATE (designLimit /
+ * reworkLimit) with the constants as defaults; a legacy or null limit falls
+ * back to 4/3 and a missing/null extensions array reads as []. Read-only:
+ * callers must not migrate legacy states to disk.
+ */
+function budgetOf(state) {
+  return {
+    designLimit: Number(state.designLimit ?? MAX_PLAN_ROUNDS),
+    reworkLimit: Number(state.reworkLimit ?? MAX_REWORK_ROUNDS),
+    designUsed: Number(state.planRounds ?? 0),
+    implementUsed: Number(state.reworkRounds ?? 0),
   }
 }
 
@@ -95,7 +110,7 @@ const LEAD_POLICY = `Agent Squad 已启用：你是 Lead，小队里有按角色
 非平凡任务按以下流程（先审方案再实现）：
 1. 调用 squad_start 一次，写入目标与验收标准（验收标准确实含糊时先问用户）。
 2. 派 brain 队友，phase="design"。读共享目录里的 PLAN.md。
-3. Lead 亲自做 PLAN.md 的可执行性审核：假装自己是一个没有上下文的 worker，逐项检查文件改动、接口与错误、边界值、测试预期、AC 验证命令和假设；无法只靠 PLAN 实现、需要 worker 猜测的点一律按 D1 起连续编号，写明章节、缺失或矛盾、最小补全要求，派回 brain（phase="design"）返工迭代，最多 ${MAX_DESIGN_REWORK_ROUNDS} 轮设计返工（初始设计 + 返工合计 ${MAX_PLAN_ROUNDS} 次 design 派单，第 ${MAX_PLAN_ROUNDS + 1} 次会被拒绝）；方案合格后调用 squad_approve_plan 批准（归档 PLAN-APPROVED.md）。有 brain 参与的任务，PLAN 未批准前 implement/rework 派单会被拒绝；没有 brain 参与的任务豁免此门禁。
+3. Lead 亲自做 PLAN.md 的可执行性审核：假装自己是一个没有上下文的 worker，逐项检查文件改动、接口与错误、边界值、测试预期、AC 验证命令和假设；无法只靠 PLAN 实现、需要 worker 猜测的点一律按 D1 起连续编号，写明章节、缺失或矛盾、最小补全要求，派回 brain（phase="design"）返工迭代，默认初始设计 + ${MAX_DESIGN_REWORK_ROUNDS} 轮返工 = ${MAX_PLAN_ROUNDS} 次 design 派单，未扩展时第 ${MAX_PLAN_ROUNDS + 1} 次暂停：先向用户说明阻塞点与已完成部分并等待决策，用户同意后调用 squad_extend(kind="design", rounds=3, reason="用户批准的追加理由", confirmed=true) 追加轮次再派 design；方案合格后调用 squad_approve_plan 批准（归档 PLAN-APPROVED.md）。有 brain 参与的任务，PLAN 未批准前 implement/rework 派单会被拒绝；没有 brain 参与的任务豁免此门禁。
 4. 批准后派一个 worker，phase="implement"，给出 PLAN-APPROVED.md 路径、文件范围与本轮 AC 编号映射。
 5. 派 brain，phase="review"，附上实际 diff 与测试证据。
 6. 若验收返回 changes_requested，把同样的缺陷派回同一个 worker，phase="rework"。进程内队友会续跑同一会话；外部 provider（codex 等）是一次性调用，返工必须重发 BRIEF 与编号缺陷。
@@ -103,11 +118,11 @@ const LEAD_POLICY = `Agent Squad 已启用：你是 Lead，小队里有按角色
 
 规则：
 - 你是组织者，不写业务代码；自己的改动只限协调文件与最终整合。
-- 两种批准相互独立：Lead 用 squad_approve_plan 批准的是「方案」，brain 在 REVIEW.md 给出的 VERDICT: APPROVED 批准的是「实现」；前者不能替代后者，收尾仍然只认 brain 验收。设计预算（初始 + ${MAX_DESIGN_REWORK_ROUNDS} 轮返工）与实现返工预算（${MAX_REWORK_ROUNDS} 轮）也相互独立、分别计数。
+- 两种批准相互独立：Lead 用 squad_approve_plan 批准的是「方案」，brain 在 REVIEW.md 给出的 VERDICT: APPROVED 批准的是「实现」；前者不能替代后者，收尾仍然只认 brain 验收。设计预算（默认初始 + ${MAX_DESIGN_REWORK_ROUNDS} 轮返工 = ${MAX_PLAN_ROUNDS} 次 design 派单）与实现返工预算（默认 ${MAX_REWORK_ROUNDS} 轮）也相互独立、分别计数，两类预算均可由用户决定追加。
 - 一个角色一个 agent。按能力选 worker：zcode 负责实现，qoder 负责并行或前端偏重的改动。
 - 每次派单后结束当前回合，等队友的 squad_report 唤醒你；查看状态用 squad_status，只有必须在本回合阻塞时才用 squad_wait。
 - 队友在跑时不得声称完成；没有 brain 验收不得接受结果。
-- 同一个任务的实现返工最多 ${MAX_REWORK_ROUNDS} 轮；设计返工最多 ${MAX_DESIGN_REWORK_ROUNDS} 轮。任一超限就停下，向用户报告阻塞点与已完成部分。
+- 同一个任务的实现返工默认最多 ${MAX_REWORK_ROUNDS} 轮；设计返工默认最多 ${MAX_DESIGN_REWORK_ROUNDS} 轮。任一到上限就暂停派单，先向用户说明阻塞点与已完成部分并等待决策；仅用户明确同意后调用 squad_extend(kind/rounds/reason/confirmed=true) 追加轮次再派单，每次扩展都要重新确认，可重复扩展，不自动续跑；用户拒绝或未回复时保持暂停。
 - 外部 provider（agent 配置里 provider 非空且不是 spawn/fork）走一次性派发：squad_dispatch 阻塞到它返回并把结果直接给你；它不会 squad_report，也不能续跑。返工=再派一次，必须重发 BRIEF 与缺陷清单。
 - 外部 agent 不共享你的会话上下文，只读共享文件；派单靠路径和编号，不要假设它记得上一轮。
 - 默认在 worktree 分支开发：squad_start 会创建新分支并切过去；不要在源 checkout 上直接改业务代码。
@@ -281,6 +296,21 @@ async function readJson(path) {
   }
 }
 
+/**
+ * Like readJson, but non-ENOENT I/O errors (e.g. EISDIR on a path squatting
+ * on a file) propagate with their original code/message; only a missing file
+ * (or unparseable content) reads as undefined. Used by squad_extend so a
+ * broken filesystem is never misreported as a missing task.
+ */
+async function readJsonIoStrict(path) {
+  try {
+    return JSON.parse(await readFile(path, 'utf8'))
+  } catch (error) {
+    if (error?.code === 'ENOENT' || error?.code === undefined) return undefined
+    throw error
+  }
+}
+
 async function writeJson(path, value) {
   await writeFile(path, `${JSON.stringify(value, null, 2)}\n`, 'utf8')
 }
@@ -386,14 +416,14 @@ ${workspaceBlock}
 ## 共享记忆协议
 
 - 任何派单动手前先读本文件。
-- Lead 先审方案再实现：\`brain\` 写 \`PLAN.md\` 后由 Lead 审核并用 \`squad_approve_plan\` 批准（Lead 只批准**方案**，归档 \`PLAN-APPROVED.md\`）；设计问题须带编号缺陷再派 \`phase="design"\` 返工，初始设计 + 3 轮返工 = 4 次 design 派单，第 5 次被拒绝；未批准前不派 implement/rework（无 brain 任务豁免）。
+- Lead 先审方案再实现：\`brain\` 写 \`PLAN.md\` 后由 Lead 审核并用 \`squad_approve_plan\` 批准（Lead 只批准**方案**，归档 \`PLAN-APPROVED.md\`）；设计问题须带编号缺陷再派 \`phase="design"\` 返工；默认初始设计 + 3 轮返工 = 4 次 design 派单，未扩展时第 5 次暂停：先向用户说明阻塞点与已完成部分并等待决策，用户同意后调用 squad_extend(kind="design", rounds=3, reason="用户批准的追加理由", confirmed=true) 追加轮次再派 design；每次扩展都要重新取得用户明确确认，可重复扩展，不自动续跑；用户拒绝或未回复时保持暂停。未批准前不派 implement/rework（无 brain 任务豁免）。
 - \`brain\` 写 \`PLAN.md\`（方案 + 编号验收标准）与 \`REVIEW.md\`（逐条结论与证据）。
 - \`worker\` 写 \`REPORT.md\`（改动、执行的命令、测试证据）。
 - PLAN-APPROVED.md 是实现、返工与验收的唯一权威规格；PLAN.md 只用于设计，不能覆盖批准归档。
 - 仅任务快照豁免方案门禁且无批准归档时，按 TASK.md 与 Lead 本轮派单执行；仍须逐条 AC 留证。
 - AC 映射：沿用 TASK.md 的 AC 编号；未编号时按条目顺序从 AC1 开始编号。PLAN.md 为每条 AC 指定改动文件、测试名、验证命令与期望值；REPORT.md/REVIEW.md 按批准方案逐条记录 AC 编号、文件路径、测试名、命令、退出码、关键输出与结论。
 - 每个成员在调用 \`squad_report\` 前，向 \`JOURNAL.md\` 追加一条简短记录。
-- 实现验收只有 \`brain\` 能批准（\`REVIEW.md\` 以 \`VERDICT: APPROVED\` 结束），与 Lead 的方案批准相互独立；实现返工独立计数，最多 3 轮、第 4 次被拒绝；Lead 在 brain 批准后收尾。
+- 实现验收只有 \`brain\` 能批准（\`REVIEW.md\` 以 \`VERDICT: APPROVED\` 结束），与 Lead 的方案批准相互独立；实现返工独立计数，默认 3 轮，未扩展时第 4 次暂停：先向用户说明阻塞点与已完成部分并等待决策，用户同意后调用 squad_extend(kind="implement", rounds=3, reason="用户批准的追加理由", confirmed=true) 追加轮次再派 rework；每次扩展都要重新取得用户明确确认，可重复扩展，不自动续跑；用户拒绝或未回复时保持暂停。Lead 在 brain 批准后收尾。
 - 记忆目录：\`${taskDir}\`
 
 ## 成员
@@ -454,10 +484,11 @@ async function fileSummary(taskDir) {
 
 /** Deterministic one-page brief; the only file an external agent must read first. */
 async function writeBrief({ taskDir, state, agent, phase, round }) {
+  const budget = budgetOf(state)
   const lines = [
     `# BRIEF · ${state.taskId}`,
     '',
-    `phase=${phase} round=${round} rework=${state.reworkRounds ?? 0}/${MAX_REWORK_ROUNDS}`,
+    `phase=${phase} round=${round} rework=${state.reworkRounds ?? 0}/${budget.reworkLimit}`,
     `agent=${agent.name} role=${agent.role}`,
     '',
     '## 目标 / 验收 / 约束',
@@ -700,6 +731,9 @@ function createTools(ctx, config, runtime, store) {
             planRounds: 0,
             planApproved: false,
             planApprovedAt: null,
+            designLimit: MAX_PLAN_ROUNDS,
+            reworkLimit: MAX_REWORK_ROUNDS,
+            extensions: [],
             dispatches: [],
             worktree: worktrees[0],
             worktrees,
@@ -860,6 +894,9 @@ function createTools(ctx, config, runtime, store) {
         planRounds: 0,
         planApproved: false,
         planApprovedAt: null,
+        designLimit: MAX_PLAN_ROUNDS,
+        reworkLimit: MAX_REWORK_ROUNDS,
+        extensions: [],
         dispatches: [],
         worktree: worktree ?? null,
         worktrees: worktree ? [{ ...worktree, repo: worktree.repositoryRoot }] : [],
@@ -959,9 +996,10 @@ function createTools(ctx, config, runtime, store) {
       const members = ctx.agentTeams.listMembers(lead)
       const existing = members.find((member) => member.name === target.name)
       const priorRework = Number(state.reworkRounds ?? 0)
-      if (phase === 'rework' && priorRework >= MAX_REWORK_ROUNDS) {
+      const budget = budgetOf(state)
+      if (phase === 'rework' && priorRework >= budget.reworkLimit) {
         throw new Error(
-          `返工已达上限 ${MAX_REWORK_ROUNDS} 轮。停止返工，向用户报告阻塞点与已完成部分。`,
+          `返工已达上限 ${budget.reworkLimit} 轮（已用 ${budget.implementUsed}）。先向用户说明阻塞点与已完成部分并等待决策；用户同意后调用 squad_extend(kind="implement", confirmed=true, reason="用户批准的追加理由") 追加轮次，再派 rework；用户拒绝或未回复时保持暂停，不得自动续跑。`,
         )
       }
       const round = phase === 'rework' ? Number(state.round ?? 1) + 1 : Number(state.round ?? 1)
@@ -1054,15 +1092,15 @@ function createTools(ctx, config, runtime, store) {
             `任务 ${taskId} 的 PLAN 已批准（${plan.planApprovedAt ?? '?'}）：不能再派 design 返工，请进入 implement。`,
           )
         }
-        if (plan.planRounds >= MAX_PLAN_ROUNDS) {
+        if (plan.planRounds >= budget.designLimit) {
           throw new Error(
-            `设计预算已用完：初始设计 + ${MAX_DESIGN_REWORK_ROUNDS} 轮返工 = ${MAX_PLAN_ROUNDS} 次 design 派单（当前 planRounds=${plan.planRounds}），第 ${MAX_PLAN_ROUNDS + 1} 次被拒绝。停下，向用户报告阻塞点与已完成部分。`,
+            `设计预算已用完：已到上限 ${budget.designLimit} 次 design 派单（已用 ${budget.designUsed}）。先向用户说明阻塞点与已完成部分并等待决策；用户同意后调用 squad_extend(kind="design", confirmed=true, reason="用户批准的追加理由") 追加轮次，再派 design；用户拒绝或未回复时保持暂停，不得自动续跑。`,
           )
         }
       }
       if ((phase === 'implement' || phase === 'rework') && plan.planRequired && !plan.planApproved) {
         throw new Error(
-          `任务 ${taskId} 的 PLAN.md 尚未经 Lead 审核批准（planRounds=${plan.planRounds}/${MAX_PLAN_ROUNDS}）。先审核 PLAN.md 并调用 squad_approve_plan，再派 ${phase}。`,
+          `任务 ${taskId} 的 PLAN.md 尚未经 Lead 审核批准（planRounds=${plan.planRounds}/${budget.designLimit}）。先审核 PLAN.md 并调用 squad_approve_plan，再派 ${phase}。`,
         )
       }
       await writeBrief({ taskDir, state, agent: target, phase, round })
@@ -1309,8 +1347,8 @@ function createTools(ctx, config, runtime, store) {
       if (mode === 'local' || mode === 'local-resumed') {
         return [
           `${mode === 'local' ? '已创建' : '已续跑'}本地子代理 ${target.name} [${target.role}] model=${target.model} session=${sessionId}`,
-          `task=${taskId} phase=${phase} round=${round} rework=${state.reworkRounds ?? 0}/${MAX_REWORK_ROUNDS}`,
-          ...(phase === 'design' ? [`planRounds=${state.planRounds}/${MAX_PLAN_ROUNDS}（Lead 审核后用 squad_approve_plan 批准）`] : []),
+          `task=${taskId} phase=${phase} round=${round} rework=${state.reworkRounds ?? 0}/${budget.reworkLimit}`,
+          ...(phase === 'design' ? [`planRounds=${state.planRounds}/${budget.designLimit}（Lead 审核后用 squad_approve_plan 批准）`] : []),
           `workspace=${workspace}`,
           '它完成后会以完成通知唤醒你；返工用同一 child id 续跑。',
         ].join('\n')
@@ -1323,7 +1361,7 @@ function createTools(ctx, config, runtime, store) {
         return [
           `已外部派发 ${target.displayName} (${target.name}) [${target.role}] provider=${target.model}（一次性，不续跑）`,
           `task=${taskId} phase=${phase} round=${round} tokens=${tokens ?? 'unknown'} totalTokens=${state.tokens ?? 0}`,
-          ...(phase === 'design' ? [`planRounds=${state.planRounds}/${MAX_PLAN_ROUNDS}（已归档 PLAN-R${state.planRounds}.md；Lead 审核后用 squad_approve_plan 批准）`] : []),
+          ...(phase === 'design' ? [`planRounds=${state.planRounds}/${budget.designLimit}（已归档 PLAN-R${state.planRounds}.md；Lead 审核后用 squad_approve_plan 批准）`] : []),
           `workspace=${workspace}`,
           '输出：',
           clipped || '（无文本输出）',
@@ -1331,8 +1369,8 @@ function createTools(ctx, config, runtime, store) {
       }
       return [
         `${mode === 'spawned' ? '已创建' : '已续跑'} ${target.name} [${target.role}] session=${sessionId}`,
-        `task=${taskId} phase=${phase} round=${round} rework=${state.reworkRounds ?? 0}/${MAX_REWORK_ROUNDS}`,
-        ...(phase === 'design' ? [`planRounds=${state.planRounds}/${MAX_PLAN_ROUNDS}（Lead 审核后用 squad_approve_plan 批准）`] : []),
+        `task=${taskId} phase=${phase} round=${round} rework=${state.reworkRounds ?? 0}/${budget.reworkLimit}`,
+        ...(phase === 'design' ? [`planRounds=${state.planRounds}/${budget.designLimit}（Lead 审核后用 squad_approve_plan 批准）`] : []),
         `workspace=${workspace}`,
         '队友完成后会调用 squad_report。结束本回合等报告；需要查看时用 squad_status。',
       ].join('\n')
@@ -1391,6 +1429,8 @@ function createTools(ctx, config, runtime, store) {
       const taskDir = join(directory, taskId)
       const state = (await readJson(join(taskDir, 'STATE.json'))) ?? {}
       const plan = planGateOf(state)
+      const budget = budgetOf(state)
+      const extensions = Array.isArray(state.extensions) ? state.extensions : []
       const members = ctx.agentTeams.listMembers(lead)
       const repoRows = worktreesOf(state)
       const workspaceBlock =
@@ -1403,14 +1443,23 @@ function createTools(ctx, config, runtime, store) {
             ? [`工作区：worktree ${state.worktree.branch} @ ${state.worktree.path}（源仓库 ${state.worktree.repositoryRoot}）`]
             : ['工作区：原地开发']
       const lines = [
-        `${PLUGIN_MARKER}  task=${taskId}  phase=${state.phase ?? 'unknown'}  round=${state.round ?? '?'}  rework=${state.reworkRounds ?? 0}/${MAX_REWORK_ROUNDS}  created=${state.createdAt ?? '?'}`,
-        `PLAN：planRequired=${plan.planRequired}  planRounds=${plan.planRounds}/${MAX_PLAN_ROUNDS}  planApproved=${plan.planApproved}${
+        `${PLUGIN_MARKER}  task=${taskId}  phase=${state.phase ?? 'unknown'}  round=${state.round ?? '?'}  rework=${state.reworkRounds ?? 0}/${budget.reworkLimit}  created=${state.createdAt ?? '?'}`,
+        `PLAN：planRequired=${plan.planRequired}  planRounds=${plan.planRounds}/${budget.designLimit}  planApproved=${plan.planApproved}${
           plan.planApproved
             ? `  planApprovedAt=${plan.planApprovedAt ?? '?'}（已归档 PLAN-APPROVED.md）`
             : plan.planRequired
               ? '（未批准：implement/rework 会被拒绝，先 squad_approve_plan）'
               : ''
         }`,
+        `预算：design 上限=${budget.designLimit} 已用=${budget.designUsed} 剩余=${Math.max(0, budget.designLimit - budget.designUsed)}；implement 上限=${budget.reworkLimit} 已用=${budget.implementUsed} 剩余=${Math.max(0, budget.reworkLimit - budget.implementUsed)}`,
+        ...(extensions.length === 0
+          ? ['最近扩展：无']
+          : [
+              '最近扩展（最多 6 条）：',
+              ...extensions.slice(-6).map(
+                (item) => `- ${item.at} kind=${item.kind} rounds=${item.rounds} reason=${item.reason}`,
+              ),
+            ]),
         `当前目录：${sessionDirectory(ctx, lead)}`,
         ...workspaceBlock,
         `共享记忆：${taskDir}`,
@@ -1846,6 +1895,7 @@ ${String(args.summary).trim()}
         )
       }
       const plan = planGateOf(state)
+      const designLimit = budgetOf(state).designLimit
       // Local/team designs are archived only here; a historical archive from
       // the external path is never rewritten. An existing path must be a
       // regular file — a directory or anything else is an archive fault and
@@ -1878,11 +1928,11 @@ ${String(args.summary).trim()}
       await writeJson(join(taskDir, 'STATE.json'), state)
       await appendFile(
         join(taskDir, 'JOURNAL.md'),
-        `- ${approvedAt} lead: 审核 PLAN 通过（设计轮次 ${plan.planRounds}/${MAX_PLAN_ROUNDS}），归档 PLAN-APPROVED.md\n`,
+        `- ${approvedAt} lead: 审核 PLAN 通过（设计轮次 ${plan.planRounds}/${designLimit}），归档 PLAN-APPROVED.md\n`,
         'utf8',
       ).catch(() => {})
       return [
-        `任务 ${taskId} 的 PLAN 已批准（第 ${plan.planRounds}/${MAX_PLAN_ROUNDS} 次设计）。`,
+        `任务 ${taskId} 的 PLAN 已批准（第 ${plan.planRounds}/${designLimit} 次设计）。`,
         `批准时间：${approvedAt}`,
         `归档：${archived.map((name) => join(taskDir, name)).join('、')}`,
         '下一步：squad_dispatch({ agent: "<worker>", phase: "implement" })；实现后仍需 brain 验收（REVIEW.md VERDICT: APPROVED）才能收尾。',
@@ -1890,7 +1940,98 @@ ${String(args.summary).trim()}
     },
   })
 
-  return { start, dispatch, status, wait, report, finish, approvePlan }
+  const extend = defineTool({
+    name: 'squad_extend',
+    description:
+      '仅允许 Lead 在对应预算（design/implement）已耗尽且用户明确同意后调用：为当前任务追加轮次，提高该类预算上限并记录扩展历史。每次调用都必须先向用户说明阻塞点并取得本次同意，再传 confirmed=true；可重复扩展，但不得预先充值，也不会自动续跑派单。',
+    parameters: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        kind: { type: 'string', enum: ['design', 'implement'] },
+        rounds: { type: 'integer', minimum: 1, default: 3 },
+        reason: { type: 'string', minLength: 1 },
+        confirmed: { type: 'boolean', const: true },
+        task_id: { type: 'string', minLength: 1 },
+      },
+      required: ['kind', 'reason', 'confirmed'],
+    },
+    output: {
+      schema: { type: 'string' },
+      render: (_args, value) => [{ type: 'text', text: value }],
+    },
+    async execute(args, exec) {
+      const lead = callingAgent(exec, 'squad_extend')
+      let membership
+      try {
+        membership = ctx.agentTeams.tryMembership(lead)
+      } catch {
+        membership = undefined
+      }
+      if (membership?.role !== 'lead') {
+        throw new Error('squad_extend 仅允许 Lead 调用。')
+      }
+      const kind = args.kind
+      if (kind !== 'design' && kind !== 'implement') {
+        throw new Error('kind 必须是 design 或 implement。')
+      }
+      const rounds = args.rounds === undefined ? 3 : args.rounds
+      if (!(Number.isSafeInteger(rounds) && rounds > 0)) {
+        throw new Error('rounds 必须是正的安全整数。')
+      }
+      if (typeof args.reason !== 'string' || args.reason.trim() === '') {
+        throw new Error('reason 必须是非空字符串。')
+      }
+      const reason = args.reason.trim()
+      if (args.confirmed !== true) {
+        throw new Error('必须先获得用户明确同意，并传入 confirmed=true 才能追加轮次。')
+      }
+      if (args.task_id !== undefined && (typeof args.task_id !== 'string' || args.task_id.trim() === '')) {
+        throw new Error('task_id 必须是非空字符串。')
+      }
+      // Shared-root resolution mirrors memoryDirectory, but non-ENOENT I/O
+      // errors propagate as-is instead of reading as "no task" (§16).
+      const base = config.memoryDir || DEFAULT_MEMORY_DIR
+      const cwd = sessionDirectory(ctx, lead)
+      const pointer = await readJsonIoStrict(join(cwd, base, 'current.json'))
+      const directory = pointer?.memoryRoot ? pointer.memoryRoot : resolve(cwd, base)
+      const current = await readJsonIoStrict(join(directory, 'current.json'))
+      const taskId = args.task_id !== undefined ? args.task_id.trim() : String(current?.taskId ?? '')
+      if (!taskId) throw new Error('还没有小队任务。先调用 squad_start。')
+      const taskDir = join(directory, taskId)
+      const state = await readJsonIoStrict(join(taskDir, 'STATE.json'))
+      if (!state) throw new Error(`未知小队任务 "${taskId}"。先调用 squad_start。`)
+      if (state.phase === 'done') {
+        throw new Error(`任务 ${taskId} 已经收尾，不能追加轮次。`)
+      }
+      const budget = budgetOf(state)
+      const used = kind === 'design' ? budget.designUsed : budget.implementUsed
+      const limit = kind === 'design' ? budget.designLimit : budget.reworkLimit
+      if (used < limit) {
+        throw new Error(
+          `任务 ${taskId} 的 ${kind} 预算尚未到上限（已用 ${used}/${limit}），不能追加轮次。`,
+        )
+      }
+      if (!Number.isSafeInteger(limit + rounds)) {
+        throw new Error('追加后的预算上限超出安全整数范围。')
+      }
+      // All checks passed: write back both effective limits, raising only the
+      // selected budget, and append one history record. Nothing else changes.
+      const extensions = Array.isArray(state.extensions) ? state.extensions : []
+      state.designLimit = budget.designLimit
+      state.reworkLimit = budget.reworkLimit
+      if (kind === 'design') state.designLimit = limit + rounds
+      else state.reworkLimit = limit + rounds
+      state.extensions = [
+        ...extensions,
+        { kind, rounds, reason, at: new Date().toISOString() },
+      ]
+      await writeJson(join(taskDir, 'STATE.json'), state)
+      return `任务 ${taskId} 的 ${kind} 预算已扩展：上限 ${limit} → ${limit + rounds}，已用 ${used}，剩余 ${Math.max(0, limit + rounds - used)}（追加 ${rounds} 轮）。\n原因：${reason}`
+    },
+  })
+
+  return { start, dispatch, status, wait, report, finish, approvePlan, extend }
 }
 
 /** Host plugin entry. */
@@ -2024,6 +2165,7 @@ export function apply(ctx, input) {
     [tools.start, isLead],
     [tools.dispatch, isLead],
     [tools.approvePlan, isLead],
+    [tools.extend, isLead],
     [tools.status, isLead],
     [tools.wait, isLead],
     [tools.finish, isLead],

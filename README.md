@@ -19,7 +19,7 @@
 
 | 角色 | 谁 | 职责 | 工具 |
 | --- | --- | --- | --- |
-| `lead` | 当前 DSH 会话 | 拆解流程、审核并批准 PLAN、决定下一个执行者、汇总交付；不写业务代码 | `squad_start` / `squad_dispatch` / `squad_approve_plan` / `squad_status` / `squad_wait` / `squad_finish` |
+| `lead` | 当前 DSH 会话 | 拆解流程、审核并批准 PLAN、决定下一个执行者、汇总交付；不写业务代码 | `squad_start` / `squad_dispatch` / `squad_approve_plan` / `squad_extend` / `squad_status` / `squad_wait` / `squad_finish` |
 | `brain` | codex | 写可执行规格与 AC 验证命令；最终逐条验收，只有它能给 approved | `squad_report` |
 | `worker` | zcode / qoder | 按 PLAN-APPROVED.md 实现、写测试、跑验收命令、记录证据；返工按编号缺陷修复 | `squad_report` |
 
@@ -42,9 +42,10 @@
 ### 预算与上限
 
 - **方案预算**：brain 的计划正文默认 ≤ 80 行，测试数 ≤ `max(6, 验收条数×2)`，除非任务确实更复杂并在 PLAN.md 说明理由。
-- **设计返工上限**：Lead 先审方案再实现——初始设计 + 最多 **3 轮设计返工**（合计 4 次 `phase="design"` 派单），**第 5 次被 `squad_dispatch` 直接拒绝**；与实现返工预算相互独立、分别计数。
-- **实现返工上限**：同一任务最多 **3 轮返工**；**第 4 次** `phase="rework"` 会被 `squad_dispatch` 直接拒绝，Lead 必须停下来向用户报告。
-- **预算常量都在插件常量里**，可按需调整（`MAX_DESIGN_REWORK_ROUNDS` / `MAX_REWORK_ROUNDS`）。
+- **设计预算（默认 4 次）**：Lead 先审方案再实现——初始设计 + 最多 **3 轮设计返工**（合计 4 次 `phase="design"` 派单）；与实现返工预算相互独立、分别计数。
+- **实现返工预算（默认 3 轮）**：同一任务最多 **3 轮返工**。
+- **到上限是暂停，不是硬拒绝**：未扩展时第 5 次 design / 第 4 次 rework 会被 `squad_dispatch` 暂停。Lead 必须先向用户说明阻塞点及已完成部分并**等待决策**；仅用户明确同意后调用 **`squad_extend`**（例如 `squad_extend(kind="design", rounds=3, reason="用户批准的追加理由", confirmed=true)`，`rounds` 正整数默认 3）追加轮次再派单。每次扩展都要重新取得用户同意（每次都传 `confirmed=true`），可重复扩展、无插件硬上限，但不得预先充值，也**不自动续跑**；用户拒绝或未回复时保持暂停。
+- **默认值只在插件常量里**：`MAX_DESIGN_REWORK_ROUNDS` / `MAX_REWORK_ROUNDS` 只作新任务初值与旧数据回退；每个任务的实际上限存在 STATE（`designLimit` / `reworkLimit` / `extensions`），由 `squad_extend` 提高。
 
 ## 使用
 
@@ -56,10 +57,10 @@ Lead 的固定流程（**先审方案再实现**）：
 
 1. `squad_start` 建任务与共享记忆；**默认同时创建 worktree + 新分支，并把会话切过去**；
 2. `squad_dispatch(codex, phase=design)` → brain 写 `PLAN.md` 与验收标准；
-3. **Lead 审核 `PLAN.md`**：假装自己是没有上下文的 worker，无法只靠 PLAN 实现的点一律按 D1 起连续编号，写明章节、缺失或矛盾、最小补全要求，再派回 brain。有问题就把编号缺陷派回 brain（`phase="design"` 返工，最多 3 轮）；方案合格后调用 **`squad_approve_plan`** 批准（归档 `PLAN-APPROVED.md`）。有 brain 参与的任务，批准前 `implement`/`rework` 派单会被拒绝；无 brain 任务豁免；
+3. **Lead 审核 `PLAN.md`**：假装自己是没有上下文的 worker，无法只靠 PLAN 实现的点一律按 D1 起连续编号，写明章节、缺失或矛盾、最小补全要求，再派回 brain。有问题就把编号缺陷派回 brain（`phase="design"` 返工）；设计预算默认 4 次，未扩展时第 5 次暂停——先向用户说明阻塞点与已完成部分并等待决策，用户同意后用 `squad_extend(kind="design", rounds=3, reason="用户批准的追加理由", confirmed=true)` 追加轮次再派。方案合格后调用 **`squad_approve_plan`** 批准（归档 `PLAN-APPROVED.md`）。有 brain 参与的任务，批准前 `implement`/`rework` 派单会被拒绝；无 brain 任务豁免；
 4. `squad_dispatch(zcode, phase=implement)` → worker 按 PLAN-APPROVED.md 在 worktree 里实现并写 `REPORT.md`，逐条 AC 给证据；
 5. `squad_dispatch(codex, phase=review)` → brain 对照 PLAN-APPROVED.md 逐条验收；
-6. 不通过 → `squad_dispatch(zcode, phase=rework)`：**同一会话**继续，只补缺陷；
+6. 不通过 → `squad_dispatch(zcode, phase=rework)`：**同一会话**继续，只补缺陷；返工预算默认 3 轮，未扩展时第 4 次暂停——先向用户说明阻塞点与已完成部分并等待决策，用户同意后用 `squad_extend(kind="implement", rounds=3, reason="用户批准的追加理由", confirmed=true)` 追加轮次再派，每次扩展都要重新确认、可重复扩展、不自动续跑，用户拒绝或未回复时保持暂停；
 7. brain `approved` 后调用 `squad_finish`：逐仓提交 worktree 改动、切回主仓库源目录、给出每仓分支与合并命令。
 
 > 两种批准相互独立：`squad_approve_plan`（Lead）批准的是**方案**，`REVIEW.md` 的 `VERDICT: APPROVED`（brain）批准的是**实现**；前者不能替代后者，收尾仍只认 brain 验收。
@@ -112,7 +113,7 @@ node --test dsh-agent-squad/test/settings.test.js
 ASQ_LIVE_QODER=1 node --test --test-name-pattern='^T09 ' dsh-agent-squad/test/settings.test.js
 ```
 
-测试保持九个顶层用例；实机模式由 qoder 一次派单修改两个临时仓库，各新增一次提交，并输出 `AC7 task=... cwd=... repo=... commit=... repo=... commit=...`。普通单测不能代替该证据。
+测试保持十个顶层用例；实机模式由 qoder 一次派单修改两个临时仓库，各新增一次提交，并输出 `AC7 task=... cwd=... repo=... commit=... repo=... commit=...`。普通单测不能代替该证据。
 
 ## B 模式：外部 provider（一次性）
 
@@ -277,13 +278,13 @@ token：GLM implement 26,295 / rework 26,459（cache 主导）；Codex 设计 + 
     ├── TASK.md               # 目标 / 验收标准 / 约束 / 成员（Lead 写）
     ├── BRIEF.md              # 每次派单重写的一次性简报（外部 agent 必读）
     ├── PLAN.md               # 设计草稿 + 编号验收标准（brain 写）
-    ├── PLAN-R<n>.md          # 第 n 次设计的方案归档（1–4）
+    ├── PLAN-R<n>.md          # 第 n 次设计的方案归档（n 随扩展增长）
     ├── PLAN-APPROVED.md      # 实现、返工与验收的唯一权威规格（squad_approve_plan 写）
     ├── REVIEW.md             # 逐条验收结论 + 证据（brain 写）
     ├── REVIEW-R<round>.md    # 每轮验收归档
     ├── REPORT.md             # 逐条 AC 的文件 / 测试 / 命令 / 退出码 / 输出 / 结论
     ├── JOURNAL.md            # 追加式流水（所有人写）
-    ├── STATE.json            # phase / round / planRequired / planRounds / planApproved / dispatch 记录
+    ├── STATE.json            # phase / round / planRequired / planRounds / planApproved / designLimit / reworkLimit / extensions / dispatch 记录
     └── FINAL.md              # 收尾摘要（squad_finish 写）
 ```
 
@@ -291,7 +292,7 @@ token：GLM implement 26,295 / rework 26,459（cache 主导）；Codex 设计 + 
 
 - **external 执行者**：每次成功的 design 派单在返回前同步读取 `PLAN.md` 并归档为 `PLAN-R<n>.md`（n = 派单前 planRounds + 1）；归档失败会显式报错（说明已派单）、planRounds 不增加、不自动重派。
 - **local / team 执行者**：design 派单投递成功即计数写 STATE，不逐轮归档；仅在 `squad_approve_plan` 批准时把当前 PLAN.md 补归档为当前轮次 `PLAN-R<n>.md`（已存在的历史归档不改写）。
-- **设计预算**：初始设计 + 3 轮返工 = 4 次成功 design 派单；第 5 次拒绝。PLAN 已批准后 design 一律拒绝。
+- **设计预算**：默认初始设计 + 3 轮返工 = 4 次成功 design 派单；未扩展时第 5 次暂停（用户决策门禁，见上），上限存 STATE 的 `designLimit`。PLAN 已批准后 design 一律拒绝（扩展不解除批准门禁）。
 - **实现门禁**：`planRequired`（任务建立时按参与者是否含 brain 快照，之后改角色不生效）且未批准时，implement/rework 在写 BRIEF/STATE/调用执行器之前即被拒绝，错误信息指向 `squad_approve_plan`；无 brain 任务豁免。旧 STATE 无这些字段时按验收门禁快照回退（gate 显式 false 才豁免），不按当前 roster 放宽。
 
 每次派单的消息只带任务号、阶段、轮次、目录和本轮任务，不复制历史对话；队友先读文件再动手。这样跨 agent 的“共享记忆”是可审计的文件，而不是互相复制的 transcript。
@@ -307,9 +308,10 @@ token：GLM implement 26,295 / rework 26,459（cache 主导）；Codex 设计 + 
 | 工具 | 调用者 | 作用 |
 | --- | --- | --- |
 | `squad_start` | Lead | 可选 `repos: string[]`（默认当前仓库，首项为主仓）；建 worktree 集合、写 TASK/JOURNAL/STATE 和 plan 门禁，最后发布 current |
-| `squad_dispatch` | Lead | 首次创建 / 之后续跑指定队友，推进 phase 与 round；design 受 4 次预算与已批准限制，implement/rework 受 PLAN 批准门禁 |
+| `squad_dispatch` | Lead | 首次创建 / 之后续跑指定队友，推进 phase 与 round；design 受设计预算与已批准限制，implement/rework 受 PLAN 批准门禁；到预算上限时暂停并提示先问用户 |
 | `squad_approve_plan` | Lead（仅 Lead 可见） | 审核通过 PLAN.md：补归档当前轮次 `PLAN-R<n>.md`，写 `PLAN-APPROVED.md` 与 `planApproved`/`planApprovedAt`；缺 PLAN、已收尾或已批准时拒绝 |
-| `squad_status` | Lead | 任务、阶段、轮次、全部仓库/worktree/分支/基线与工作区、PLAN 门禁（planRequired / planRounds/4 / planApproved / planApprovedAt）、成员状态、记忆文件、最近派单 |
+| `squad_extend` | Lead（仅 Lead 可见） | 用户决策门禁：仅当对应预算（`kind` = design/implement）已到上限且用户明确同意后调用（`confirmed=true` 必填，`rounds` 正整数默认 3，`reason` 必填），提高该类上限并追加一条扩展记录；未到上限、未确认或非 Lead 一律拒绝；可重复扩展，不自动续跑 |
+| `squad_status` | Lead | 任务、阶段、轮次、全部仓库/worktree/分支/基线与工作区、PLAN 门禁（planRequired / planRounds/designLimit / planApproved / planApprovedAt）、两类预算的上限/已用/剩余与最近 6 条扩展记录、成员状态、记忆文件、最近派单 |
 | `squad_wait` | Lead | 有界阻塞等待团队变化（通常不需要，报告会唤醒 Lead） |
 | `squad_finish` | Lead | 校验无队友运行 + brain approved，逐仓提交并记录结果，切回主仓库源目录，写 FINAL.md 与每仓合并命令；多仓失败可重试 |
 | `squad_report` | brain / worker | 把结果、阻塞或验收结论发回 Lead 并写 JOURNAL |

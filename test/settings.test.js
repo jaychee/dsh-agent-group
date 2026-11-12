@@ -1,5 +1,5 @@
 /**
- * Settings-page test suite — exactly nine top-level tests (T01–T09).
+ * Settings-page test suite — exactly ten top-level tests (T01–T10).
  * Run: node --test dsh-agent-squad/test/settings.test.js
  */
 
@@ -1355,11 +1355,15 @@ test('T07 plan gate: lead review, design budget, squad_approve_plan, archives an
     // --- AC3: registration and Lead-only visibility -------------------------
     const names = host.registered.map((entry) => entry.definition.name).sort()
     assert.deepEqual(names, [
-      'squad_approve_plan', 'squad_dispatch', 'squad_finish', 'squad_report', 'squad_start', 'squad_status', 'squad_wait',
+      'squad_approve_plan', 'squad_dispatch', 'squad_extend', 'squad_finish', 'squad_report', 'squad_start', 'squad_status', 'squad_wait',
     ])
     const approveEntry = host.registered.find((entry) => entry.definition.name === 'squad_approve_plan')
     assert.equal(approveEntry.when({ agent: lead }), true)
     assert.equal(approveEntry.when({ agent: teammate }), false)
+    const extendEntry = host.registered.find((entry) => entry.definition.name === 'squad_extend')
+    assert.equal(extendEntry.when({ agent: lead }), true)
+    assert.equal(extendEntry.when({ agent: teammate }), false)
+    assert.equal(extendEntry.when({ agent: { id: 'anon' } }), false)
 
     // --- AC1: snapshot initialization ---------------------------------------
     const startA = await tool('squad_start').execute({ goal: 'g', acceptance: 'a' }, exec)
@@ -1608,9 +1612,9 @@ test('T07 plan gate: lead review, design budget, squad_approve_plan, archives an
     assert.match(taskMd, /squad_approve_plan/)
     assert.match(taskMd, /Lead 只批准\*\*方案\*\*/)
     assert.match(taskMd, /编号缺陷再派/)
-    assert.match(taskMd, /4 次 design 派单，第 5 次被拒绝/)
+    assert.match(taskMd, /4 次 design 派单，未扩展时第 5 次暂停/)
     assert.match(taskMd, /实现验收只有 `brain` 能批准/)
-    assert.match(taskMd, /最多 3 轮、第 4 次被拒绝/)
+    assert.match(taskMd, /默认 3 轮，未扩展时第 4 次暂停/)
     assertSEM(taskMd)
 
     // --- AC6/AC7: flow copy, dictionary and SVG wiring in the sources ---------
@@ -1664,6 +1668,30 @@ test('T07 plan gate: lead review, design budget, squad_approve_plan, archives an
     }
     assert.ok(readme.includes(WORKER_ITEMS[1]), 'README missing worker no-introduce item')
     assert.ok(readme.includes(WORKER_ITEMS[2]), 'README missing worker blocked item')
+    // Budget-gate copy: LEAD_POLICY, the generated TASK.md and the README all
+    // describe the user-decision pause + squad_extend flow (PLAN §27/D2),
+    // with a fully valid example call (kind, rounds, reason, confirmed=true).
+    const validCall = 'squad_extend(kind="design", rounds=3, reason="用户批准的追加理由", confirmed=true)'
+    for (const text of [leadSeg, taskMd, readme]) {
+      for (const literal of ['squad_extend', 'confirmed=true', '等待', '不自动续跑', validCall]) {
+        assert.ok(text.includes(literal), `budget-gate copy missing "${literal}"`)
+      }
+    }
+    // D2: the generated TASK carries the full decision rules, and the README
+    // Lead role row lists squad_extend among its tools.
+    for (const literal of [
+      '已完成部分',
+      'rounds=3',
+      '每次扩展都要重新取得用户明确确认',
+      '可重复扩展',
+      '用户拒绝或未回复时保持暂停',
+    ]) {
+      assert.ok(taskMd.includes(literal), `TASK decision-gate rule missing: ${literal}`)
+    }
+    assert.ok(
+      readme.includes('`squad_approve_plan` / `squad_extend` / `squad_status`'),
+      'README lead tool row must list squad_extend',
+    )
   } finally {
     delete process.env.DSH_HOME
     await rm(workspace, { recursive: true, force: true })
@@ -2143,6 +2171,11 @@ test('T09 multi-repository lifecycle, validation, rollback and compatibility', a
         assert.equal(state.worktrees[0].repositoryRoot, repoA)
         assert.equal(currentDir, taskRoot)
         assert.equal(host.cwdCalls.at(-1).directory, taskRoot)
+        // New budget snapshot fields persist at start (PLAN §6).
+        assert.deepEqual(
+          [state.designLimit, state.reworkLimit, state.extensions],
+          [4, 3, []],
+        )
         // Five deduplicated current pointers (task root, both worktrees,
         // primary source, caller source), all with the same content.
         const expectedPointer = { taskId, memoryRoot: join(taskRoot, '.agent-squad'), worktree: wtA, taskRoot }
@@ -2999,6 +3032,11 @@ test('T09 multi-repository lifecycle, validation, rollback and compatibility', a
       assert.equal(singleState.worktrees.length, 1)
       assert.equal(singleState.worktrees[0].repo, repoM)
       assert.equal(currentDir, singleRoot)
+      // New budget snapshot fields persist at start (PLAN §6).
+      assert.deepEqual(
+        [singleState.designLimit, singleState.reworkLimit, singleState.extensions],
+        [4, 3, []],
+      )
       await stat(join(singleRoot, '.agent-squad', singleId, 'TASK.md'))
 
       // Omitted repos in a Git directory: identical single-repository layout.
@@ -3016,6 +3054,11 @@ test('T09 multi-repository lifecycle, validation, rollback and compatibility', a
       assert.equal(omittedState.worktrees.length, 1)
       assert.equal(omittedState.worktrees[0].repo, repoN)
       assert.equal(currentDir, omittedRoot)
+      // New budget snapshot fields persist at start (PLAN §6).
+      assert.deepEqual(
+        [omittedState.designLimit, omittedState.reworkLimit, omittedState.extensions],
+        [4, 3, []],
+      )
 
       // Explicit single non-Git input is refused (no in-place degrade).
       await assert.rejects(
@@ -3054,6 +3097,739 @@ test('T09 multi-repository lifecycle, validation, rollback and compatibility', a
   } finally {
     delete process.env.DSH_HOME
     await rm(root, { recursive: true, force: true })
+    await rm(dshHome, { recursive: true, force: true })
+  }
+})
+
+/** T10 — budget extension: user-decision gate, squad_extend, dynamic limits (PLAN §29–§37). */
+test('T10 budget extension requires user confirmation and resumes exhausted budgets', async () => {
+  const workspace = await tempRoot()
+  const dshHome = await tempRoot()
+  process.env.DSH_HOME = dshHome
+  const labeled = async (name, fn) => {
+    try {
+      await fn()
+    } catch (error) {
+      error.message = `[${name}] ${error.message}`
+      throw error
+    }
+  }
+  try {
+    const settingsPath = join(dshHome, 'agent-squad', 'settings.json')
+    await mkdir(join(dshHome, 'agent-squad'), { recursive: true })
+    await writeFile(
+      settingsPath,
+      JSON.stringify(
+        {
+          version: 1,
+          revision: 1,
+          agents: [
+            { id: 'codex', displayName: 'codex', role: 'brain', executor: 'external', model: 'mock-ext', description: 'b' },
+            { id: 'zcode', displayName: 'zcode', role: 'worker', executor: 'local', model: 'p/m1', description: 'w' },
+            { id: 'qoder', displayName: 'qoder', role: 'worker', executor: 'team', model: '', description: 'w2' },
+          ],
+          worktree: { directory: '.agents/worktrees' },
+        },
+        null,
+        2,
+      ),
+      'utf8',
+    )
+    const { apply } = await import('../index.js')
+    // Mock external brain: writes a fresh PLAN.md for the current task before
+    // the activation result resolves, so the dispatch-side archive sees it.
+    let writes = 0
+    const host = mockHost(workspace, dshHome, {
+      onExternal: async () => {
+        writes += 1
+        const memory = join(workspace, '.agent-squad')
+        const pointer = JSON.parse(await readFile(join(memory, 'current.json'), 'utf8'))
+        await writeFile(
+          join(pointer.memoryRoot ?? memory, pointer.taskId, 'PLAN.md'),
+          `# PLAN T10-${writes}\n`,
+          'utf8',
+        )
+      },
+    })
+    apply(host.ctx, { agents: BUNDLE_AGENTS })
+    const tool = (name) => host.registered.find((entry) => entry.definition.name === name).definition
+    const lead = { id: 'lead-1', session: { id: 'session-1' }, __membership: { role: 'lead', name: 'lead' } }
+    const teammate = { id: 'te-1', __membership: { role: 'teammate', name: 'zcode' } }
+    const exec = { agent: lead, signal: undefined }
+    const extend = (args, caller = exec) => tool('squad_extend').execute(args, caller)
+    const dispatch = (args) => tool('squad_dispatch').execute(args, exec)
+    const design = (message, task_id) =>
+      dispatch({ agent: 'codex', message, phase: 'design', ...(task_id ? { task_id } : {}) })
+    const rework = (message) => dispatch({ agent: 'zcode', message, phase: 'rework' })
+    const startTask = async (goal) => {
+      const out = await tool('squad_start').execute({ goal, acceptance: 'ok' }, exec)
+      return /任务 (t-\S+) 已创建/.exec(out)[1]
+    }
+    const readState = async (task) =>
+      JSON.parse(await readFile(join(workspace, '.agent-squad', task, 'STATE.json'), 'utf8'))
+    const writeState = (task, state) =>
+      writeFile(join(workspace, '.agent-squad', task, 'STATE.json'), JSON.stringify(state, null, 2) + '\n', 'utf8')
+    const budgetLine = (d, du, i, iu) =>
+      `预算：design 上限=${d} 已用=${du} 剩余=${Math.max(0, d - du)}；implement 上限=${i} 已用=${iu} 剩余=${Math.max(0, i - iu)}`
+    /** Recursive byte snapshot of one directory (files base64, dirs nested). */
+    const snapDir = async (dir) => {
+      let entries
+      try {
+        entries = await readdir(dir, { withFileTypes: true })
+      } catch (error) {
+        return error?.code === 'ENOENT' ? undefined : error.code
+      }
+      const out = {}
+      for (const entry of entries.sort((a, b) => (a.name < b.name ? -1 : 1))) {
+        const full = join(dir, entry.name)
+        if (entry.isDirectory()) out[entry.name] = await snapDir(full)
+        else if (entry.isFile()) out[entry.name] = (await readFile(full)).toString('base64')
+        else out[entry.name] = 'special'
+      }
+      return out
+    }
+    /** Full side-effect snapshot: every task file/archive, the shared-root
+     * current pointer, executor counters and cwd sets (§21/D3). */
+    const snapshot = async (task) => ({
+      files: await snapDir(join(workspace, '.agent-squad', task)),
+      current: await readFile(join(workspace, '.agent-squad', 'current.json')).catch(
+        (error) => error?.code ?? 'missing',
+      ),
+      activations: host.activations.length,
+      sent: host.sent.length,
+      spawned: host.spawned.length,
+      runs: host.runIds.length,
+      cwdSets: host.cwdCalls.filter((call) => call.op === 'set').length,
+    })
+    /** §21: a rejection leaves every shared file byte-identical and spawns nothing. */
+    const noSide = async (task, thunk, expectedMessage) => {
+      const before = await snapshot(task)
+      await assert.rejects(thunk(), { message: expectedMessage })
+      assert.deepEqual(await snapshot(task), before, 'rejection must leave zero side effects')
+    }
+    /** Root-wide snapshot: the WHOLE shared memory root (every task dir, the
+     * current pointer even when it is a directory, t-nope absence) plus the
+     * executor counters (D3/E9). */
+    const snapshotRoot = async () => ({
+      root: await snapDir(join(workspace, '.agent-squad')),
+      activations: host.activations.length,
+      sent: host.sent.length,
+      spawned: host.spawned.length,
+      runs: host.runIds.length,
+      cwdSets: host.cwdCalls.filter((call) => call.op === 'set').length,
+    })
+    /** §16/D3: a successful extend changes ONLY the target STATE's three
+     * budget fields (and nothing else on disk or in the executors). */
+    const extendOnly = async (task, args) => {
+      const before = await snapshot(task)
+      const statePath = join(workspace, '.agent-squad', task, 'STATE.json')
+      const stateBefore = JSON.parse(await readFile(statePath, 'utf8'))
+      const out = await extend(args)
+      const after = await snapshot(task)
+      const { files, ...afterRest } = after
+      const { files: filesBefore, ...beforeRest } = before
+      assert.deepEqual(afterRest, beforeRest, 'extend must not touch executors or current')
+      assert.deepEqual(Object.keys(files).sort(), Object.keys(filesBefore).sort())
+      for (const name of Object.keys(files)) {
+        if (name === 'STATE.json') continue
+        assert.deepEqual(files[name], filesBefore[name], `extend must not touch ${name}`)
+      }
+      const stateAfter = JSON.parse(await readFile(statePath, 'utf8'))
+      const strip = ({ designLimit, reworkLimit, extensions, ...rest }) => rest
+      assert.deepEqual(strip(stateAfter), strip(stateBefore), 'only the three budget fields may change')
+      return out
+    }
+    const designPause = (limit, used) =>
+      `设计预算已用完：已到上限 ${limit} 次 design 派单（已用 ${used}）。先向用户说明阻塞点与已完成部分并等待决策；用户同意后调用 squad_extend(kind="design", confirmed=true, reason="用户批准的追加理由") 追加轮次，再派 design；用户拒绝或未回复时保持暂停，不得自动续跑。`
+    const reworkPause = (limit, used) =>
+      `返工已达上限 ${limit} 轮（已用 ${used}）。先向用户说明阻塞点与已完成部分并等待决策；用户同意后调用 squad_extend(kind="implement", confirmed=true, reason="用户批准的追加理由") 追加轮次，再派 rework；用户拒绝或未回复时保持暂停，不得自动续跑。`
+
+    // --- T10/schema (PLAN §30) -----------------------------------------------
+    await labeled('schema', async () => {
+      const extendDef = tool('squad_extend')
+      assert.equal(extendDef.name, 'squad_extend')
+      assert.deepEqual(extendDef.parameters, {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          kind: { type: 'string', enum: ['design', 'implement'] },
+          rounds: { type: 'integer', minimum: 1, default: 3 },
+          reason: { type: 'string', minLength: 1 },
+          confirmed: { type: 'boolean', const: true },
+          task_id: { type: 'string', minLength: 1 },
+        },
+        required: ['kind', 'reason', 'confirmed'],
+      })
+      assert.deepEqual(extendDef.output.schema, { type: 'string' })
+      assert.deepEqual(extendDef.output.render({}, 'x'), [{ type: 'text', text: 'x' }])
+      const entry = host.registered.find((row) => row.definition.name === 'squad_extend')
+      assert.equal(entry.when({ agent: lead }), true)
+      assert.equal(entry.when({ agent: teammate }), false)
+      assert.equal(entry.when({ agent: { id: 'anon' } }), false)
+      assert.deepEqual(
+        host.registered.map((row) => row.definition.name).sort(),
+        [
+          'squad_approve_plan', 'squad_dispatch', 'squad_extend', 'squad_finish',
+          'squad_report', 'squad_start', 'squad_status', 'squad_wait',
+        ],
+      )
+    })
+
+    // --- T10/reject (PLAN §31): E1–E10, first-error-wins, zero side effects ---
+    await labeled('reject', async () => {
+      const good = { kind: 'design', reason: '用户同意', confirmed: true }
+      const task = await startTask('reject-main')
+      // E1: no calling agent.
+      await noSide(task, () => extend({ ...good }, {}), 'squad_extend requires a calling agent')
+      // E2: teammate, no membership, and a membership service that throws.
+      await noSide(
+        task,
+        () => extend({ ...good }, { agent: teammate, signal: undefined }),
+        'squad_extend 仅允许 Lead 调用。',
+      )
+      await noSide(
+        task,
+        () => extend({ ...good }, { agent: { id: 'anon', session: { id: 's' } }, signal: undefined }),
+        'squad_extend 仅允许 Lead 调用。',
+      )
+      {
+        const originalTry = host.ctx.agentTeams.tryMembership
+        host.ctx.agentTeams.tryMembership = () => {
+          throw new Error('membership exploded')
+        }
+        try {
+          await noSide(task, () => extend({ ...good }), 'squad_extend 仅允许 Lead 调用。')
+        } finally {
+          host.ctx.agentTeams.tryMembership = originalTry
+        }
+      }
+      // E3: kind missing / invalid.
+      for (const kind of [undefined, 'review']) {
+        await noSide(task, () => extend({ ...good, kind }), 'kind 必须是 design 或 implement。')
+      }
+      // E4: rounds must be a positive safe integer.
+      for (const rounds of [0, -1, 1.5, '3', null, NaN, Infinity, 9007199254740992]) {
+        await noSide(task, () => extend({ ...good, rounds }), 'rounds 必须是正的安全整数。')
+      }
+      // E5: reason must be a non-empty string.
+      for (const reason of [undefined, '', ' \n ', 7]) {
+        await noSide(task, () => extend({ ...good, reason }), 'reason 必须是非空字符串。')
+      }
+      // E6: confirmed must be exactly true.
+      for (const confirmed of [undefined, false, 'true', 1, null]) {
+        await noSide(
+          task,
+          () => extend({ ...good, confirmed }),
+          '必须先获得用户明确同意，并传入 confirmed=true 才能追加轮次。',
+        )
+      }
+      // E7: an explicit task_id must be a non-empty string.
+      for (const task_id of ['', ' ', 7, null]) {
+        await noSide(task, () => extend({ ...good, task_id }), 'task_id 必须是非空字符串。')
+      }
+      // E9: unknown task id — the snapshot covers the WHOLE shared memory
+      // root, so a stray `t-nope` directory (or any other mutation) would
+      // fail the comparison, alongside the task/current/executor checks.
+      {
+        const rootBefore = await snapshotRoot()
+        assert.equal(rootBefore.root['t-nope'], undefined, 't-nope must not exist beforehand')
+        await assert.rejects(extend({ ...good, task_id: 't-nope' }), {
+          message: '未知小队任务 "t-nope"。先调用 squad_start。',
+        })
+        assert.deepEqual(await snapshotRoot(), rootBefore, 'E9 must leave the whole root untouched')
+      }
+      // E10: a finished task; the rejection leaves the DONE task untouched.
+      const doneStart = await tool('squad_start').execute(
+        { goal: 'done task', acceptance: 'ok', agents: ['zcode', 'qoder'] },
+        exec,
+      )
+      const doneTask = /任务 (t-\S+) 已创建/.exec(doneStart)[1]
+      await tool('squad_finish').execute({ summary: 'closed', task_id: doneTask }, exec)
+      assert.equal((await readState(doneTask)).phase, 'done')
+      await noSide(
+        doneTask,
+        () => extend({ ...good, task_id: doneTask }),
+        `任务 ${doneTask} 已经收尾，不能追加轮次。`,
+      )
+      // E8: no current pointer — snapshot AFTER the deletion, compare while
+      // it is still missing (ENOENT), and restore only in finally.
+      {
+        const currentPath = join(workspace, '.agent-squad', 'current.json')
+        const bytes = await readFile(currentPath)
+        const before = await snapshot(task)
+        try {
+          await rm(currentPath)
+          const during = await snapshot(task)
+          assert.equal(during.current, 'ENOENT', 'pointer must be missing for the call')
+          await assert.rejects(extend({ ...good }), {
+            message: '还没有小队任务。先调用 squad_start。',
+          })
+          const after = await snapshot(task)
+          assert.equal(after.current, 'ENOENT', 'pointer must still be missing right after the call')
+          assert.deepEqual(after, during, 'rejection must not touch the missing-pointer state')
+        } finally {
+          await writeFile(currentPath, bytes)
+        }
+        assert.deepEqual(await snapshot(task), before, 'restore returns the pointer byte-for-byte')
+      }
+      // First-error-wins combos, each with zero side effects.
+      await noSide(
+        task,
+        () => extend({ kind: 'review', rounds: 0, reason: '', confirmed: false }, { agent: teammate, signal: undefined }),
+        'squad_extend 仅允许 Lead 调用。',
+      )
+      await noSide(
+        task,
+        () => extend({ kind: 'review', rounds: 0, reason: '', confirmed: false }),
+        'kind 必须是 design 或 implement。',
+      )
+      await noSide(
+        task,
+        () => extend({ kind: 'design', rounds: 0, reason: '', confirmed: false }),
+        'rounds 必须是正的安全整数。',
+      )
+      await noSide(
+        task,
+        () => extend({ kind: 'design', rounds: 1, reason: '', confirmed: false }),
+        'reason 必须是非空字符串。',
+      )
+      await noSide(
+        task,
+        () => extend({ kind: 'design', rounds: 1, reason: 'ok', confirmed: false, task_id: '' }),
+        '必须先获得用户明确同意，并传入 confirmed=true 才能追加轮次。',
+      )
+      // D1: non-ENOENT I/O errors propagate verbatim. STATE.json as a
+      // directory must surface the native EISDIR code/message, never
+      // "unknown task". Snapshot after the fixture is in place, compare
+      // BEFORE cleanup, and restore only in finally.
+      {
+        const statePath = join(workspace, '.agent-squad', task, 'STATE.json')
+        const bytes = await readFile(statePath)
+        const before = await snapshot(task)
+        try {
+          await rm(statePath)
+          await mkdir(statePath)
+          // Expected error captured with the native reader while the fixture
+          // is in place, so code AND full message are compared verbatim.
+          let native
+          try {
+            await readFile(statePath)
+            assert.fail('readFile on a directory must throw')
+          } catch (error) {
+            native = error
+          }
+          assert.equal(native.code, 'EISDIR')
+          const during = await snapshot(task)
+          let failure
+          try {
+            await extend({ ...good, task_id: task })
+            assert.fail('squad_extend must propagate the I/O error')
+          } catch (error) {
+            failure = error
+          }
+          assert.equal(failure.code, native.code, 'original code preserved')
+          assert.equal(failure.message, native.message, 'original message preserved')
+          assert.deepEqual(await snapshot(task), during, 'rejection leaves the fixture untouched')
+        } finally {
+          await rm(statePath, { recursive: true, force: true })
+          await writeFile(statePath, bytes)
+        }
+        assert.deepEqual(await snapshot(task), before, 'STATE.json restored byte-for-byte')
+      }
+      // D1: a directory squatting on the shared-root current pointer also
+      // propagates EISDIR. The root snapshot covers the directory's own
+      // contents, not just its existence.
+      {
+        const currentPath = join(workspace, '.agent-squad', 'current.json')
+        const bytes = await readFile(currentPath)
+        try {
+          await rm(currentPath)
+          await mkdir(currentPath)
+          await writeFile(join(currentPath, 'stray.txt'), 'not a pointer\n', 'utf8')
+          const expectStray = Buffer.from('not a pointer\n').toString('base64')
+          let native
+          try {
+            await readFile(currentPath)
+            assert.fail('readFile on a directory must throw')
+          } catch (error) {
+            native = error
+          }
+          assert.equal(native.code, 'EISDIR')
+          const during = await snapshotRoot()
+          assert.deepEqual(during.root['current.json'], { 'stray.txt': expectStray },
+            'snapshot must see inside the directory fixture')
+          let failure
+          try {
+            await extend({ ...good })
+            assert.fail('squad_extend must propagate the I/O error')
+          } catch (error) {
+            failure = error
+          }
+          assert.equal(failure.code, native.code, 'original code preserved')
+          assert.equal(failure.message, native.message, 'original message preserved')
+          assert.deepEqual(await snapshotRoot(), during, 'rejection leaves the fixture untouched')
+        } finally {
+          await rm(currentPath, { recursive: true, force: true })
+          await writeFile(currentPath, bytes)
+        }
+        const restored = await snapshotRoot()
+        assert.equal(typeof restored.root['current.json'], 'string', 'pointer file restored')
+      }
+    })
+
+    // --- T10/reject-budget (PLAN §32): E11/E12 on a not-yet-exhausted task ---
+    await labeled('reject-budget', async () => {
+      const task = await startTask('reject-budget')
+      await design('d1')
+      await design('d2')
+      await design('d3')
+      // design 3/4 is not exhausted → E11 with the exact used/limit.
+      await noSide(
+        task,
+        () => extend({ kind: 'design', reason: '用户同意', confirmed: true }),
+        `任务 ${task} 的 design 预算尚未到上限（已用 3/4），不能追加轮次。`,
+      )
+      await design('d4')
+      await tool('squad_approve_plan').execute({ task_id: task }, exec)
+      await dispatch({ agent: 'zcode', message: 'impl', phase: 'implement' })
+      await rework('rw1')
+      await rework('rw2')
+      // design 4/4 is exhausted; implement 2/3 is not → E11 for implement.
+      await noSide(
+        task,
+        () => extend({ kind: 'implement', reason: '用户同意', confirmed: true }),
+        `任务 ${task} 的 implement 预算尚未到上限（已用 2/3），不能追加轮次。`,
+      )
+      // Exhaust implement too (3/3), then E12 overflow for both kinds.
+      await rework('rw3')
+      await noSide(
+        task,
+        () => extend({ kind: 'design', rounds: 9007199254740991, reason: '用户同意', confirmed: true }),
+        '追加后的预算上限超出安全整数范围。',
+      )
+      await noSide(
+        task,
+        () => extend({ kind: 'implement', rounds: 9007199254740991, reason: '用户同意', confirmed: true }),
+        '追加后的预算上限超出安全整数范围。',
+      )
+      // Missing confirmation always refuses, even at the limit.
+      await noSide(
+        task,
+        () => extend({ kind: 'design', reason: '用户同意' }),
+        '必须先获得用户明确同意，并传入 confirmed=true 才能追加轮次。',
+      )
+      await noSide(
+        task,
+        () => extend({ kind: 'design', rounds: 9007199254740991, reason: '用户同意', confirmed: true }),
+        '追加后的预算上限超出安全整数范围。',
+      )
+      await noSide(
+        task,
+        () => extend({ kind: 'implement', rounds: 9007199254740991, reason: '用户同意', confirmed: true }),
+        '追加后的预算上限超出安全整数范围。',
+      )
+      // Missing confirmation always refuses, even at the limit.
+      await noSide(
+        task,
+        () => extend({ kind: 'design', reason: '用户同意' }),
+        '必须先获得用户明确同意，并传入 confirmed=true 才能追加轮次。',
+      )
+      // A boundary rounds=1 extension succeeds (4→5)…
+      const out = await extendOnly(task, { kind: 'design', rounds: 1, reason: '用户同意', confirmed: true })
+      assert.equal(
+        out,
+        `任务 ${task} 的 design 预算已扩展：上限 4 → 5，已用 4，剩余 1（追加 1 轮）。\n原因：用户同意`,
+      )
+      // …and an immediate repeat is E11 again (4/5), plus a missing-confirmed E6.
+      await noSide(
+        task,
+        () => extend({ kind: 'design', reason: '用户同意', confirmed: true }),
+        `任务 ${task} 的 design 预算尚未到上限（已用 4/5），不能追加轮次。`,
+      )
+      await noSide(
+        task,
+        () => extend({ kind: 'implement', reason: '用户同意' }),
+        '必须先获得用户明确同意，并传入 confirmed=true 才能追加轮次。',
+      )
+    })
+
+    // --- T10/design (PLAN §33): default +3 resumes an exhausted design budget -
+    let designTask
+    await labeled('design', async () => {
+      designTask = await startTask('design-budget')
+      const dir = join(workspace, '.agent-squad', designTask)
+      let state = await readState(designTask)
+      assert.deepEqual([state.designLimit, state.reworkLimit, state.extensions], [4, 3, []])
+      for (let n = 1; n <= 4; n += 1) {
+        const out = await design(`r${n}`)
+        assert.match(out, new RegExp(`planRounds=${n}/4`))
+        state = await readState(designTask)
+        assert.equal(state.planRounds, n)
+        assert.equal(state.round, 1)
+        assert.equal(state.reworkRounds, 0)
+        assert.ok(await stat(join(dir, `PLAN-R${n}.md`)))
+      }
+      // 5th dispatch: full decision-gate message, zero side effects.
+      await noSide(designTask, () => design('r5'), designPause(4, 4))
+      // Extend with a trimmed reason and omitted rounds (default +3).
+      const before = await readState(designTask)
+      const t0 = Date.now()
+      const out = await extendOnly(designTask, { kind: 'design', reason: ' 用户同意设计 ', confirmed: true })
+      const t1 = Date.now()
+      assert.equal(
+        out,
+        `任务 ${designTask} 的 design 预算已扩展：上限 4 → 7，已用 4，剩余 3（追加 3 轮）。\n原因：用户同意设计`,
+      )
+      state = await readState(designTask)
+      assert.equal(state.designLimit, 7)
+      assert.equal(state.reworkLimit, 3)
+      assert.equal(state.extensions.length, 1)
+      const record = state.extensions[0]
+      assert.equal(record.kind, 'design')
+      assert.equal(record.rounds, 3)
+      assert.equal(record.reason, '用户同意设计')
+      const at = Date.parse(record.at)
+      assert.ok(!Number.isNaN(at) && at >= t0 && at <= t1, `at must be a valid ISO time in range: ${record.at}`)
+      // Only §16 fields changed: everything else is deep-equal.
+      const { designLimit, extensions, ...rest } = state
+      const { designLimit: bLimit, extensions: bExt, ...restBefore } = before
+      assert.deepEqual(rest, restBefore)
+      assert.notEqual(bLimit, designLimit)
+      assert.deepEqual(bExt, [])
+      // Designs 5–7 succeed; the 5th receipt reads planRounds=5/7.
+      const fifth = await design('r5')
+      assert.match(fifth, /planRounds=5\/7/)
+      await design('r6')
+      await design('r7')
+      assert.equal((await readState(designTask)).planRounds, 7)
+      // 8th blocked at 7/7, then a boundary +1 resumes it.
+      await noSide(designTask, () => design('r8'), designPause(7, 7))
+      const bump = await extendOnly(designTask, { kind: 'design', rounds: 1, reason: '用户追加一轮', confirmed: true })
+      assert.equal(
+        bump,
+        `任务 ${designTask} 的 design 预算已扩展：上限 7 → 8，已用 7，剩余 1（追加 1 轮）。\n原因：用户追加一轮`,
+      )
+      const eighth = await design('r8')
+      assert.match(eighth, /planRounds=8\/8/)
+      assert.ok(await stat(join(dir, 'PLAN-R8.md')))
+      assert.equal((await readState(designTask)).designLimit, 8)
+    })
+
+    // --- T10/implement (PLAN §34): rework budget extends independently -------
+    await labeled('implement', async () => {
+      const task = designTask
+      const dir = join(workspace, '.agent-squad', task)
+      const approveOut = await tool('squad_approve_plan').execute({ task_id: task }, exec)
+      assert.match(approveOut, /已批准（第 8\/8 次设计）/)
+      assert.match(await readFile(join(dir, 'JOURNAL.md'), 'utf8'), /设计轮次 8\/8/)
+      const designBefore = await readState(task)
+      // A plain implement does not consume the rework budget.
+      await dispatch({ agent: 'zcode', message: 'impl', phase: 'implement' })
+      assert.equal((await readState(task)).reworkRounds, 0)
+      // Rework 1–3: same local child id, round reaches 4.
+      await rework('rw1')
+      const childId = host.activations.at(-1).childId
+      await rework('rw2')
+      await rework('rw3')
+      let state = await readState(task)
+      assert.equal(state.reworkRounds, 3)
+      assert.equal(state.round, 4)
+      for (const sent of host.sent.slice(-2)) assert.equal(sent.childId, childId)
+      // 4th rework: full decision-gate message, zero side effects.
+      await noSide(task, () => rework('rw4'), reworkPause(3, 3))
+      // Extend implement (default +3): design counters and approval untouched.
+      const out = await extendOnly(task, { kind: 'implement', reason: '用户同意返工', confirmed: true })
+      assert.equal(
+        out,
+        `任务 ${task} 的 implement 预算已扩展：上限 3 → 6，已用 3，剩余 3（追加 3 轮）。\n原因：用户同意返工`,
+      )
+      state = await readState(task)
+      assert.equal(state.reworkLimit, 6)
+      assert.equal(state.designLimit, 8)
+      assert.equal(state.planRounds, designBefore.planRounds)
+      assert.equal(state.planApproved, true)
+      assert.equal(state.planApprovedAt, designBefore.planApprovedAt)
+      // Rework 4–6: the 4th receipt reads rework=4/6 and its BRIEF rework=3/6.
+      const fourth = await rework('rw4')
+      assert.match(fourth, /rework=4\/6/)
+      const brief = await readFile(join(dir, 'BRIEF.md'), 'utf8')
+      assert.ok(brief.includes('rework=3/6'), 'BRIEF shows the pre-count against the new limit')
+      await rework('rw5')
+      await rework('rw6')
+      state = await readState(task)
+      assert.equal(state.reworkRounds, 6)
+      assert.equal(state.round, 7)
+      assert.equal(host.sent.at(-1).childId, childId)
+      // 7th blocked at 6/6, +1 resumes it, round reaches 8.
+      await noSide(task, () => rework('rw7'), reworkPause(6, 6))
+      await extendOnly(task, { kind: 'implement', rounds: 1, reason: '用户追加返工', confirmed: true })
+      await rework('rw7')
+      state = await readState(task)
+      assert.equal(state.round, 8)
+      assert.equal(state.reworkRounds, 7)
+      assert.equal(state.planRounds, 8)
+      assert.equal(state.reworkLimit, 7)
+      // Approval still forbids design even though design budget was extended.
+      await noSide(
+        task,
+        () => design('late'),
+        `任务 ${task} 的 PLAN 已批准（${state.planApprovedAt}）：不能再派 design 返工，请进入 implement。`,
+      )
+    })
+
+    // --- T10/records (PLAN §35): history, status output, cross-task task_id --
+    await labeled('records', async () => {
+      const task = designTask
+      const state = await readState(task)
+      const rows = state.extensions.map((row) => [row.kind, row.rounds, row.reason])
+      assert.deepEqual(rows, [
+        ['design', 3, '用户同意设计'],
+        ['design', 1, '用户追加一轮'],
+        ['implement', 3, '用户同意返工'],
+        ['implement', 1, '用户追加返工'],
+      ])
+      for (const row of state.extensions) assert.ok(!Number.isNaN(Date.parse(row.at)))
+      const statusOut = await tool('squad_status').execute({}, exec)
+      assert.ok(statusOut.includes(budgetLine(8, 8, 7, 7)), statusOut)
+      assert.ok(statusOut.includes('最近扩展（最多 6 条）：'))
+      for (const row of state.extensions) {
+        assert.ok(
+          statusOut.includes(`- ${row.at} kind=${row.kind} rounds=${row.rounds} reason=${row.reason}`),
+        )
+      }
+      // A second task becomes current; an explicit task_id still extends the
+      // exhausted task A and touches nothing else.
+      const taskB = await startTask('records-b')
+      const stateBPath = join(workspace, '.agent-squad', taskB, 'STATE.json')
+      const stateBBefore = await readFile(stateBPath, 'utf8')
+      const currentPath = join(workspace, '.agent-squad', 'current.json')
+      const currentBefore = await readFile(currentPath, 'utf8')
+      const cwdSets = host.cwdCalls.filter((call) => call.op === 'set').length
+      const out = await extendOnly(task, {
+        kind: 'design',
+        rounds: 1,
+        reason: '用户同意',
+        confirmed: true,
+        task_id: task,
+      })
+      assert.equal(
+        out,
+        `任务 ${task} 的 design 预算已扩展：上限 8 → 9，已用 8，剩余 1（追加 1 轮）。\n原因：用户同意`,
+      )
+      assert.equal((await readState(task)).designLimit, 9)
+      assert.equal((await readState(task)).reworkLimit, 7)
+      assert.equal(await readFile(stateBPath, 'utf8'), stateBBefore)
+      assert.equal(await readFile(currentPath, 'utf8'), currentBefore)
+      assert.equal(host.cwdCalls.filter((call) => call.op === 'set').length, cwdSets)
+    })
+
+    // --- T10/legacy-status (PLAN §36): legacy STATE falls back to 4/3/[] -----
+    await labeled('legacy-status', async () => {
+      const task = await startTask('legacy-budget')
+      const statePath = join(workspace, '.agent-squad', task, 'STATE.json')
+      const strip = async (mutate) => {
+        const state = JSON.parse(await readFile(statePath, 'utf8'))
+        delete state.designLimit
+        delete state.reworkLimit
+        delete state.extensions
+        state.planRounds = 4
+        state.reworkRounds = 3
+        state.planApproved = false
+        mutate?.(state)
+        await writeState(task, state)
+        return readFile(statePath, 'utf8')
+      }
+      let bytes = await strip()
+      const expectLine = budgetLine(4, 4, 3, 3)
+      let statusOut = await tool('squad_status').execute({}, exec)
+      assert.ok(statusOut.includes(expectLine), statusOut)
+      assert.ok(statusOut.includes('最近扩展：无'))
+      assert.equal(await readFile(statePath, 'utf8'), bytes)
+      // Null limits read the same way; status never migrates the file.
+      bytes = await strip((state) => {
+        state.designLimit = null
+        state.reworkLimit = null
+        state.extensions = null
+      })
+      statusOut = await tool('squad_status').execute({}, exec)
+      assert.ok(statusOut.includes(expectLine))
+      assert.ok(statusOut.includes('最近扩展：无'))
+      assert.equal(await readFile(statePath, 'utf8'), bytes)
+      // §36: restore the deleted-fields state before the dispatch/extension
+      // steps below (they must run against a legacy STATE, not null fields).
+      bytes = await strip()
+      // Both dispatch kinds are paused at the legacy limits.
+      await noSide(task, () => design('over'), designPause(4, 4))
+      await noSide(task, () => rework('over'), reworkPause(3, 3))
+      // Extend both budgets by 1: 5/4 persisted, two records, counters 4/3.
+      await extendOnly(task, { kind: 'design', rounds: 1, reason: '用户同意设计', confirmed: true })
+      await extendOnly(task, { kind: 'implement', rounds: 1, reason: '用户同意返工', confirmed: true })
+      let state = await readState(task)
+      assert.equal(state.designLimit, 5)
+      assert.equal(state.reworkLimit, 4)
+      assert.deepEqual(
+        state.extensions.map((row) => [row.kind, row.rounds, row.reason]),
+        [
+          ['design', 1, '用户同意设计'],
+          ['implement', 1, '用户同意返工'],
+        ],
+      )
+      assert.equal(state.planRounds, 4)
+      assert.equal(state.reworkRounds, 3)
+      // Both kinds can continue: design (4/5) now, rework (3/4) after approval.
+      await design('d5')
+      assert.equal((await readState(task)).planRounds, 5)
+      await tool('squad_approve_plan').execute({ task_id: task }, exec)
+      await rework('rw4')
+      state = await readState(task)
+      assert.equal(state.reworkRounds, 4)
+      assert.equal(state.round, 2)
+    })
+
+    // --- T10/status-tail (PLAN §37): over-budget STATE, last-6 extension view -
+    await labeled('status-tail', async () => {
+      const task = await startTask('status-tail')
+      const statePath = join(workspace, '.agent-squad', task, 'STATE.json')
+      const state = JSON.parse(await readFile(statePath, 'utf8'))
+      state.phase = 'design'
+      state.planApproved = false
+      state.designLimit = 8
+      state.planRounds = 9
+      state.reworkLimit = 7
+      state.reworkRounds = 8
+      state.extensions = Array.from({ length: 7 }, (_, i) => ({
+        at: `2026-11-12T00:00:0${i + 1}.000Z`,
+        kind: 'design',
+        rounds: 1,
+        reason: `r${i + 1}`,
+      }))
+      await writeState(task, state)
+      const bytes = await readFile(statePath, 'utf8')
+      const statusOut = await tool('squad_status').execute({}, exec)
+      assert.ok(statusOut.includes(budgetLine(8, 9, 7, 8)), statusOut)
+      assert.ok(statusOut.includes('最近扩展（最多 6 条）：'))
+      assert.ok(!statusOut.includes('reason=r1\n') && !statusOut.endsWith('reason=r1'))
+      assert.ok(!statusOut.includes('- 2026-11-12T00:00:01.000Z'))
+      for (let i = 2; i <= 7; i += 1) {
+        const line = `- 2026-11-12T00:00:0${i}.000Z kind=design rounds=1 reason=r${i}`
+        assert.ok(statusOut.includes(line), `missing tail record line: ${line}`)
+      }
+      const first = statusOut.indexOf('reason=r2')
+      const last = statusOut.indexOf('reason=r7')
+      assert.ok(first !== -1 && last !== -1 && first < last)
+      assert.equal(await readFile(statePath, 'utf8'), bytes)
+      // Over-budget STATE still allows design extension (9>=8), remaining 0.
+      const out = await extendOnly(task, { kind: 'design', rounds: 1, reason: '用户同意', confirmed: true })
+      assert.equal(
+        out,
+        `任务 ${task} 的 design 预算已扩展：上限 8 → 9，已用 9，剩余 0（追加 1 轮）。\n原因：用户同意`,
+      )
+      // used == limit keeps design paused even after the extension.
+      await noSide(task, () => design('still'), designPause(9, 9))
+    })
+  } finally {
+    delete process.env.DSH_HOME
+    await rm(workspace, { recursive: true, force: true })
     await rm(dshHome, { recursive: true, force: true })
   }
 })
