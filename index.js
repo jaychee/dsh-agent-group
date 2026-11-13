@@ -241,19 +241,29 @@ function isRowRunning(rows, childId) {
 
 /** Enrich tree rows into member-like rows for display (name/role/status). */
 function memberRowsOf(rows, runtime, config) {
-  return rows.map((row) => {
-    const name = row.name ?? row.label ?? String(row.id)
-    const binding = runtime.bindingOf(row.id)
-    const configured =
-      binding ?? configuredAgents(config).find((agent) => agent.name === name)
-    return {
-      id: row.id,
-      name,
-      role: configured?.role ?? 'teammate',
-      description: configured?.description,
-      status: row.activity === 'running' ? 'running' : 'inactive',
-    }
-  })
+  // Display filter: keep rows this squad owns — anything running, rows with a
+  // dispatch binding, and rows named after a roster agent. Cold children from
+  // earlier plugin generations (label-only rows like `t-x/implement/zcode`)
+  // stay hidden from the member list; finish/wait gates read the raw rows.
+  const roster = configuredAgents(config)
+  return rows
+    .filter((row) => {
+      if (row.activity === 'running') return true
+      if (runtime.bindingOf(row.id) !== undefined) return true
+      return row.name !== undefined && roster.some((agent) => agent.name === row.name)
+    })
+    .map((row) => {
+      const name = row.name ?? row.label ?? String(row.id)
+      const binding = runtime.bindingOf(row.id)
+      const configured = binding ?? roster.find((agent) => agent.name === name)
+      return {
+        id: row.id,
+        name,
+        role: configured?.role ?? 'teammate',
+        description: configured?.description,
+        status: row.activity === 'running' ? 'running' : 'inactive',
+      }
+    })
 }
 
 /** Resolve the workspace directory visible to one session. */
@@ -1469,7 +1479,14 @@ function createTools(ctx, config, runtime, store) {
       const budget = budgetOf(state)
       const extensions = Array.isArray(state.extensions) ? state.extensions : []
       const treeRows = await treeRowsOf(ctx, lead)
-      const memberRows = memberRowsOf(treeRows, runtime, config)
+      const childIds = new Set(
+        Object.values(state.children ?? {}).map((child) => child.id),
+      )
+      const memberRows = memberRowsOf(
+        treeRows.filter((row) => !childIds.has(row.id)),
+        runtime,
+        config,
+      )
       const repoRows = worktreesOf(state)
       const workspaceBlock =
         repoRows.length > 1

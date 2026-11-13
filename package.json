@@ -1,6 +1,6 @@
 {
   "name": "dsh-agent-squad",
-  "version": "0.9.0",
+  "version": "0.9.1",
   "private": true,
   "description": "Role-based local agent team for DeepSeek Harness: a Lead delegates design, implementation and acceptance to named teammates and reuses each teammate's conversation across rework rounds.",
   "type": "module",
