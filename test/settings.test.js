@@ -313,6 +313,7 @@ function mockHost(workspace, dshHome, hooks = {}, options = {}) {
       disposers.push(dispose)
       return dispose
     },
+    inject: (_deps, callback) => callback(ctx),
   }
   return {
     ctx, registered, activations, sent, spawned, sections, members, agentsById, makeAgent,

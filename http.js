@@ -394,16 +394,31 @@ export async function collectModels(models) {
     }),
   )
   let externalProviders = []
-  if (subagents && typeof subagents.list === 'function') {
-    try {
-      externalProviders = subagents
-        .list()
-        .filter((name) => name !== 'spawn' && name !== 'fork')
+  if (subagents) {
+    if (typeof subagents.list === 'function') {
+      try {
+        externalProviders = subagents
+          .list()
+          .filter((name) => name !== 'spawn' && name !== 'fork')
+          .map((name) => ({ id: name, label: name }))
+      } catch (cause) {
+        const error = new Error(`subagent directory is not available: ${cause.message}`)
+        error.code = 'CATALOG_UNAVAILABLE'
+        throw error
+      }
+    } else if (typeof subagents.getProvider === 'function') {
+      // DSH 0.2.x removed the provider listing. Probe the providers this
+      // plugin ships or documents instead of failing the whole catalog.
+      const known = ['codex', 'qoder-cli', 'zcode-cli']
+      externalProviders = known
+        .filter((name) => {
+          try {
+            return subagents.getProvider(name) !== undefined
+          } catch {
+            return false
+          }
+        })
         .map((name) => ({ id: name, label: name }))
-    } catch (cause) {
-      const error = new Error(`subagent directory is not available: ${cause.message}`)
-      error.code = 'CATALOG_UNAVAILABLE'
-      throw error
     }
   }
   return { groups, externalProviders }
@@ -430,10 +445,16 @@ async function validateDynamic(agents, worktree, models) {
           fields: { [field]: 'MODEL_NOT_FOUND' },
         })
       }
-    } else if (!catalog.externalProviders.some((entry) => entry.id === agent.model)) {
-      throw new SettingsError('VALIDATION_FAILED', `external provider "${agent.model}" is not registered`, {
-        fields: { [field]: 'PROVIDER_NOT_REGISTERED' },
-      })
+    } else {
+      const registered =
+        typeof models?.subagents?.getProvider === 'function'
+          ? models.subagents.getProvider(agent.model) !== undefined
+          : catalog.externalProviders.some((entry) => entry.id === agent.model)
+      if (!registered) {
+        throw new SettingsError('VALIDATION_FAILED', `external provider "${agent.model}" is not registered`, {
+          fields: { [field]: 'PROVIDER_NOT_REGISTERED' },
+        })
+      }
     }
   }
 }

@@ -2056,13 +2056,17 @@ export function apply(ctx, input) {
     seed: seedFromBundle(config.agents, config.worktreeDir),
     logger: { warn: (text) => ctx.logger?.('agent-squad')?.warn?.(text) },
   })
-  // Settings page routes: registered only while a host web server is mounted.
-  const disposeRoutes = registerRoutes({
-    ctx,
-    store,
-    models: { llm: ctx.get('llm'), subagents: ctx.get('subagents') },
+  // Settings page routes: register when the host web server is available.
+  // `ctx.get()` at apply time can be undefined during startup in newer DSH
+  // releases, so use a reactive injection instead of a one-shot check.
+  ctx.inject(['webServer'], (webCtx) => {
+    const disposeRoutes = registerRoutes({
+      ctx: webCtx,
+      store,
+      models: { llm: webCtx.get('llm'), subagents: webCtx.get('subagents') },
+    })
+    if (disposeRoutes) webCtx.effect(() => disposeRoutes, 'agent-squad: settings routes')
   })
-  if (disposeRoutes) ctx.effect(() => disposeRoutes, 'agent-squad: settings routes')
   /** Per-agent prompt-section disposers, owned by this plugin's context effect. */
   const installed = new Map()
   /**
