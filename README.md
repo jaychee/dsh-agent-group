@@ -9,7 +9,7 @@
             └─ qoder  [worker]  并行或前端实现
 ```
 
-插件本身很薄：它挂在 DSH 内置的实验性 **Agent Teams** 运行时（`ctx.agentTeams`）上，补上 DSH 缺的三件事：
+插件本身很薄：它挂在 DSH 0.2.x 内置的标准 **subagent 运行时**（`ctx.subagents`：`startActivation`/`sendMessage`/`listDescendants`/`rootOf`）上，补上 DSH 缺的三件事：
 
 1. **命名 + 角色**：三个固定 teammate（codex / zcode / qoder），角色决定系统提示里的职责章程与可见工具；
 2. **共享记忆**：每个任务一个 `.agent-squad/<task>/` 目录，TASK / PLAN / PLAN-APPROVED / REVIEW / REPORT / JOURNAL 承载任务、设计草稿、批准规格、验收、交付证据与历史，所有成员读写同一份；
@@ -299,7 +299,7 @@ token：GLM implement 26,295 / rework 26,459（cache 主导）；Codex 设计 + 
 
 ## 会话复用（token 关键）
 
-- 队友第一次派单时由 `ctx.agentTeams.spawnTeammate` 创建，之后 `squad_dispatch` 走 `sendMessage`：消息进入同一个子会话，冷启动时按需 resume。
+- 队友第一次派单时通过 `subagents.startActivation({provider:'spawn', childId, name})` 创建为命名可续跑子代理，之后 `squad_dispatch` 走 `subagents.sendMessage`：消息进入同一个子会话，冷启动时按需 resume。
 - `squad_dispatch` 返回 `mode=spawned|resumed` 和 `session_id`，可以直接核对返工是否落在同一会话。
 - 同一个姓名在 Team 内永久唯一，所以不要为返工新建 agent——再派一次即可。
 
@@ -326,7 +326,7 @@ plugin_manager install_bundle  <本目录绝对路径>
 plugin_manager remove_bundle   dsh-agent-squad
 ```
 
-本插件的 patch 会顺带挂载 `@deepseek-ai/dsh-experimental-agent-team`（DSH 自带包）。如果之后又启用了官方 `dsh-experimental-agent-team-profile`，两者会重复注册同一个服务，二选一保留。
+DSH 0.2.x 已把 Agent Teams 并入标准 subagent 运行时，本插件的 patch 不再挂载已移除的 `@deepseek-ai/dsh-experimental-agent-team`；改为挂载 `@deepseek-ai/dsh-subagent-codex` 提供 codex 外部执行者。
 
 ## 升级与重载
 

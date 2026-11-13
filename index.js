@@ -1,8 +1,10 @@
 /**
  * Agent Squad — role-based local agent team for DeepSeek Harness.
  *
- * The squad is a thin, opinionated role layer over the shipped experimental
- * Agent Teams runtime (`ctx.agentTeams`):
+ * The squad is a thin, opinionated role layer over the standard subagent
+ * runtime (`ctx.subagents`): every teammate is a named continuable child of
+ * the Lead's subagent tree, and team membership is resolved through
+ * `rootOf`/`namesOf`/`listDescendants` (DSH 0.2.x Agent-Teams API).
  *
  *   lead   — the DSH session itself; orchestrates and assigns work.
  *   brain  — designs the plan and acceptance bar, then reviews the result.
@@ -35,8 +37,8 @@ const runFile = promisify(execFile)
 /** Cordis plugin name. */
 export const name = 'agent-squad'
 
-/** Services this plugin builds on. Activation waits for the Team runtime. */
-export const inject = ['agentTeams', 'agents', 'tools', 'systemPrompt']
+/** Services this plugin builds on. Activation waits for the subagent runtime. */
+export const inject = ['subagents', 'agents', 'tools', 'systemPrompt']
 
 /** Order of the squad prompt sections relative to first-party guidance. */
 const SECTION_ORDER = 610
@@ -212,6 +214,46 @@ function settingsRoster(settings, config) {
 function callingAgent(exec, toolName) {
   if (!exec.agent) throw new Error(`${toolName} requires a calling agent`)
   return exec.agent
+}
+
+/**
+ * Live child rows of the Lead's subagent tree (replaces the removed
+ * `agentTeams.listMembers`). Rows are `kind: 'child'` catalog entries with an
+ * `activity` of 'running' | 'inactive'; a child absent from the catalog is
+ * cold. Failures degrade to an empty list rather than failing the tool.
+ */
+async function treeRowsOf(ctx, lead, signal) {
+  const subagents = ctx.get('subagents')
+  if (!subagents || typeof subagents.listDescendants !== 'function') return []
+  try {
+    const rows = await subagents.listDescendants(lead.id, signal)
+    return rows.filter((row) => row.kind === 'child')
+  } catch {
+    return []
+  }
+}
+
+/** Running check for one child id against fetched tree rows. */
+function isRowRunning(rows, childId) {
+  const row = rows.find((entry) => entry.id === childId)
+  return row !== undefined && row.activity === 'running'
+}
+
+/** Enrich tree rows into member-like rows for display (name/role/status). */
+function memberRowsOf(rows, runtime, config) {
+  return rows.map((row) => {
+    const name = row.name ?? row.label ?? String(row.id)
+    const binding = runtime.bindingOf(row.id)
+    const configured =
+      binding ?? configuredAgents(config).find((agent) => agent.name === name)
+    return {
+      id: row.id,
+      name,
+      role: configured?.role ?? 'teammate',
+      description: configured?.description,
+      status: row.activity === 'running' ? 'running' : 'inactive',
+    }
+  })
 }
 
 /** Resolve the workspace directory visible to one session. */
@@ -617,10 +659,10 @@ function createTools(ctx, config, runtime, store) {
           ? await readJson(join(memory, pointer.taskId, 'STATE.json'))
           : undefined
         if (previous && previous.phase !== 'done') {
-          const active = Object.entries(previous.children ?? {}).filter(([, child]) => {
-            const live = ctx.agents.get(child.id)
-            return live?.status === 'running' || live?.status === 'provisioning'
-          })
+          const treeRows = await treeRowsOf(ctx, lead)
+          const active = Object.entries(previous.children ?? {}).filter(
+            ([, child]) => child.status === 'provisioning' || isRowRunning(treeRows, child.id),
+          )
           if (active.length > 0) {
             throw new Error(
               `当前任务 ${pointer.taskId} 仍有运行中的本地子代理：${active.map(([name]) => name).join(', ')}。先收尾或等它们完成，再开新任务。`,
@@ -993,8 +1035,10 @@ function createTools(ctx, config, runtime, store) {
       if (!state) throw new Error(`未知小队任务 "${taskId}"。先调用 squad_start。`)
 
       const phase = args.phase ?? 'design'
-      const members = ctx.agentTeams.listMembers(lead)
-      const existing = members.find((member) => member.name === target.name)
+      const treeRows = await treeRowsOf(ctx, lead, exec.signal)
+      const existing = treeRows.find(
+        (row) => (row.name ?? row.label ?? String(row.id)) === target.name,
+      )
       const priorRework = Number(state.reworkRounds ?? 0)
       const budget = budgetOf(state)
       if (phase === 'rework' && priorRework >= budget.reworkLimit) {
@@ -1044,15 +1088,10 @@ function createTools(ctx, config, runtime, store) {
       // regardless of executor or model changes. Checked BEFORE any shared
       // file (BRIEF) or state mutation so a refusal leaves them untouched.
       const recordedChild = state.children?.[target.name]
-      const childLive = recordedChild ? ctx.agents.get(recordedChild.id) : undefined
       const childBusy =
         recordedChild !== undefined &&
-        (recordedChild.status === 'provisioning' ||
-          childLive?.status === 'running' ||
-          childLive?.status === 'provisioning')
-      const memberBusy =
-        existing !== undefined &&
-        (existing.status === 'running' || existing.status === 'provisioning')
+        (recordedChild.status === 'provisioning' || isRowRunning(treeRows, recordedChild.id))
+      const memberBusy = existing !== undefined && existing.activity === 'running'
       if (childBusy || memberBusy) {
         const where = childBusy ? `本地子代理 ${recordedChild.id}` : `队友 ${existing.id}`
         throw new Error(
@@ -1067,12 +1106,7 @@ function createTools(ctx, config, runtime, store) {
           const other = await readJson(join(directory, name, 'STATE.json'))
           const otherChild = other?.children?.[target.name]
           if (!otherChild) continue
-          const live = ctx.agents.get(otherChild.id)
-          if (
-            otherChild.status === 'provisioning' ||
-            live?.status === 'running' ||
-            live?.status === 'provisioning'
-          ) {
+          if (otherChild.status === 'provisioning' || isRowRunning(treeRows, otherChild.id)) {
             throw new Error(
               `目标 ${target.name} 在任务 ${name} 中仍有运行中的本地子代理（${otherChild.id}）。等它完成后再派单。`,
             )
@@ -1144,13 +1178,12 @@ function createTools(ctx, config, runtime, store) {
             const activation = await subagents.startActivation({
               provider: 'spawn',
               childId,
+              name: target.name,
               label: `${taskId}/${phase}/${target.name}`,
-              request: {
-                prompt: [{ type: 'text', text: prompt }],
-                parent: lead,
-                agentOptions: { provider: pinned.provider, model: pinned.model },
-                ...(hasWorkspace ? { cwd: workspace } : {}),
-              },
+              prompt: [{ type: 'text', text: prompt }],
+              parent: lead,
+              agentOptions: { provider: pinned.provider, model: pinned.model },
+              ...(hasWorkspace ? { cwd: workspace } : {}),
               signal: exec.signal,
               delivery: 'parent',
             })
@@ -1198,11 +1231,9 @@ function createTools(ctx, config, runtime, store) {
         const activation = await subagents.startActivation({
           provider: target.model,
           label: `${taskId}/${phase}/${target.name}`,
-          request: {
-            prompt: [{ type: 'text', text: prompt }],
-            parent: lead,
-            ...(hasWorkspace ? { cwd: workspace } : {}),
-          },
+          prompt: [{ type: 'text', text: prompt }],
+          parent: lead,
+          ...(hasWorkspace ? { cwd: workspace } : {}),
           signal: exec.signal,
           delivery: 'caller',
         })
@@ -1241,48 +1272,54 @@ function createTools(ctx, config, runtime, store) {
         ).catch(() => {})
         state.tokens = (state.tokens ?? 0) + (tokens ?? 0)
       } else if (!existing) {
-        const context = target.context === 'fork' ? 'fork' : 'fresh'
-        const provider = context === 'fork' ? 'fork' : 'spawn'
-        // Publish this round's snapshot before spawning so an agent/created
+        // Team executor: a named continuable child on the Lead's subagent
+        // tree (the 0.2.x replacement for agentTeams.spawnTeammate).
+        const subagents = ctx.get('subagents')
+        if (!subagents) {
+          throw new Error('team 执行者需要宿主 subagents 服务，但当前不可用。')
+        }
+        const provider = target.context === 'fork' ? 'fork' : 'spawn'
+        const childId = randomUUID()
+        // Publish this round's snapshots before spawning so an agent/created
         // fired mid-spawn already installs the dispatched identity (R08).
         runtime.setPending(target.name, target)
-        let spawned
+        let activation
         try {
-          spawned = await ctx.agentTeams.spawnTeammate(lead, {
-            name: target.name,
-            description: target.description || `${target.role} teammate`,
-            prompt: [{ type: 'text', text: message }],
-            context,
+          activation = await subagents.startActivation({
             provider,
+            childId,
+            name: target.name,
+            label: `${taskId}/${phase}/${target.name}`,
+            prompt: [{ type: 'text', text: message }],
+            parent: lead,
+            ...(hasWorkspace ? { cwd: workspace } : {}),
             signal: exec.signal,
+            delivery: 'parent',
           })
         } finally {
           runtime.clearPending(target.name)
         }
         mode = 'spawned'
-        sessionId = spawned.member.id
+        sessionId = activation.childId
         await moveTeammate(sessionId)
         // Team members carry the dispatch-time settings snapshot, exactly like
         // local children, so later edits cannot restyle their identity (R08).
         runtime.rebind(sessionId, target)
-      } else if (existing.status === 'failed') {
-        throw new Error(
-          `队友 "${target.name}" 创建失败，该名字已被永久占用。换一个配置名，或开新会话。`,
-        )
-      } else if (existing.status === 'provisioning') {
-        throw new Error(
-          `队友 "${target.name}" 仍在创建中。先调用 squad_wait，再重试派单。`,
-        )
       } else {
+        const subagents = ctx.get('subagents')
+        if (!subagents) {
+          throw new Error('team 执行者需要宿主 subagents 服务，但当前不可用。')
+        }
         await moveTeammate(existing.id)
         // Idle resume: refresh the binding and identity section to this
         // round's snapshot before the message is delivered (R08).
         runtime.rebind(existing.id, target)
-        await ctx.agentTeams.sendMessage(lead, {
-          target: existing.name,
-          content: [{ type: 'text', text: message }],
-          signal: exec.signal,
-        })
+        await subagents.sendMessage(
+          lead,
+          existing.id,
+          [{ type: 'text', text: message }],
+          { signal: exec.signal },
+        )
         mode = 'resumed'
         sessionId = existing.id
       }
@@ -1431,7 +1468,8 @@ function createTools(ctx, config, runtime, store) {
       const plan = planGateOf(state)
       const budget = budgetOf(state)
       const extensions = Array.isArray(state.extensions) ? state.extensions : []
-      const members = ctx.agentTeams.listMembers(lead)
+      const treeRows = await treeRowsOf(ctx, lead)
+      const memberRows = memberRowsOf(treeRows, runtime, config)
       const repoRows = worktreesOf(state)
       const workspaceBlock =
         repoRows.length > 1
@@ -1464,14 +1502,20 @@ function createTools(ctx, config, runtime, store) {
         ...workspaceBlock,
         `共享记忆：${taskDir}`,
         '成员：',
-        formatMembers(members),
+        formatMembers(memberRows),
         '本地子代理：',
         state.children
           ? Object.entries(state.children)
               .map(([name, child]) => {
-                const live = ctx.agents.get(child.id)
+                const row = treeRows.find((entry) => entry.id === child.id)
                 const status =
-                  live === undefined ? 'cold' : live.status === 'running' ? 'running' : 'inactive'
+                  child.status === 'provisioning'
+                    ? 'provisioning'
+                    : row === undefined
+                      ? 'cold'
+                      : row.activity === 'running'
+                        ? 'running'
+                        : 'inactive'
                 return `- ${name} → ${child.id} (${child.model}) ${status}`
               })
               .join('\n')
@@ -1517,17 +1561,26 @@ function createTools(ctx, config, runtime, store) {
       const lead = callingAgent(exec, 'squad_wait')
       const requested = Number(args.timeout_ms ?? 30000)
       const timeout = Math.min(600000, Math.max(10000, Number.isFinite(requested) ? requested : 30000))
-      const before = ctx.agentTeams.listMembers(lead)
-      const active = before.some(
-        (member) =>
-          member.id !== lead.id && (member.status === 'running' || member.status === 'provisioning'),
-      )
-      if (!active) {
-        return `没有队友在运行或创建中，等待不会产生进展。用 squad_status 复查，然后派下一个任务。\n${formatMembers(before)}`
+      // 0.2.x removed agentTeams.waitForChange; poll the subagent tree until
+      // no child is running or the timeout expires (2s interval).
+      const runningNow = async () =>
+        (await treeRowsOf(ctx, lead, exec.signal)).some((row) => row.activity === 'running')
+      const beforeRows = memberRowsOf(await treeRowsOf(ctx, lead, exec.signal), runtime, config)
+      if (!(await runningNow())) {
+        return `没有队友在运行或创建中，等待不会产生进展。用 squad_status 复查，然后派下一个任务。\n${formatMembers(beforeRows)}`
       }
-      const result = await ctx.agentTeams.waitForChange(lead, timeout, exec.signal)
-      const after = ctx.agentTeams.listMembers(lead)
-      return [`等待${result.timedOut ? '超时' : '观察到变化'}。`, formatMembers(after)].join('\n')
+      const deadline = Date.now() + timeout
+      let stillRunning = true
+      while (Date.now() < deadline) {
+        if (exec.signal?.aborted) break
+        await delay(Math.min(2000, Math.max(1, deadline - Date.now())), undefined, {
+          signal: exec.signal,
+        }).catch(() => {})
+        stillRunning = await runningNow()
+        if (!stillRunning) break
+      }
+      const afterRows = memberRowsOf(await treeRowsOf(ctx, lead, exec.signal), runtime, config)
+      return [`等待${stillRunning ? '超时' : '观察到变化'}。`, formatMembers(afterRows)].join('\n')
     },
   })
 
@@ -1563,13 +1616,24 @@ function createTools(ctx, config, runtime, store) {
     },
     async execute(args, exec) {
       const me = callingAgent(exec, 'squad_report')
-      const membership = ctx.agentTeams.tryMembership(me)
-      if (!membership) {
-        throw new Error('squad_report 只能在 Agent Squad 队友会话里使用')
-      }
-      if (membership.role === 'lead') {
+      const subagents = ctx.get('subagents')
+      let rootId
+      try {
+        rootId = subagents?.rootOf(me)?.id
+      } catch {}
+      const binding = runtime.bindingOf(me.id)
+      if (rootId === me.id) {
         throw new Error('squad_report 是队友工具；Lead 用 squad_status 查看状态')
       }
+      if (!rootId && !binding && !me.__membership) {
+        throw new Error('squad_report 只能在 Agent Squad 队友会话里使用')
+      }
+      let selfName
+      try {
+        selfName = subagents?.namesOf?.(me)?.self
+      } catch {}
+      const name = binding?.name ?? selfName ?? me.__membership?.name ?? String(me.id)
+      const root = rootId ?? 'lead'
       const directory = await memoryDirectory(ctx, me, config)
       const current = await readJson(join(directory, 'current.json'))
       const taskId = current?.taskId ? String(current.taskId) : 'unknown'
@@ -1577,25 +1641,26 @@ function createTools(ctx, config, runtime, store) {
       // for agents bound before snapshots existed (R08).
       const configured =
         runtime.bindingOf(me.id) ??
-        settingsRoster(await store.read(), config).find((agent) => agent.name === membership.name)
+        settingsRoster(await store.read(), config).find((agent) => agent.name === name)
       const role = configured?.role ?? 'worker'
       if (current?.taskId) {
         const journal = join(directory, String(current.taskId), 'JOURNAL.md')
         await appendFile(
           journal,
-          `- ${new Date().toISOString()} ${membership.name} (${role}) report=${args.status} — ${firstLine(args.summary)}\n`,
+          `- ${new Date().toISOString()} ${name} (${role}) report=${args.status} — ${firstLine(args.summary)}\n`,
           'utf8',
         ).catch(() => {})
       }
       const files = Array.isArray(args.files) && args.files.length > 0 ? args.files.join(', ') : '—'
-      const text = `[squad-report] task=${taskId} agent=${membership.name} role=${role} status=${args.status}
+      const text = `[squad-report] task=${taskId} agent=${name} role=${role} status=${args.status}
 总结：
 ${String(args.summary).trim()}
 文件：${files}
 下一步：${String(args.next ?? '—').trim()}`
-      await ctx.agentTeams.sendMessage(me, {
-        target: 'lead',
-        content: [{ type: 'text', text }],
+      if (!subagents || (!rootId && !me.__membership)) {
+        throw new Error('squad_report 需要 subagents 服务把报告发给 Lead。')
+      }
+      await subagents.sendMessage(me, root, [{ type: 'text', text }], {
         signal: exec.signal,
       })
       return `已把报告发给 lead（task=${taskId} status=${args.status}）。`
@@ -1629,21 +1694,17 @@ ${String(args.summary).trim()}
       if (!state) throw new Error(`未知小队任务 "${taskId}"。`)
       if (state.phase === 'done') throw new Error(`任务 ${taskId} 已经收尾。`)
 
-      const members = ctx.agentTeams.listMembers(lead)
-      const active = members.filter(
-        (member) =>
-          member.id !== lead.id &&
-          (member.status === 'running' || member.status === 'provisioning'),
-      )
+      const treeRows = await treeRowsOf(ctx, lead, exec.signal)
+      const active = treeRows.filter((row) => row.activity === 'running')
       if (active.length > 0) {
-        throw new Error(
-          `仍有队友在运行：${active.map((member) => member.name).join(', ')}。等报告后再收尾。`,
+        const names = active.map(
+          (row) => row.name ?? row.label ?? String(row.id),
         )
+        throw new Error(`仍有队友在运行：${names.join(', ')}。等报告后再收尾。`)
       }
-      const runningChildren = Object.entries(state.children ?? {}).filter(([, child]) => {
-        const live = ctx.agents.get(child.id)
-        return child.status === 'provisioning' || live?.status === 'running'
-      })
+      const runningChildren = Object.entries(state.children ?? {}).filter(
+        ([, child]) => child.status === 'provisioning' || isRowRunning(treeRows, child.id),
+      )
       if (runningChildren.length > 0) {
         throw new Error(
           `仍有本地子代理在运行：${runningChildren.map(([name]) => name).join(', ')}。等完成通知后再收尾。`,
@@ -1962,13 +2023,11 @@ ${String(args.summary).trim()}
     },
     async execute(args, exec) {
       const lead = callingAgent(exec, 'squad_extend')
-      let membership
+      let rootId
       try {
-        membership = ctx.agentTeams.tryMembership(lead)
-      } catch {
-        membership = undefined
-      }
-      if (membership?.role !== 'lead') {
+        rootId = ctx.get('subagents')?.rootOf(lead)?.id
+      } catch {}
+      if (rootId !== lead.id) {
         throw new Error('squad_extend 仅允许 Lead 调用。')
       }
       const kind = args.kind
@@ -2082,12 +2141,29 @@ export function apply(ctx, input) {
    */
   const pendingByName = new Map()
 
+  // 0.2.x membership: the Lead is the subagent-tree root; a teammate is a
+  // bound child (dispatch snapshot), a pending spawn, or a roster name. An
+  // unrelated subagent from another plugin resolves to no membership.
   const membershipOf = (agent) => {
     try {
-      return ctx.agentTeams.tryMembership(agent)
-    } catch {
-      return undefined
-    }
+      const subagents = ctx.get('subagents')
+      const root = subagents?.rootOf(agent)
+      if (root) {
+        if (root.id === agent.id) return { role: 'lead', name: 'lead' }
+        const binding = agentBindings.get(agent.id)
+        if (binding) return { role: 'teammate', name: binding.name }
+        let self
+        try {
+          self = subagents.namesOf?.(agent)?.self
+        } catch {}
+        if (self && pendingByName.has(self)) return { role: 'teammate', name: self }
+        const rosterName =
+          configuredAgents(config).find((entry) => entry.name === self)?.name ??
+          (agent.__membership && configuredAgents(config).find((entry) => entry.name === agent.__membership.name)?.name)
+        if (rosterName) return { role: 'teammate', name: rosterName }
+      }
+    } catch {}
+    return agent?.__membership
   }
 
   const installSection = (agent) => {

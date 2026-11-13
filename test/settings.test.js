@@ -230,25 +230,44 @@ function mockHost(workspace, dshHome, hooks = {}, options = {}) {
       }
     },
     list: () => ['spawn', 'fork', 'mock-ext', ...providers.keys()],
-    startActivation: async ({ provider, childId, request, signal }) => {
+    // 0.2.x flat SubagentActivationSpec (no nested request object).
+    startActivation: async ({ provider, childId, name, prompt, parent, agentOptions, cwd, signal, label }) => {
       childSeq += 1
-      const id = childId ?? request?.childId ?? `child-${childSeq}`
-      activations.push({ provider, childId: id, request })
+      const id = childId ?? `child-${childSeq}`
+      activations.push({ provider, childId: id, name, prompt, agentOptions, cwd, label })
+      const isTeamSpawn = (provider === 'spawn' || provider === 'fork') && agentOptions === undefined
+      if (isTeamSpawn && name) {
+        spawned.push({ name, prompt, description: label })
+        // Named continuable teammate (the spawnTeammate replacement):
+        // agent/created fires before the activation resolves (R08), and the
+        // member becomes visible in listDescendants.
+        const member = makeAgent(id, { role: 'teammate', name })
+        member.__root = parent
+        member.__name = name
+        members.push({ id, name, status: 'inactive' })
+        for (const handler of createdHandlers) handler({ agent: member })
+        return {
+          childId: id,
+          result: Promise.resolve({ stopReason: 'completed', output: [{ type: 'text', text: 'done' }] }),
+          dispose: async () => {},
+        }
+      }
       // Test hook: external activations run before the (already
       // resolved) result is awaited, so the mock "agent" can produce
       // PLAN.md synchronously — exactly what an external brain does.
-      if (provider !== 'spawn' && hooks.onExternal) {
-        await hooks.onExternal(provider, request)
+      if (provider !== 'spawn' && provider !== 'fork' && hooks.onExternal) {
+        await hooks.onExternal(provider, { prompt, cwd, signal, label })
       }
       // Providers registered through registerProvider run for real
       // (e.g. the built-in qoder-cli adapter around a stub CLI).
       const registeredProvider = providers.get(provider)
       if (registeredProvider) {
         const run = await registeredProvider.start({
-          ...request,
-          cwd: request.cwd ?? workspace,
-          signal: signal ?? request.signal,
-          label: request.label,
+          prompt,
+          parent,
+          cwd: cwd ?? workspace,
+          signal,
+          label,
         })
         runIds.push(run.id)
         return { childId: id, result: run.result, dispose: run.dispose }
@@ -262,26 +281,24 @@ function mockHost(workspace, dshHome, hooks = {}, options = {}) {
         dispose: async () => {},
       }
     },
-    sendMessage: async (_from, childId, content) => {
-      sent.push({ childId, content })
+    sendMessage: async (_from, targetId, content) => {
+      sent.push({ targetId, content })
     },
+    rootOf: (agent) => agent?.__root ?? (agent?.__membership?.role === 'lead' ? agent : undefined),
+    namesOf: (agent) => ({ self: agent?.__name ?? agent?.__membership?.name ?? String(agent?.id) }),
+    listDescendants: async () =>
+      members.map((member) => ({
+        id: member.id,
+        kind: 'child',
+        mode: 'continuable',
+        name: member.name,
+        label: member.name,
+        activity: member.status === 'running' ? 'running' : 'inactive',
+        hasChildren: false,
+      })),
+    getProvider: (id) => providers.get(id),
   }
   const ctx = {
-    agentTeams: {
-      listMembers: () => members.map((member) => ({ ...member })),
-      tryMembership: (agent) => agent.__membership,
-      spawnTeammate: async (_lead, request) => {
-        spawned.push(request)
-        const member = makeAgent(`team-${spawned.length}`, { role: 'teammate', name: request.name })
-        members.push({ id: member.id, name: request.name, status: 'inactive' })
-        // Host lifecycle: agent/created fires before spawnTeammate resolves.
-        for (const handler of createdHandlers) handler({ agent: member })
-        return { member }
-      },
-      sendMessage: async (_lead, message) => {
-        sent.push(message)
-      },
-    },
     agents: {
       list: () => [...agentsById.values()],
       get: (id) => agentsById.get(id),
@@ -315,9 +332,18 @@ function mockHost(workspace, dshHome, hooks = {}, options = {}) {
     },
     inject: (_deps, callback) => callback(ctx),
   }
+  // A running row WITHOUT a name: local children appear in listDescendants
+  // but must not match the team-member name lookup.
+  const markRunning = (id) => {
+    if (!members.some((member) => member.id === id)) members.push({ id, status: 'running' })
+  }
+  const unmarkRunning = (id) => {
+    const index = members.findIndex((member) => member.id === id)
+    if (index >= 0) members.splice(index, 1)
+  }
   return {
     ctx, registered, activations, sent, spawned, sections, members, agentsById, makeAgent,
-    dshHome, subagents, providers, runIds, disposers, cwdCalls,
+    dshHome, subagents, providers, runIds, disposers, cwdCalls, markRunning, unmarkRunning,
   }
 }
 
@@ -400,7 +426,7 @@ test('T03 dispatch reads fresh settings and routes external/local/team executors
     assert.match(externalOutput, /planRounds=1\/4/)
     assert.equal(host.activations.at(-1).provider, 'mock-ext')
     // S/E/M contract reaches the external activation prompt (charter included).
-    assertSEM(host.activations.at(-1).request.prompt.map((block) => block.text).join(''))
+    assertSEM(host.activations.at(-1).prompt.map((block) => block.text).join(''))
     await assertBrief(firstDir)
     // The external design round is archived synchronously as PLAN-R1.md.
     assert.equal(await readFile(join(firstDir, 'PLAN-R1.md'), 'utf8'), '# PLAN (mock)\n')
@@ -420,8 +446,8 @@ test('T03 dispatch reads fresh settings and routes external/local/team executors
     )
     assert.match(local1, /已创建本地子代理 zcode/)
     const firstChild = host.activations.at(-1).childId
-    assert.deepEqual(host.activations.at(-1).request.agentOptions, { provider: 'p', model: 'm1' })
-    assertSEM(host.activations.at(-1).request.prompt.map((block) => block.text).join(''))
+    assert.deepEqual(host.activations.at(-1).agentOptions, { provider: 'p', model: 'm1' })
+    assertSEM(host.activations.at(-1).prompt.map((block) => block.text).join(''))
     await assertBrief(firstDir)
 
     // Same binding → resume the same child id.
@@ -430,7 +456,7 @@ test('T03 dispatch reads fresh settings and routes external/local/team executors
       exec,
     )
     assert.match(local2, /已续跑本地子代理 zcode/)
-    assert.equal(host.sent.at(-1).childId, firstChild)
+    assert.equal(host.sent.at(-1).targetId, firstChild)
     {
       const resumeText = host.sent.at(-1).content.map((block) => block.text).join('')
       // includeCharter=false still outputs S/E/M, without the charter block.
@@ -466,14 +492,14 @@ test('T03 dispatch reads fresh settings and routes external/local/team executors
     assert.ok(qoderBrainSections.length >= 1)
     for (const text of qoderBrainSections) assert.match(text, /brain 角色/)
     // squad_report uses the same snapshot role, not the current roster (R08).
-    const qoderAgent = [...host.agentsById.values()].find((agent) => agent.id.startsWith('team-'))
+    const qoderAgent = [...host.agentsById.values()].find((agent) => agent.__membership?.name === 'qoder')
     const reportOutput = await tool('squad_report').execute(
       { status: 'done', summary: 'ok' },
       { agent: qoderAgent, signal: undefined },
     )
     assert.match(reportOutput, /status=done/)
     assert.match(
-      host.sent.filter((item) => item.target === 'lead').at(-1).content[0].text,
+      host.sent.filter((item) => item.targetId === 'lead-1').at(-1).content[0].text,
       /role=brain/,
     )
 
@@ -495,7 +521,7 @@ test('T03 dispatch reads fresh settings and routes external/local/team executors
     const statePath = join(firstTaskDir, 'STATE.json')
     const briefBefore = await readFile(briefPath, 'utf8')
     const stateBefore = await readFile(statePath, 'utf8')
-    host.agentsById.set(firstChild, { id: firstChild, status: 'running' })
+    host.markRunning(firstChild)
     await assert.rejects(
       tool('squad_dispatch').execute(
         { agent: 'zcode', message: 'same binding', phase: 'implement' },
@@ -526,7 +552,7 @@ test('T03 dispatch reads fresh settings and routes external/local/team executors
       tool('squad_start').execute({ goal: 'g9', acceptance: 'a9' }, exec),
       /仍有运行中的本地子代理/,
     )
-    host.agentsById.delete(firstChild)
+    host.unmarkRunning(firstChild)
 
     // R07 (cross-task): a child busy in ANOTHER task of the same memory root
     // blocks dispatch here too, whatever task_id is addressed.
@@ -554,7 +580,7 @@ test('T03 dispatch reads fresh settings and routes external/local/team executors
       exec,
     )
     assert.match(resumeTaskAExplicit, /已续跑本地子代理 zcode/)
-    host.agentsById.set(firstChild, { id: firstChild, status: 'running' })
+    host.markRunning(firstChild)
     const stateBPath = join(workspace, '.agent-squad', taskB, 'STATE.json')
     const stateBBefore = await readFile(stateBPath, 'utf8')
     const activationsBefore = host.activations.length
@@ -567,7 +593,7 @@ test('T03 dispatch reads fresh settings and routes external/local/team executors
     )
     assert.equal(await readFile(stateBPath, 'utf8'), stateBBefore)
     assert.equal(host.activations.length, activationsBefore)
-    host.agentsById.delete(firstChild)
+    host.unmarkRunning(firstChild)
     // Restore the external binding for the assertions below.
     snapshot = await settingsStore.read()
     await settingsStore.save({
@@ -605,7 +631,7 @@ test('T03 dispatch reads fresh settings and routes external/local/team executors
     )
     assert.match(reportAfterResume, /status=done/)
     assert.match(
-      host.sent.filter((item) => item.target === 'lead').at(-1).content[0].text,
+      host.sent.filter((item) => item.targetId === 'lead-1').at(-1).content[0].text,
       /role=worker/,
     )
 
@@ -722,7 +748,7 @@ test('T03 dispatch reads fresh settings and routes external/local/team executors
     assert.equal(host.activations.at(-1).provider, 'qoder-cli')
     const qoderPrompt = host.activations
       .at(-1)
-      .request.prompt.map((block) => block.text)
+      .prompt.map((block) => block.text)
       .join('')
     const stubArgs = JSON.parse(qoderOut.split('输出：\n')[1])
     assert.deepEqual(stubArgs, [
@@ -1462,7 +1488,7 @@ test('T07 plan gate: lead review, design budget, squad_approve_plan, archives an
     assert.match(await dispatch({ agent: 'zcode', message: 'impl', phase: 'implement' }), /本地子代理 zcode/)
     assert.match(await dispatch({ agent: 'zcode', message: 'fix', phase: 'rework' }), /本地子代理 zcode/)
     assert.equal(await readFile(join(dirA, 'PLAN-APPROVED.md'), 'utf8'), '# PLAN FINAL\n')
-    assertSEM(host.activations.at(-1).request.prompt.map((block) => block.text).join(''))
+    assertSEM(host.activations.at(-1).prompt.map((block) => block.text).join(''))
     assertSEM(host.sent.at(-1).content.map((block) => block.text).join(''))
     await assertBrief(dirA)
     await assert.rejects(design('late'), /PLAN 已批准/)
@@ -1486,7 +1512,7 @@ test('T07 plan gate: lead review, design budget, squad_approve_plan, archives an
       /已外部派发 codex/,
     )
     skipPlan = false
-    assertSEM(host.activations.at(-1).request.prompt.map((block) => block.text).join(''))
+    assertSEM(host.activations.at(-1).prompt.map((block) => block.text).join(''))
     await assertBrief(dirA)
     assert.equal(await readFile(join(dirA, 'PLAN-APPROVED.md'), 'utf8'), '# PLAN FINAL\n')
     assert.equal(
@@ -2209,8 +2235,8 @@ test('T09 multi-repository lifecycle, validation, rollback and compatibility', a
           { agent: 'codex', message: 'review it', phase: 'review' },
           exec,
         )
-        assert.equal(host.activations.at(-1).request.cwd, taskRoot)
-        const externalPrompt = host.activations.at(-1).request.prompt.map((b) => b.text).join('')
+        assert.equal(host.activations.at(-1).cwd, taskRoot)
+        const externalPrompt = host.activations.at(-1).prompt.map((b) => b.text).join('')
         assert.ok(externalPrompt.includes(`仓库：${repoA}`))
         assert.ok(externalPrompt.includes(`仓库：${repoB}`))
 
@@ -2219,8 +2245,8 @@ test('T09 multi-repository lifecycle, validation, rollback and compatibility', a
           { agent: 'zcode', message: 'implement', phase: 'implement' },
           exec,
         )
-        assert.equal(host.activations.at(-1).request.cwd, taskRoot)
-        const localPrompt = host.activations.at(-1).request.prompt.map((b) => b.text).join('')
+        assert.equal(host.activations.at(-1).cwd, taskRoot)
+        const localPrompt = host.activations.at(-1).prompt.map((b) => b.text).join('')
         assert.ok(localPrompt.includes(`仓库：${repoA}`))
         assert.ok(localPrompt.includes(`仓库：${repoB}`))
 
@@ -2258,7 +2284,7 @@ test('T09 multi-repository lifecycle, validation, rollback and compatibility', a
           const wIndex = argv.indexOf('-w')
           assert.equal(argv[wIndex + 1], taskRoot)
           assert.ok(!argv.includes('--add-dir'))
-          assert.equal(host2.activations.at(-1).request.cwd, taskRoot)
+          assert.equal(host2.activations.at(-1).cwd, taskRoot)
         } finally {
           await rm(stubDir, { recursive: true, force: true })
         }
@@ -3294,14 +3320,14 @@ test('T10 budget extension requires user confirmation and resumes exhausted budg
         'squad_extend 仅允许 Lead 调用。',
       )
       {
-        const originalTry = host.ctx.agentTeams.tryMembership
-        host.ctx.agentTeams.tryMembership = () => {
+        const originalRootOf = host.subagents.rootOf
+        host.subagents.rootOf = () => {
           throw new Error('membership exploded')
         }
         try {
           await noSide(task, () => extend({ ...good }), 'squad_extend 仅允许 Lead 调用。')
         } finally {
-          host.ctx.agentTeams.tryMembership = originalTry
+          host.subagents.rootOf = originalRootOf
         }
       }
       // E3: kind missing / invalid.
@@ -3635,7 +3661,7 @@ test('T10 budget extension requires user confirmation and resumes exhausted budg
       let state = await readState(task)
       assert.equal(state.reworkRounds, 3)
       assert.equal(state.round, 4)
-      for (const sent of host.sent.slice(-2)) assert.equal(sent.childId, childId)
+      for (const sent of host.sent.slice(-2)) assert.equal(sent.targetId, childId)
       // 4th rework: full decision-gate message, zero side effects.
       await noSide(task, () => rework('rw4'), reworkPause(3, 3))
       // Extend implement (default +3): design counters and approval untouched.
@@ -3660,7 +3686,7 @@ test('T10 budget extension requires user confirmation and resumes exhausted budg
       state = await readState(task)
       assert.equal(state.reworkRounds, 6)
       assert.equal(state.round, 7)
-      assert.equal(host.sent.at(-1).childId, childId)
+      assert.equal(host.sent.at(-1).targetId, childId)
       // 7th blocked at 6/6, +1 resumes it, round reaches 8.
       await noSide(task, () => rework('rw7'), reworkPause(6, 6))
       await extendOnly(task, { kind: 'implement', rounds: 1, reason: '用户追加返工', confirmed: true })

@@ -1,17 +1,10 @@
 # Agent Squad bundle layer.
-# The squad tools are a thin role layer over the shipped experimental Agent Teams
-# runtime, so this bundle mounts that runtime itself: a profile that installs only
-# this bundle still gets named, continuable teammates and durable team state.
+# DSH 0.2.x ships the standard subagent runtime (continuable children,
+# messaging, descendant discovery) and the Agent Teams task board itself, so
+# this bundle no longer mounts the removed experimental team runtime. It still
+# mounts the codex external provider and the experimental worktree service.
 
 - insert:
-    - id: agent-squad-team-runtime
-      name: '@deepseek-ai/dsh-experimental-agent-team'
-      config:
-        maxMembers: 8
-        maxTasks: 256
-        maxMessageBytes: 65536
-        disposalTimeoutMs: 5000
-
     - id: agent-squad-worktree-runtime
       name: '@deepseek-ai/dsh-experimental-worktree'
       config:
