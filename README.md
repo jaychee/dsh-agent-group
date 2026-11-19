@@ -5,8 +5,8 @@
 ```text
 用户 ──▶ Lead (DSH 当前会话)
             ├─ codex  [brain]   方案 / 验收标准 / 最终验收
-            ├─ zcode  [worker]  实现 / 测试
-            └─ qoder  [worker]  并行或前端实现
+            ├─ zcode  [worker]  后端开发 / 后端测试
+            └─ qoder  [worker]  仅前端测试
 ```
 
 插件本身很薄：它挂在 DSH 0.2.x 内置的标准 **subagent 运行时**（`ctx.subagents`：`startActivation`/`sendMessage`/`listDescendants`/`rootOf`）上，补上 DSH 缺的三件事：

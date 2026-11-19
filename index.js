@@ -145,18 +145,23 @@ const DEFAULT_AGENTS = [
   {
     name: 'zcode',
     role: 'worker',
-    description: '按已批准方案实现并运行测试。',
+    description: '后端执行者：后端代码的开发与测试。',
     provider: '',
     context: 'fresh',
-    charter: '',
+    charter: `后端执行者分工：
+- 负责后端/服务端代码的实现：业务逻辑、API、数据层、脚本与配置。
+- 负责后端测试：单元测试、集成测试与回归验证，逐条 AC 留证。
+- 边界：不承担前端页面/样式/交互改动；发现前端问题转交 qoder，不代改。`,
   },
   {
     name: 'qoder',
     role: 'worker',
-    description: '第二执行者，负责并行任务或前端偏重的改动。',
+    description: '前端执行者：仅前端代码测试。',
     provider: '',
     context: 'fresh',
-    charter: '',
+    charter: `前端执行者分工：
+- 仅负责前端代码的测试：编写/运行 UI 与组件测试、构建验证、复现并报告前端缺陷。
+- 边界：不改后端代码；前端缺陷修复仅限页面/样式/交互层，涉及接口契约的问题报告 Lead 转交 zcode。`,
   },
 ]
 
