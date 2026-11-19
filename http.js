@@ -446,6 +446,25 @@ async function validateDynamic(agents, worktree, models) {
         })
       }
     } else {
+      const slash = agent.model.indexOf('/')
+      if (slash > 0) {
+        // Pinned one-shot spawn (provider/model form on an external executor):
+        // validate the provider part against the LLM catalog exactly like the
+        // local executor instead of demanding a registered subagent provider.
+        const provider = agent.model.slice(0, slash)
+        const group = catalog.groups.find((entry) => entry.provider === provider)
+        if (group?.error) {
+          const error = new Error(`model directory for "${group.provider}" is unavailable: ${group.error}`)
+          error.code = 'CATALOG_UNAVAILABLE'
+          throw error
+        }
+        if (!group || !group.models.some((model) => model.value === agent.model)) {
+          throw new SettingsError('VALIDATION_FAILED', `model "${agent.model}" is not in the catalog`, {
+            fields: { [field]: 'MODEL_NOT_FOUND' },
+          })
+        }
+        continue
+      }
       const registered =
         typeof models?.subagents?.getProvider === 'function'
           ? models.subagents.getProvider(agent.model) !== undefined

@@ -1237,6 +1237,61 @@ test('T04 validation rejects invalid rosters with field paths and HTTP refuses n
   const body = JSON.parse(res.body)
   assert.equal(body.defaults.worktree.directory, 'custom-worktrees')
   assert.equal(body.defaults.agents[0].executor, 'external')
+
+  // PUT validation: an external executor may carry a pinned `provider/model`
+  // value (one-shot spawn path) — it must check the LLM catalog like the local
+  // executor instead of demanding a registered subagent provider.
+  {
+    const putPath = join(root, 'put', 'settings.json')
+    const putStore = createSettingsStore({ filePath: putPath })
+    const current = await putStore.read()
+    const models = {
+      llm: {
+        listProviders: () => [{ id: 'zai-coding-cn', name: 'ZAI' }],
+        listModels: async () => [{ id: 'glm-5.3', name: 'GLM' }],
+      },
+      subagents: { getProvider: (id) => (id === 'mock-ext' ? {} : undefined) },
+    }
+    const putHandler = createRequestHandler({ store: putStore, models })
+    const roster = (zcodeModel) =>
+      four(
+        validAgent('codex', { role: 'brain', executor: 'external', model: 'mock-ext' }),
+        validAgent('zcode', { executor: 'external', model: zcodeModel }),
+        validAgent('qoder'),
+      )
+    const sendPut = async (agents, expectedRevision = 1) => {
+      const payload = JSON.stringify({ expectedRevision, agents, worktree: current.worktree })
+      const r = makeRes()
+      await putHandler(
+        {
+          method: 'PUT',
+          url: '/agent-squad/settings',
+          headers: { host: '127.0.0.1:57954' },
+          socket: { remoteAddress: '127.0.0.1', localPort: 57954 },
+          on(event, listener) {
+            if (event === 'data') setImmediate(() => listener(Buffer.from(payload)))
+            if (event === 'end') setImmediate(() => listener())
+            return this
+          },
+          destroy() {},
+        },
+        r,
+      )
+      return r
+    }
+    // Pinned external form validates against the catalog and saves.
+    res = await sendPut(roster('zai-coding-cn/glm-5.3'))
+    assert.equal(res.statusCode, 200, `pinned external model must save: ${res.body}`)
+    assert.equal(JSON.parse(res.body).settings.revision, 2)
+    // A pinned external model missing from the catalog is a field error.
+    res = await sendPut(roster('zai-coding-cn/nope-9.9'), 2)
+    assert.equal(res.statusCode, 400)
+    assert.equal(JSON.parse(res.body).error.fields['agents.zcode.model'], 'MODEL_NOT_FOUND')
+    // A bare external provider still requires registration.
+    res = await sendPut(roster('not-registered'), 2)
+    assert.equal(res.statusCode, 400)
+    assert.equal(JSON.parse(res.body).error.fields['agents.zcode.model'], 'PROVIDER_NOT_REGISTERED')
+  }
   // R01: full-form mapped loopback and ::1 spellings pass the guard.
   for (const remoteAddress of ['0:0:0:0:0:ffff:7f00:1', '0:0:0:0:0:0:0:0001']) {
     res = makeRes()
