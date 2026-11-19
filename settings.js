@@ -128,7 +128,10 @@ export function validateAgentsAndWorktree(agents, worktree) {
       continue
     }
     const unknown = Object.keys(entry).filter(
-      (key) => !['id', 'displayName', 'role', 'executor', 'model', 'description'].includes(key),
+      (key) =>
+        !['id', 'displayName', 'role', 'executor', 'model', 'reasoning', 'description'].includes(
+          key,
+        ),
     )
     if (unknown.length > 0) fields[prefix] = 'UNKNOWN_FIELD'
     if (entry.id !== FIXED_IDS[index]) fields[`${prefix}.id`] = 'ID_READONLY'
@@ -143,6 +146,12 @@ export function validateAgentsAndWorktree(agents, worktree) {
       fields[`${prefix}.model`] = 'MODEL_REQUIRED'
     } else if (entry.executor === 'team' && entry.model !== '') {
       fields[`${prefix}.model`] = 'MODEL_MUST_BE_EMPTY'
+    }
+    if (
+      entry.reasoning !== undefined &&
+      !['', 'low', 'high', 'max'].includes(entry.reasoning)
+    ) {
+      fields[`${prefix}.reasoning`] = 'REASONING_INVALID'
     }
     if (typeof entry.description !== 'string') fields[`${prefix}.description`] = 'DESCRIPTION_INVALID'
   }

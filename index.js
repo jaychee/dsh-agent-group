@@ -200,6 +200,9 @@ function runtimeAgent(settingsAgent, config) {
     description: settingsAgent.description ?? '',
     executor: settingsAgent.executor,
     model: settingsAgent.model ?? '',
+    reasoning: ['low', 'high', 'max'].includes(settingsAgent.reasoning)
+      ? settingsAgent.reasoning
+      : '',
     context: bundle.context === 'fork' ? 'fork' : 'fresh',
     charter: bundle.charter ?? '',
   }
@@ -1196,7 +1199,11 @@ function createTools(ctx, config, runtime, store) {
               label: `${taskId}/${phase}/${target.name}`,
               prompt: [{ type: 'text', text: prompt }],
               parent: lead,
-              agentOptions: { provider: pinned.provider, model: pinned.model },
+              agentOptions: {
+                provider: pinned.provider,
+                model: pinned.model,
+                ...(target.reasoning ? { reasoningEffort: target.reasoning } : {}),
+              },
               ...(hasWorkspace ? { cwd: workspace } : {}),
               signal: exec.signal,
               delivery: 'parent',
@@ -1245,9 +1252,16 @@ function createTools(ctx, config, runtime, store) {
         // An external `provider/model` form runs a ONE-SHOT pinned child:
         // fresh context on every dispatch, no name/binding, no children
         // entry — the continuable path is the local/team executors.
+        const pinnedOptions = pinned
+          ? {
+              provider: pinned.provider,
+              model: pinned.model,
+              ...(target.reasoning ? { reasoningEffort: target.reasoning } : {}),
+            }
+          : undefined
         const activation = await subagents.startActivation({
           provider: pinned ? 'spawn' : target.model,
-          ...(pinned ? { agentOptions: { provider: pinned.provider, model: pinned.model } } : {}),
+          ...(pinned ? { agentOptions: pinnedOptions } : {}),
           label: `${taskId}/${phase}/${target.name}`,
           prompt: [{ type: 'text', text: prompt }],
           parent: lead,
