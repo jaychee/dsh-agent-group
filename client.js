@@ -37,6 +37,11 @@ window.__ModuleLoader__.load({
       fieldRole: '角色',
       fieldExecutor: '执行方式',
       fieldModel: '模型 / Provider',
+      fieldReasoning: '思考强度',
+      reasoningDefault: '默认（不传）',
+      reasoningLow: 'low',
+      reasoningHigh: 'high',
+      reasoningMax: 'max',
       fieldDescription: '描述',
       roleBrain: 'brain（业务设计与验收）',
       roleArchitect: 'architect（系统架构师）',
@@ -111,6 +116,11 @@ window.__ModuleLoader__.load({
       fieldRole: 'Role',
       fieldExecutor: 'Executor',
       fieldModel: 'Model / provider',
+      fieldReasoning: 'Reasoning effort',
+      reasoningDefault: 'Default (omit)',
+      reasoningLow: 'low',
+      reasoningHigh: 'high',
+      reasoningMax: 'max',
       fieldDescription: 'Description',
       roleBrain: 'brain (business design & acceptance)',
       roleArchitect: 'architect (system architect)',
@@ -370,6 +380,24 @@ window.__ModuleLoader__.load({
                     : null,
                 ),
             err('model') && h('span', { className: 'asq-error', role: 'alert' }, t.errorFor(err('model')))),
+        // Reasoning effort applies to pinned provider/model children: the
+        // continuable local executor and the one-shot external spawn both
+        // forward reasoningEffort in agentOptions; a bare external provider
+        // (codex-cli &co.) has its own policy, so the control stays hidden.
+        (agent.executor === 'local' || (agent.executor === 'external' && modelValue.includes('/'))) &&
+          h('div', { className: 'asq-field' },
+            h('label', { className: 'asq-label', htmlFor: `asq-${agent.id}-reasoning` }, t.fieldReasoning),
+            h('select', {
+              id: `asq-${agent.id}-reasoning`, className: 'asq-select', value: agent.reasoning ?? '',
+              disabled,
+              onChange: (event) => update({ reasoning: event.target.value }),
+            },
+              h('option', { value: '' }, t.reasoningDefault),
+              h('option', { value: 'low' }, t.reasoningLow),
+              h('option', { value: 'high' }, t.reasoningHigh),
+              h('option', { value: 'max' }, t.reasoningMax),
+            ),
+            err('reasoning') && h('span', { className: 'asq-error', role: 'alert' }, t.errorFor(err('reasoning')))),
         h('div', { className: 'asq-field' },
           h('label', { className: 'asq-label', htmlFor: `asq-${agent.id}-description` }, t.fieldDescription),
           h('textarea', {

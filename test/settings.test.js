@@ -1785,6 +1785,10 @@ test('T07 plan gate: lead review, design budget, squad_approve_plan, archives an
     assert.match(clientSource, /flowApprove/)
     assert.match(clientSource, /settings\.section/)
     assert.match(clientSource, /roleArchitect/)
+    // The settings page exposes the per-agent reasoning effort for pinned
+    // provider/model executors (local + one-shot external).
+    assert.match(clientSource, /asq-\$\{agent\.id\}-reasoning/)
+    assert.match(clientSource, /update\(\{ reasoning: event\.target\.value \}\)/)
     assert.match(readme, /先审方案再实现|Lead 审核 PLAN/)
     assert.match(readme, /第 4 轮/)
     assert.ok(!/6 轮返工|第 7 次/.test(readme))
