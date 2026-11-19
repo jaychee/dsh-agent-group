@@ -713,6 +713,7 @@ test('T03 dispatch reads fresh settings and routes external/local/team executors
 
     // --- built-in qoder-cli provider: registration, catalog, dispatch -------
     assert.ok(host.providers.has('qoder-cli'), 'qoder-cli provider registered')
+    assert.ok(host.providers.has('codex-cli'), 'codex-cli provider registered')
     assert.ok(host.subagents.list().includes('qoder-cli'))
     // Loopback GET /agent-squad/models surfaces the provider as external.
     {
@@ -1778,6 +1779,60 @@ test('T08 qoder provider builds args and handles process lifecycle', async () =>
     buildQoderArgs('a\nb;$(x)', '/tmp/a b', Object.freeze({ permissionMode: 'custom', model: 'm1' })),
     ['-p', 'a\nb;$(x)', '-w', '/tmp/a b', '--permission-mode', 'custom', '-m', 'm1'],
   )
+
+  // --- codex-cli provider: arg builder + answer extraction -----------------
+  const { buildCodexArgs, extractCodexAnswer, createCodexProvider } = await import('../codex.js')
+  assert.deepEqual(buildCodexArgs('hi', '/tmp/w'), [
+    'exec', '--skip-git-repo-check',
+    '-m', 'gpt-6.2-astra',
+    '-c', 'model_reasoning_effort="xhigh"',
+    '-s', 'workspace-write',
+    '-C', '/tmp/w',
+    'hi',
+  ])
+  assert.deepEqual(
+    buildCodexArgs('p', '/w', { model: 'm9', reasoningEffort: 'low', sandboxMode: 'read-only' }),
+    [
+      'exec', '--skip-git-repo-check',
+      '-m', 'm9',
+      '-c', 'model_reasoning_effort="low"',
+      '-s', 'read-only',
+      '-C', '/w',
+      'p',
+    ],
+  )
+  {
+    const stdout = [
+      'OpenAI Codex v0.170.0',
+      '--------',
+      'workdir: /w',
+      'model: gpt-6.2-astra',
+      '',
+      'user',
+      'do it',
+      'codex',
+      'line one',
+      'line two',
+      'tokens used',
+      '7,844',
+      'line one',
+      'line two',
+      '',
+    ].join('\n')
+    assert.equal(extractCodexAnswer(stdout), 'line one\nline two')
+    assert.equal(extractCodexAnswer('no markers'), 'no markers')
+  }
+  {
+    const codexBare = createCodexProvider()
+    assert.equal(codexBare.name, 'codex-cli')
+    assert.equal(codexBare.inheritsParentContext, false)
+    assert.deepEqual(codexBare.capabilities, {
+      agentOptions: false,
+      agentPreset: false,
+      outputSchema: false,
+      depthLimit: false,
+    })
+  }
 
   // --- constructor defaults: shape, capabilities, one-shot -----------------
   const bare = createQoderProvider()

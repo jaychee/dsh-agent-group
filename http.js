@@ -409,7 +409,7 @@ export async function collectModels(models) {
     } else if (typeof subagents.getProvider === 'function') {
       // DSH 0.2.x removed the provider listing. Probe the providers this
       // plugin ships or documents instead of failing the whole catalog.
-      const known = ['codex', 'qoder-cli', 'zcode-cli']
+      const known = ['codex', 'codex-cli', 'qoder-cli', 'zcode-cli']
       externalProviders = known
         .filter((name) => {
           try {

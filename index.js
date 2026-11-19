@@ -30,6 +30,7 @@ import { promisify } from 'node:util'
 import { createSettingsStore, seedFromBundle } from './settings.js'
 import { registerRoutes } from './http.js'
 import { createSquadWorktree, createSquadWorktrees, rollbackSquadWorktrees } from './worktree.js'
+import { createCodexProvider } from './codex.js'
 import { createQoderProvider } from './qoder.js'
 
 const runFile = promisify(execFile)
@@ -182,6 +183,10 @@ function resolveSettings(input) {
     qoderCommand: text(config.qoderCommand, 'qoderclicn'),
     qoderPermissionMode: text(config.qoderPermissionMode, 'accept_edits'),
     qoderModel: text(config.qoderModel, ''),
+    codexCommand: text(config.codexCommand, 'codex'),
+    codexModel: text(config.codexModel, 'gpt-6.2-astra'),
+    codexReasoningEffort: text(config.codexReasoningEffort, 'xhigh'),
+    codexSandboxMode: text(config.codexSandboxMode, 'workspace-write'),
   }
 }
 
@@ -1248,7 +1253,9 @@ function createTools(ctx, config, runtime, store) {
         })
         const startedAt = Date.now()
         const tokensBefore =
-          target.model === 'codex' ? await captureCodexTokens(startedAt - 600000) : undefined
+          ['codex', 'codex-cli'].includes(target.model)
+            ? await captureCodexTokens(startedAt - 600000)
+            : undefined
         // An external `provider/model` form runs a ONE-SHOT pinned child:
         // fresh context on every dispatch, no name/binding, no children
         // entry — the continuable path is the local/team executors.
@@ -1287,7 +1294,7 @@ function createTools(ctx, config, runtime, store) {
           .filter((block) => block?.type === 'text')
           .map((block) => block.text)
           .join('')
-        if (target.model === 'codex') {
+        if (['codex', 'codex-cli'].includes(target.model)) {
           const after = await captureCodexTokens(startedAt)
           tokens =
             after !== undefined
@@ -2155,6 +2162,21 @@ export function apply(ctx, input) {
         }),
       ),
     'agent-squad: qoder-cli provider',
+  )
+  // Built-in codex-cli external provider: drives the user's codex CLI
+  // (codex exec) directly, so the squad rides the newest CLI models
+  // instead of the bundled app-server kernel's model ceiling.
+  ctx.effect(
+    () =>
+      ctx.get('subagents')?.registerProvider(
+        createCodexProvider({
+          command: config.codexCommand,
+          model: config.codexModel,
+          reasoningEffort: config.codexReasoningEffort,
+          sandboxMode: config.codexSandboxMode,
+        }),
+      ),
+    'agent-squad: codex-cli provider',
   )
   const store = createSettingsStore({
     seed: seedFromBundle(config.agents, config.worktreeDir),
