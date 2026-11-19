@@ -368,6 +368,16 @@ plugin_manager remove_bundle   dsh-agent-squad
 
 DSH 0.2.x 已把 Agent Teams 并入标准 subagent 运行时，本插件的 patch 不再挂载已移除的 `@deepseek-ai/dsh-experimental-agent-team`；改为挂载 `@deepseek-ai/dsh-subagent-codex` 提供 codex 外部执行者。
 
+### zcode-bm：BigModel ACP 桥（随 bundle 挂载）
+
+本 bundle 的 patch 同时挂载 `@deepseek-ai/dsh-subagent-acp`（provider 名 `zcode-bm`），通过本地 `zcode-acp-server` 桥以 ACP/stdio 驱动 ZCode CLI（BigModel 个人编码套餐，GLM-5.3），并注册 `subagent_zcode_bm` 工具行与 collab 技能约定对齐。把 zcode 的 executor 设为 `external`、model 选 `zcode-bm` 即走此通道；该包须作为 profile 直接依赖安装（`link:` bundle 的自身依赖不会进 profile 的 node_modules）：
+
+```sh
+cd ~/.dsh/profiles/<profile> && pnpm add @deepseek-ai/dsh-subagent-acp@<运行时版本>
+```
+
+桥的命令行与 env（`ZCODE_BIN`/`ZCODE_PROVIDER`/`ZCODE_MODEL`）在 `cordis.patch.yml` 的 `subagent-acp-zcode-bm` 行内配置。
+
 ## 升级与重载
 
 本插件挂载的 Team 运行时与工具都归属于插件上下文。修改 `index.js` 后，用插件管理器禁用再启用 `agent-squad` 即可干净重载（工具全局注册、按 `when` 对 agent 可见；章程分区由插件上下文持有并随重载销毁）。重载会清空"已启用小队"的会话集合：正在带任务的会话需要再调一次 `squad_enable` 恢复 Lead 身份（任务数据不受影响）。内置的 qoder-cli provider 也随插件上下文注册/注销：重载后它出现在 `GET /agent-squad/models` 的 `externalProviders`（id `qoder-cli`）。实机验证：在设置页把 qoder 的 `executor` 设为 `external`、`model` 选 `qoder-cli` 并保存（前提是宿主 PATH 上已安装并登录 `qoderclicn`），随后给 qoder 派一个小任务，确认派单结果带 `provider=qoder-cli` 且产物落盘。如果旧版本曾在会话里留下作用域注册，升级后需要重启一次 DSH 清除。从三成员旧版本升级时，settings.json 读取时自动迁移为 v2（插入 gpt 行），既有编辑保留。

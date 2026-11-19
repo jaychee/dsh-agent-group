@@ -25,6 +25,9 @@
     "icon.svg",
     "README.md"
   ],
+  "dependencies": {
+    "@deepseek-ai/dsh-subagent-acp": "0.2.2-rc.5"
+  },
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"

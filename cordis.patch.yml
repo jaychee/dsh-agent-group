@@ -6,6 +6,10 @@
 #
 # The squad is opt-in: sessions must call squad_enable after an explicit user
 # request before any squad_* tool or Lead persona appears.
+#
+# zcode-bm: the BigModel ACP bridge (zcode-acp-server driving the local ZCode
+# CLI over stdio), mounted here so installing this bundle registers the
+# provider; the subagent_zcode_bm tool row keeps parity with the collab skill.
 
 - insert:
     - id: agent-squad-worktree-runtime
@@ -14,6 +18,27 @@
         directory: .agents/worktrees
         namePrefix: squad-
 
+    - id: subagent-acp-zcode-bm
+      name: '@deepseek-ai/dsh-subagent-acp'
+      config:
+        providerName: zcode-bm
+        command: "/Users/jaychee/.nvm/versions/node/v24.14.0/bin/node"
+        args:
+          - "/Users/jaychee/Documents/deepseek-harness/default-workspace/codex-zcode-collab/tools/node_modules/zcode-acp-server/dist/cli.js"
+          - "server"
+        permission: allow
+        env:
+          ZCODE_BIN: "/Applications/ZCode.app/Contents/Resources/glm/zcode.cjs"
+          ZCODE_PROVIDER: "account:bigmodel-individual-coding-plan"
+          ZCODE_MODEL: "GLM-5.3"
+
+    - id: tool-subagent-zcode-bm
+      name: '@deepseek-ai/dsh-tool-subagent'
+      config:
+        provider: zcode-bm
+        toolName: subagent_zcode_bm
+        maxDepth: provider-managed
+
     - id: agent-squad
       name: 'dsh-agent-squad'
       config:
@@ -21,9 +46,9 @@
         # settings page stores the live value in ~/.dsh/agent-squad/settings.json.
         worktreeDir: .agents/worktrees
         # Hybrid: Lead stays DeepSeek; codex is an external one-shot brain;
-        # gpt is the architect on a pinned local model; workers are local
-        # pinned-model children (GLM, continuable). These rows only seed the
-        # settings file on first run.
+        # gpt is the architect on a pinned local model; zcode defaults to the
+        # zcode-bm ACP bridge (BigModel plan); qoder stays a pinned local-model
+        # worker. These rows only seed the settings file on first run.
         agents:
           - name: codex
             role: brain
@@ -38,10 +63,9 @@
             description: 系统架构师：发布技术规格并做技术验收；可接手实现（不能自签技术验收）。
           - name: zcode
             role: worker
-            provider: ''
-            model: zai-coding-cn/glm-5.3
+            provider: zcode-bm
             context: fresh
-            description: 后端 worker：实现后端代码并自测（GLM 本地子代理，可续跑）。
+            description: 后端 worker：实现后端代码并自测（BigModel ACP 桥接本地 ZCode，GLM-5.3）。
           - name: qoder
             role: worker
             provider: ''
