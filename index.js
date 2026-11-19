@@ -6,17 +6,32 @@
  * the Lead's subagent tree, and team membership is resolved through
  * `rootOf`/`namesOf`/`listDescendants` (DSH 0.2.x Agent-Teams API).
  *
- *   lead   — the DSH session itself; orchestrates and assigns work.
- *   brain  — designs the plan and acceptance bar, then reviews the result.
- *   worker — implements the approved plan and runs the tests.
+ * The squad is OPT-IN: a normal session never sees the squad persona or tools.
+ * Only an explicit user request ("用小队实现") makes the Lead call
+ * `squad_enable`; mentioning a teammate's name alone never enables it.
+ *
+ *   lead      — the DSH session itself; orchestrates and assigns work.
+ *   brain     — codex: business design (PLAN.md) and business acceptance
+ *               (REVIEW.md). Changing business behavior needs a user decision.
+ *   architect — gpt: system architect on a pinned local model. Publishes the
+ *               technical spec (SPEC.md) and signs technical acceptance
+ *               (TECH-REVIEW.md); may take over implementation, but then never
+ *               signs acceptance for their own code — the brain does.
+ *   worker    — zcode (backend) / qoder (frontend): implement and self-test.
+ *
+ * Full flow (new code tasks): business plan → Lead approval → technical spec →
+ * implementation → technical acceptance → business acceptance. Tech and
+ * business rework budgets are independent (3 rounds each, first acceptance
+ * free); acceptances are versioned against the code/spec they examined.
  *
  * Context policy:
  *   - A teammate is a durable, continuable child of the Lead. Re-dispatching an
  *     existing teammate sends a message into the *same* session, so a rework
  *     round continues the previous conversation instead of paying for a new one.
  *   - Cross-agent memory lives in `<workspace>/.agent-squad/<task>/`: TASK.md,
- *     PLAN.md, REVIEW.md, REPORT.md, JOURNAL.md. Every assignment points at that
- *     directory, so agents exchange artifacts rather than transcript copies.
+ *     PLAN.md, SPEC.md, REVIEW.md, TECH-REVIEW.md, REPORT.md, JOURNAL.md. Every
+ *     assignment points at that directory, so agents exchange artifacts rather
+ *     than transcript copies.
  */
 
 import { execFile } from 'node:child_process'
@@ -51,9 +66,12 @@ const MAX_REWORK_ROUNDS = 3
 /** Design budget: initial design + at most 3 rework rounds = 4 design dispatches. */
 const MAX_DESIGN_REWORK_ROUNDS = 3
 const MAX_PLAN_ROUNDS = 1 + MAX_DESIGN_REWORK_ROUNDS
+/** Full-flow acceptance budgets: tech and business rework, 3 rounds each. */
+const MAX_TECH_REWORK_ROUNDS = 3
+const MAX_BUSINESS_REWORK_ROUNDS = 3
 
 /** Liveness marker surfaced by squad_status; changes whenever behavior changes. */
-const PLUGIN_MARKER = 'agent-squad/zh-v7'
+const PLUGIN_MARKER = 'agent-squad/zh-v8'
 
 /**
  * Plan-gate snapshot for one STATE. New tasks persist all four fields at
@@ -80,56 +98,114 @@ function budgetOf(state) {
   return {
     designLimit: Number(state.designLimit ?? MAX_PLAN_ROUNDS),
     reworkLimit: Number(state.reworkLimit ?? MAX_REWORK_ROUNDS),
+    techLimit: Number(state.techReworkLimit ?? MAX_TECH_REWORK_ROUNDS),
+    businessLimit: Number(state.businessReworkLimit ?? MAX_BUSINESS_REWORK_ROUNDS),
     designUsed: Number(state.planRounds ?? 0),
     implementUsed: Number(state.reworkRounds ?? 0),
+    techUsed: Number(state.techReworkRounds ?? 0),
+    businessUsed: Number(state.businessReworkRounds ?? 0),
   }
 }
 
-const BRAIN_CHARTER = `你是小队里的思考者，负责方案与验收标准。
+/**
+ * Flow snapshot for one STATE. `full` tasks snapshot specRequired at start
+ * (architect participant required); every other shape — explicit `simple`
+ * tasks and legacy states created before flows existed — keeps the legacy
+ * gates: plan approval (when a brain participated) and a single REVIEW close.
+ */
+function flowOf(state) {
+  return {
+    flow: state.flow === 'full' || state.flow === 'simple' ? state.flow : 'legacy',
+    specRequired: state.flow === 'full' && state.specRequired === true,
+  }
+}
 
-- 把目标写成可执行规格，存入 PLAN.md：逐个列出新增、修改、删除的文件路径，每个文件写明改动位置、改动要点及对应 AC 编号。
-- 逐项写出接口名称与精确签名、参数类型与默认值、返回类型与返回值；错误必须写明错误类型、触发条件与完整消息。没有接口变更时明确写“无接口变更”，并列出须保留的接口与错误行为。
-- 列出边界输入与精确期望值；逐项指定测试文件、测试名、输入和期望输出。每条 AC 必须给出可直接执行的验证命令、执行目录、退出码与通过条件，并映射到改动文件和测试名。
-- 在“假设与待确认”中显式列出假设及影响；未确定且影响实现的事项标为待确认，不能让 worker 猜测。禁止使用“适当”“合理”“类似”“等等”“参考现有实现”替代具体规格。
-- 写完后自检“一个没有上下文的 worker 能否只靠 PLAN 完成”，把结论写入 PLAN.md；不能时补全规格，或列入“假设与待确认”并标明阻塞项，不得宣称方案可执行。
-- 被要求验收时，以 PLAN-APPROVED.md 为唯一权威规格，逐条核对 AC 并在 REVIEW.md 写明 AC 编号、文件路径、测试名、验证命令、退出码、关键输出与结论；亲自运行或检查测试，不接受没有证据的声明。
+/** Read the last machine verdict line of an acceptance file. */
+async function readVerdict(taskDir, fileName) {
+  const text = await readFile(join(taskDir, fileName), 'utf8').catch(() => '')
+  if (!text) return undefined
+  const verdicts = [...text.matchAll(/VERDICT:\s*(APPROVED|CHANGES_REQUESTED)/gi)]
+  return verdicts.at(-1)?.[1]?.toUpperCase() ?? null
+}
+
+/**
+ * One acceptance binding: a review dispatch remembers the code epoch and spec
+ * version it examined. The verdict itself is read from the file at gate time;
+ * the acceptance is usable only while the binding is still fresh (no code or
+ * spec dispatch happened after it), so any change invalidates old conclusions.
+ */
+function bindingFresh(binding, state) {
+  return (
+    binding !== null &&
+    binding !== undefined &&
+    Number(binding.codeEpoch) === Number(state.codeEpoch ?? 0) &&
+    Number(binding.specVersion) === Number(state.specVersion ?? 0)
+  )
+}
+
+const BRAIN_CHARTER = `你是小队里的 brain（业务设计与验收），与架构师分工：你管业务，架构师管技术。
+
+- 把业务目标写成可执行业务方案，存入 PLAN.md：对外行为、用户可见结果、边界场景与编号验收标准（AC）。
+- 涉及对外接口时逐项写明接口契约与错误行为；没有接口变更时明确写“无接口变更”，并列出须保留的对外行为。
+- 列出边界输入与精确期望值；每条 AC 必须给出可直接执行的验收命令、执行目录、退出码与通过条件。
+- 在“假设与待确认”中显式列出假设及影响；未确定且影响交付的事项标为待确认，不能让架构师或 worker 猜测。禁止使用“适当”“合理”“类似”“等等”“参考现有实现”替代具体规格。
+- 你可以澄清方案；但要改变原有业务功能、对外结果或验收标准，必须先请用户决策，不得擅自变更。
+- 写完后自检“一个没有上下文的架构师能否只靠 PLAN 拍板技术设计”，把结论写入 PLAN.md；不能时补全方案，或列入“假设与待确认”并标明阻塞项，不得宣称方案可执行。
+- 业务验收轮以 PLAN-APPROVED.md 为唯一权威业务规格，逐条核对 AC 并在 REVIEW.md 写明 AC 编号、验证命令、退出码、关键输出与结论；亲自运行或检查，不接受没有证据的声明。技术结论对照 SPEC.md 与 TECH-REVIEW.md，不替技术验收背书。
 - 只有每条标准都有证据通过时才报 "approved"；否则报 "changes_requested"，给出编号缺陷清单和每项的最小修复方案。
 - REVIEW.md 的最后一行必须是机器可读的「VERDICT: APPROVED」或「VERDICT: CHANGES_REQUESTED」（Lead 的收尾门禁只认这一行）。
+- 当架构师接手实现时，由你对照 SPEC.md 亲自运行验证测试并代签技术验收：在 TECH-REVIEW.md 记录命令、退出码、关键输出与编号缺陷，最后一行同样是「VERDICT: APPROVED」或「VERDICT: CHANGES_REQUESTED」；之后再按业务方案单独签署业务验收，两份验收独立记录。
 - 不写生产代码；一次性探针脚本可以放在 /tmp。
-- 方案要克制：计划正文默认不超过约 80 行；测试数量不超过 max(6, 验收条数×2)，除非任务确实更复杂，并在 PLAN.md 里说明理由。
+- 方案要克制：计划正文默认不超过约 80 行，除非任务确实更复杂并在 PLAN.md 里说明理由。
 - 不扩大范围，取满足目标的最小方案。`
 
-const WORKER_CHARTER = `你是小队里的执行者，严格按已批准的方案实现。
+const ARCHITECT_CHARTER = `你是小队里的系统架构师（architect），与 brain 分工：brain 管业务，你管技术。
 
-- 动手前先读 TASK.md 和 PLAN-APPROVED.md。PLAN-APPROVED.md 是实现、返工与验收的唯一权威规格；PLAN.md 只用于设计，不能覆盖批准归档。仅任务快照豁免方案门禁且无批准归档时，按 TASK.md 与 Lead 本轮派单执行；仍须逐条 AC 留证。
-- 只做方案定义的最小改动；不得引入方案未定义的接口、文件或依赖，不重新设计、不改名、不扩大范围。
-- 规格缺失、矛盾或明显错误时立即停止实现，报 "blocked"，引用 PLAN-APPROVED.md 的具体章节与 AC 编号，并列出缺失项或冲突原文；需要批准归档而文件缺失时明确引用文件名；豁免任务引用 TASK.md 章节或 Lead 派单条目。不得自行补全规格或改用 PLAN.md。
-- 按 PLAN-APPROVED.md 指定的测试名、输入与期望输出写或更新测试，并亲自运行每条 AC 的验收命令；豁免任务按 TASK.md 与 Lead 本轮派单执行。
+- 设计轮（spec）读取已批准的业务方案 PLAN-APPROVED.md；对缺失的技术设计拍板，对已有设计审核、补充。
+- 把技术规格写入 SPEC.md，至少覆盖适用的：代码结构、文件与模块职责、数据库表与迁移、领域模型及其依赖、对外接口与错误行为、各模块实现、可执行验证用例；对不适用的部分逐项明确说明“不适用”。
+- 技术实现可以调整，但不能擅改业务行为；若必须改业务预期，暂停受影响工作并在报告中交 Lead 转用户决策。
+- 规格有问题时按 worker 的上报修订并发布新版本（更新 SPEC.md，版本号以派单为准）；单纯澄清规格不扣返工额度，也不重置已用额度。
+- 技术验收轮（tech-review）以当前 SPEC.md 为唯一权威技术规格：做代码审查、亲自运行验证测试，在 TECH-REVIEW.md 逐条记录需求/AC 编号、命令、退出码、关键输出与可执行的编号缺陷清单。
+- TECH-REVIEW.md 的最后一行必须是机器可读的「VERDICT: APPROVED」或「VERDICT: CHANGES_REQUESTED」（Lead 的技术验收门禁只认这一行）。
+- 接手实现时按 worker 章程执行并自测，但你不能签署自己改动的技术验收：插件会拒绝对你派 tech-review；交由 brain（codex）对照 SPEC.md 独立代签技术验收。
+- 不确定的业务预期不要猜：交 Lead 转用户决策。`
+
+const WORKER_CHARTER = `你是小队里的执行者，严格按已批准的业务方案与技术规格实现。
+
+- 动手前先读 TASK.md、PLAN-APPROVED.md（业务方案）与 SPEC.md（技术规格）。PLAN-APPROVED.md 是业务方案与业务验收的唯一权威规格；SPEC.md 是技术实现、返工与技术验收的唯一权威规格；PLAN.md 只用于设计，不能覆盖批准归档。仅任务快照豁免方案门禁且无批准归档时，按 TASK.md 与 Lead 本轮派单执行；仍须逐条 AC 留证。
+- 只做规格定义的最小改动；不得引入规格未定义的接口、文件或依赖，不重新设计、不改名、不扩大范围。
+- 规格缺失、矛盾或明显错误时立即停止实现，报 "blocked"，引用 PLAN-APPROVED.md/SPEC.md 的具体章节与编号，并列出缺失项或冲突原文；需要归档而文件缺失时明确引用文件名；豁免任务引用 TASK.md 章节或 Lead 派单条目。规格有问题上报 Lead 转 gpt 修订发布，不自行偏离或改用 PLAN.md。
+- 按 SPEC.md 指定的测试名、输入与期望输出写或更新测试，并亲自运行每条 AC 的验收命令；豁免任务按 TASK.md 与 Lead 本轮派单执行。
 - 在 REPORT.md 逐条 AC 给证据：AC 编号、改动文件路径、测试名、实际命令、退出码、关键输出与结论；失败或未执行必须如实标注，不得只写“测试通过”。
 - 返工派单仍是在同一段对话里：逐条修复验收提出的编号缺陷，重跑完整相关测试，再次报告。`
 
-const LEAD_POLICY = `Agent Squad 已启用：你是 Lead，小队里有按角色分工的队友。
+const LEAD_POLICY = `Agent Squad 已启用：你是 Lead，小队里有按角色分工的队友（brain=业务设计与验收，architect=系统架构师，worker=执行者）。
 
-非平凡任务按以下流程（先审方案再实现）：
-1. 调用 squad_start 一次，写入目标与验收标准（验收标准确实含糊时先问用户）。
-2. 派 brain 队友，phase="design"。读共享目录里的 PLAN.md。
-3. Lead 亲自做 PLAN.md 的可执行性审核：假装自己是一个没有上下文的 worker，逐项检查文件改动、接口与错误、边界值、测试预期、AC 验证命令和假设；无法只靠 PLAN 实现、需要 worker 猜测的点一律按 D1 起连续编号，写明章节、缺失或矛盾、最小补全要求，派回 brain（phase="design"）返工迭代，默认初始设计 + ${MAX_DESIGN_REWORK_ROUNDS} 轮返工 = ${MAX_PLAN_ROUNDS} 次 design 派单，未扩展时第 ${MAX_PLAN_ROUNDS + 1} 次暂停：先向用户说明阻塞点与已完成部分并等待决策，用户同意后调用 squad_extend(kind="design", rounds=3, reason="用户批准的追加理由", confirmed=true) 追加轮次再派 design；方案合格后调用 squad_approve_plan 批准（归档 PLAN-APPROVED.md）。有 brain 参与的任务，PLAN 未批准前 implement/rework 派单会被拒绝；没有 brain 参与的任务豁免此门禁。
-4. 批准后派一个 worker，phase="implement"，给出 PLAN-APPROVED.md 路径、文件范围与本轮 AC 编号映射。
-5. 派 brain，phase="review"，附上实际 diff 与测试证据。
-6. 若验收返回 changes_requested，把同样的缺陷派回同一个 worker，phase="rework"。进程内队友会续跑同一会话；外部 provider（codex 等）是一次性调用，返工必须重发 BRIEF 与编号缺陷。
-7. 只有 brain 的 "approved" 才能收尾；随后向用户汇总交付结果。
+完整流程（新代码任务默认：先业务方案、再技术规格、后实现与双验收）：
+1. 调用 squad_start 一次，写入目标与验收标准（验收标准确实含糊时先问用户）。非代码任务可在创建时传 flow="simple" 走简化流程。
+2. 派 brain（codex），phase="design"：写业务方案 PLAN.md。
+3. Lead 亲自审核 PLAN.md：假装自己是没有上下文的架构师，无法只靠 PLAN 拍板技术设计的点按 D1 起连续编号，写明章节、缺失或矛盾、最小补全要求，派回 brain（phase="design"）返工迭代，默认初始设计 + ${MAX_DESIGN_REWORK_ROUNDS} 轮返工 = ${MAX_PLAN_ROUNDS} 次 design 派单，未扩展时第 ${MAX_PLAN_ROUNDS + 1} 次暂停：先向用户说明阻塞点与已完成部分并等待决策，用户同意后调用 squad_extend(kind="design", rounds=3, reason="用户批准的追加理由", confirmed=true) 追加轮次再派 design；每次扩展都要重新取得用户明确确认，可重复扩展，不自动续跑；用户拒绝或未回复时保持暂停。
+4. 方案合格后调用 squad_approve_plan 批准（归档 PLAN-APPROVED.md）。有 brain 参与的任务，PLAN 未批准前 implement/rework/spec 派单会被拒绝；没有 brain 参与的任务豁免此门禁。
+5. 派 architect（gpt），phase="spec"：读取 PLAN-APPROVED.md，发布技术规格 SPEC.md（代码结构、文件与模块职责、表与迁移、领域模型、接口与错误行为、各模块实现、可执行验证用例；不适用的明确说明）。规格可多轮修订、不占返工额度；发布后即可派工，不需要 Lead 再审批。
+6. 派 worker，phase="implement"：zcode 负责后端，qoder 负责前端产品代码；都按 PLAN-APPROVED.md + SPEC.md 实现并自测，写 REPORT.md。
+7. 派 gpt，phase="tech-review"：技术验收，附实际 diff 与测试证据，写 TECH-REVIEW.md。
+8. 技术验收 changes_requested → 把编号缺陷派回对应 worker，phase="rework"（技术返工额度 ${MAX_TECH_REWORK_ROUNDS} 轮，前后端共享、不因换人或规格修订重置；未扩展时第 4 轮暂停：先向用户说明阻塞点与已完成部分并等待决策，用户同意后调用 squad_extend(kind="tech", rounds=3, reason="用户批准的追加理由", confirmed=true) 追加轮次再派）。
+9. 技术验收 approved → 派 codex，phase="review"：业务验收，写 REVIEW.md。
+10. 业务验收 changes_requested → phase="rework"（业务返工额度 ${MAX_BUSINESS_REWORK_ROUNDS} 轮，与技术额度独立计数；业务返工改了代码后必须重新通过技术验收，再重新业务验收）。
+11. 两份验收都 approved 且仍然新鲜（代码/规格未再变动）→ squad_finish 收尾，随后向用户汇总交付结果。
 
 规则：
 - 你是组织者，不写业务代码；自己的改动只限协调文件与最终整合。
-- 两种批准相互独立：Lead 用 squad_approve_plan 批准的是「方案」，brain 在 REVIEW.md 给出的 VERDICT: APPROVED 批准的是「实现」；前者不能替代后者，收尾仍然只认 brain 验收。设计预算（默认初始 + ${MAX_DESIGN_REWORK_ROUNDS} 轮返工 = ${MAX_PLAN_ROUNDS} 次 design 派单）与实现返工预算（默认 ${MAX_REWORK_ROUNDS} 轮）也相互独立、分别计数，两类预算均可由用户决定追加。
-- 一个角色一个 agent。按能力选 worker：zcode 负责实现，qoder 负责并行或前端偏重的改动。
+- 三种批准相互独立：squad_approve_plan 批准的是「业务方案」，TECH-REVIEW.md 的 VERDICT: APPROVED 批准的是「技术」，REVIEW.md 的 VERDICT: APPROVED 批准的是「业务」；任何一个不能替代另一个。代码、规格或方案变动后旧结论失效，不能用旧批准收尾。
+- worker 不可用时可直接指定 gpt 接手实现（phase="implement"/"rework"）；${MAX_TECH_REWORK_ROUNDS} 轮技术返工仍未通过时先问用户是否继续，获准继续后直接派 gpt 接手，不需要再次确认选人。gpt 接手写代码后不能自签技术验收：tech-review 改派 codex 对照 SPEC.md 独立代签技术验收，业务验收仍由 codex 按业务方案单独签署，两份验收独立记录。
+- 一个角色一个 agent。按能力选 worker：zcode 负责后端实现，qoder 负责前端产品实现与自测。
 - 每次派单后结束当前回合，等队友的 squad_report 唤醒你；查看状态用 squad_status，只有必须在本回合阻塞时才用 squad_wait。
-- 队友在跑时不得声称完成；没有 brain 验收不得接受结果。
-- 同一个任务的实现返工默认最多 ${MAX_REWORK_ROUNDS} 轮；设计返工默认最多 ${MAX_DESIGN_REWORK_ROUNDS} 轮。任一到上限就暂停派单，先向用户说明阻塞点与已完成部分并等待决策；仅用户明确同意后调用 squad_extend(kind/rounds/reason/confirmed=true) 追加轮次再派单，每次扩展都要重新确认，可重复扩展，不自动续跑；用户拒绝或未回复时保持暂停。
-- 外部 provider（agent 配置里 provider 非空且不是 spawn/fork）走一次性派发：squad_dispatch 阻塞到它返回并把结果直接给你；它不会 squad_report，也不能续跑。返工=再派一次，必须重发 BRIEF 与缺陷清单。
+- 队友在跑时不得声称完成；没有双验收不得接受结果。
+- 技术返工与业务返工各自默认最多 3 轮、独立计数、互不重置。任一到上限就暂停派单，先向用户说明阻塞点与已完成部分并等待决策；仅用户明确同意后调用 squad_extend(kind="tech"/"business", rounds=3, reason="用户批准的追加理由", confirmed=true) 追加轮次再派单，每次扩展都要重新确认，可重复扩展，不自动续跑；用户拒绝或未回复时保持暂停。
+- 外部 provider（agent 配置里 provider 非空且不是 spawn/fork）走一次性派发：squad_dispatch 阻塞到它返回并把结果直接给你；它不会 squad_report，也不能续跑。返工=再派一次，必须重发 BRIEF 与编号缺陷。
 - 外部 agent 不共享你的会话上下文，只读共享文件；派单靠路径和编号，不要假设它记得上一轮。
 - 默认在 worktree 分支开发：squad_start 会创建新分支并切过去；不要在源 checkout 上直接改业务代码。
-- 收尾：brain approved 后调用 squad_finish（提交 worktree 改动、切回源目录、给出分支与合并命令）。
+- 收尾：双验收 approved 后调用 squad_finish（提交 worktree 改动、切回源目录、给出分支与合并命令）。
 - 队友共享你的工作目录与 .agent-squad 记忆，不要重复他们的工作。
 - 面向用户的回复必须使用用户所用的语言（用户用中文就用中文）；角色章程的语言不影响你回复用户的语言。`
 
@@ -137,15 +213,24 @@ const DEFAULT_AGENTS = [
   {
     name: 'codex',
     role: 'brain',
-    description: '负责方案设计与验收标准，并对实现做最终验收。',
+    description: '业务设计与验收：给出业务方案、对外行为与验收标准，并做业务验收。',
     provider: '',
+    context: 'fresh',
+    charter: '',
+  },
+  {
+    name: 'gpt',
+    role: 'architect',
+    description: '系统架构师：发布技术规格并做技术验收；可接手实现（不能自签技术验收）。',
+    provider: '',
+    model: 'openai/gpt-6.2-sol',
     context: 'fresh',
     charter: '',
   },
   {
     name: 'zcode',
     role: 'worker',
-    description: '后端执行者：后端代码的开发与测试。',
+    description: '后端 worker：实现后端代码并自测。',
     provider: '',
     context: 'fresh',
     charter: `后端执行者分工：
@@ -156,12 +241,12 @@ const DEFAULT_AGENTS = [
   {
     name: 'qoder',
     role: 'worker',
-    description: '前端执行者：仅前端代码测试。',
+    description: '前端 worker：实现前端产品代码并自测。',
     provider: '',
     context: 'fresh',
     charter: `前端执行者分工：
-- 仅负责前端代码的测试：编写/运行 UI 与组件测试、构建验证、复现并报告前端缺陷。
-- 边界：不改后端代码；前端缺陷修复仅限页面/样式/交互层，涉及接口契约的问题报告 Lead 转交 zcode。`,
+- 负责前端产品代码的实现：页面、样式、交互与前端状态，并编写/运行 UI 与组件测试、构建验证。
+- 边界：不改后端代码；涉及接口契约的问题报告 Lead 转交 zcode，不代改。`,
   },
 ]
 
@@ -180,6 +265,7 @@ function resolveSettings(input) {
   return {
     memoryDir: text(config.memoryDir, DEFAULT_MEMORY_DIR),
     brainCharter: text(config.brainCharter, BRAIN_CHARTER),
+    architectCharter: text(config.architectCharter, ARCHITECT_CHARTER),
     workerCharter: text(config.workerCharter, WORKER_CHARTER),
     agents,
     worktreeDir: text(config.worktreeDir, '.agents/worktrees'),
@@ -404,7 +490,7 @@ function configuredAgents(config) {
     seen.add(agentName)
     agents.push({
       name: agentName,
-      role: entry.role === 'brain' ? 'brain' : 'worker',
+      role: ['brain', 'architect', 'worker'].includes(entry.role) ? entry.role : 'worker',
       description: String(entry.description ?? ''),
       provider: String(entry.provider ?? ''),
       model: String(entry.model ?? ''),
@@ -417,7 +503,9 @@ function configuredAgents(config) {
 
 function charterFor(agent, config) {
   if (agent.charter) return agent.charter
-  return agent.role === 'brain' ? config.brainCharter : config.workerCharter
+  if (agent.role === 'brain') return config.brainCharter
+  if (agent.role === 'architect') return config.architectCharter
+  return config.workerCharter
 }
 
 function teammatePrompt(agent, config) {
@@ -425,10 +513,10 @@ function teammatePrompt(agent, config) {
 
 ${charterFor(agent, config)}
 
-共享记忆：每次派单都会给出共享目录。先读 TASK.md；PLAN.md、REVIEW.md、REPORT.md、JOURNAL.md 分别承载方案、验收结论、交付证据与历史。保持这些文件最新，队友才能不靠复述对话协作。
-- PLAN-APPROVED.md 是实现、返工与验收的唯一权威规格；PLAN.md 只用于设计，不能覆盖批准归档。
+共享记忆：每次派单都会给出共享目录。先读 TASK.md；PLAN.md、SPEC.md、TECH-REVIEW.md、REVIEW.md、REPORT.md、JOURNAL.md 分别承载业务方案、技术规格、技术验收、业务验收、交付证据与历史。保持这些文件最新，队友才能不靠复述对话协作。
+- PLAN-APPROVED.md 是业务方案与业务验收的唯一权威规格；SPEC.md 是技术实现、返工与技术验收的唯一权威规格；PLAN.md 只用于设计，不能覆盖批准归档。
 - 仅任务快照豁免方案门禁且无批准归档时，按 TASK.md 与 Lead 本轮派单执行；仍须逐条 AC 留证。
-- AC 映射：沿用 TASK.md 的 AC 编号；未编号时按条目顺序从 AC1 开始编号。PLAN.md 为每条 AC 指定改动文件、测试名、验证命令与期望值；REPORT.md/REVIEW.md 按批准方案逐条记录 AC 编号、文件路径、测试名、命令、退出码、关键输出与结论。
+- AC 映射：沿用 TASK.md 的 AC 编号；未编号时按条目顺序从 AC1 开始编号。PLAN.md/SPEC.md 为每条 AC 指定改动文件、测试名、验证命令与期望值；REPORT.md/TECH-REVIEW.md/REVIEW.md 按对应规格逐条记录 AC 编号、文件路径、测试名、命令、退出码、关键输出与结论。
 
 汇报：任务完成、受阻或验收结束时，调用一次 squad_report，带上 status、简短总结和改动文件。Lead 会被这条报告唤醒。不要创建队友或重新分配工作。`
 }
@@ -439,7 +527,7 @@ function repoLines(worktrees) {
   )
 }
 
-function renderTask({ taskId, goal, acceptance, constraints, participants, taskDir, worktree, worktrees = [], workspace }) {
+function renderTask({ taskId, goal, acceptance, constraints, participants, taskDir, worktree, worktrees = [], workspace, flowInfo }) {
   const members = participants
     .map((agent) => `| ${agent.displayName} (${agent.name}) | ${agent.role} | ${agent.executor}${agent.model ? ` · ${agent.model}` : ''} | ${clip(agent.description, 80) || '—'} |`)
     .join('\n')
@@ -460,6 +548,38 @@ function renderTask({ taskId, goal, acceptance, constraints, participants, taskD
   } else {
     workspaceBlock = '- 原地开发（未创建 worktree）。'
   }
+  const full = flowInfo?.specRequired === true
+  const protocol = full
+    ? [
+        '- 任何派单动手前先读本文件。',
+        '- 流程（完整）：brain 业务方案 → Lead 审核批准 → architect 技术规格 → worker 实现自测 → 技术验收 → 业务验收 → 收尾。插件强制门禁，不自动派发后续阶段。',
+        '- Lead 先审方案再实现：`brain` 写 `PLAN.md`（业务方案 + 编号验收标准）后由 Lead 审核并用 `squad_approve_plan` 批准（Lead 只批准**业务方案**，归档 `PLAN-APPROVED.md`）；设计问题须带编号缺陷再派 `phase="design"` 返工；默认初始设计 + 3 轮返工 = 4 次 design 派单，未扩展时第 5 次暂停：先向用户说明阻塞点与已完成部分并等待决策，用户同意后调用 squad_extend(kind="design", rounds=3, reason="用户批准的追加理由", confirmed=true) 追加轮次再派 design；每次扩展都要重新取得用户明确确认，可重复扩展，不自动续跑；用户拒绝或未回复时保持暂停。未批准前不派 implement/rework/spec（无 brain 任务豁免）。',
+        '- `architect` 写 `SPEC.md`（技术规格：代码结构、模块职责、表与迁移、领域模型、接口与错误、验证用例；不适用处明确说明）。规格有问题由 worker 上报、gpt 修订发布版本；单纯澄清不扣返工额度，也不重置已用额度；发布后即可派工，不需要 Lead 再审批。若必须改业务预期，暂停受影响工作，交给用户决策。',
+        '- `worker` 写 `REPORT.md`（改动、执行的命令、测试证据）；zcode 负责后端，qoder 负责前端产品代码与自测。',
+        '- 技术验收：`architect` 对照当前 `SPEC.md` 做代码审查、亲自运行验证测试，写 `TECH-REVIEW.md`（最后一行 `VERDICT: APPROVED` 或 `VERDICT: CHANGES_REQUESTED`）。技术返工默认 3 轮（前后端共享、不因换人或规格修订重置），未扩展时第 4 轮暂停：先向用户说明阻塞点与已完成部分并等待决策，用户同意后调用 squad_extend(kind="tech", rounds=3, reason="用户批准的追加理由", confirmed=true) 追加轮次再派；每次扩展都要重新取得用户明确确认，可重复扩展，不自动续跑；用户拒绝或未回复时保持暂停。',
+        '- 业务验收：`brain` 以 `PLAN-APPROVED.md` 为唯一业务规格写 `REVIEW.md`（最后一行 `VERDICT: APPROVED` 或 `VERDICT: CHANGES_REQUESTED`），与技术验收相互独立、不能互相替代。业务返工默认 3 轮（与技术额度独立计数），未扩展时第 4 轮暂停：先向用户说明阻塞点与已完成部分并等待决策，用户同意后调用 squad_extend(kind="business", rounds=3, reason="用户批准的追加理由", confirmed=true) 追加轮次再派；每次扩展都要重新取得用户明确确认，可重复扩展，不自动续跑；用户拒绝或未回复时保持暂停。业务返工改了代码后必须重新通过技术验收。',
+        '- 验收记录与同一版候选代码、业务方案与技术规格对应：任一变化使旧结论失效，不能用旧批准收尾。',
+        '- worker 不可用时 Lead 可直接指定 `architect` 接手实现；接手写代码后不能签署自己改动的技术验收，由 `brain` 对照 SPEC.md 独立代签技术验收，再单独签署业务验收（两份独立记录）。',
+        '- PLAN-APPROVED.md 是业务方案与业务验收的唯一权威规格；SPEC.md 是技术实现、返工与技术验收的唯一权威规格；PLAN.md 只用于设计，不能覆盖批准归档。',
+        '- 仅任务快照豁免方案门禁且无批准归档时，按 TASK.md 与 Lead 本轮派单执行；仍须逐条 AC 留证。',
+        '- AC 映射：沿用 TASK.md 的 AC 编号；未编号时按条目顺序从 AC1 开始编号。PLAN.md/SPEC.md 为每条 AC 指定改动文件、测试名、验证命令与期望值；REPORT.md/TECH-REVIEW.md/REVIEW.md 按对应规格逐条记录 AC 编号、文件路径、测试名、命令、退出码、关键输出与结论。',
+        '- 每个成员在调用 `squad_report` 前，向 `JOURNAL.md` 追加一条简短记录。',
+        `- 收尾需要技术验收与业务验收都以 \`VERDICT: APPROVED\` 结束且仍然新鲜；Lead 在双验收 approved 后调用 squad_finish。`,
+        `- 记忆目录：\`${taskDir}\``,
+      ].join('\n')
+    : [
+        '- 任何派单动手前先读本文件。',
+        '- 流程（简化/兼容）：brain 方案 → Lead 审核批准 → worker 实现 → brain 验收 → 收尾；无技术规格/技术验收门禁。',
+        '- Lead 先审方案再实现：`brain` 写 `PLAN.md` 后由 Lead 审核并用 `squad_approve_plan` 批准（Lead 只批准**方案**，归档 `PLAN-APPROVED.md`）；设计问题须带编号缺陷再派 `phase="design"` 返工；默认初始设计 + 3 轮返工 = 4 次 design 派单，未扩展时第 5 次暂停：先向用户说明阻塞点与已完成部分并等待决策，用户同意后调用 squad_extend(kind="design", rounds=3, reason="用户批准的追加理由", confirmed=true) 追加轮次再派 design；每次扩展都要重新取得用户明确确认，可重复扩展，不自动续跑；用户拒绝或未回复时保持暂停。未批准前不派 implement/rework（无 brain 任务豁免）。',
+        '- `brain` 写 `PLAN.md`（方案 + 编号验收标准）与 `REVIEW.md`（逐条结论与证据）。',
+        '- `worker` 写 `REPORT.md`（改动、执行的命令、测试证据）。',
+        '- PLAN-APPROVED.md 是业务方案与业务验收的唯一权威规格；SPEC.md 是技术实现、返工与技术验收的唯一权威规格；PLAN.md 只用于设计，不能覆盖批准归档。',
+        '- 仅任务快照豁免方案门禁且无批准归档时，按 TASK.md 与 Lead 本轮派单执行；仍须逐条 AC 留证。',
+        '- AC 映射：沿用 TASK.md 的 AC 编号；未编号时按条目顺序从 AC1 开始编号。PLAN.md/SPEC.md 为每条 AC 指定改动文件、测试名、验证命令与期望值；REPORT.md/TECH-REVIEW.md/REVIEW.md 按对应规格逐条记录 AC 编号、文件路径、测试名、命令、退出码、关键输出与结论。',
+        '- 每个成员在调用 `squad_report` 前，向 `JOURNAL.md` 追加一条简短记录。',
+        '- 实现验收只有 `brain` 能批准（`REVIEW.md` 以 `VERDICT: APPROVED` 结束），与 Lead 的方案批准相互独立；实现返工独立计数，默认 3 轮，未扩展时第 4 次暂停：先向用户说明阻塞点与已完成部分并等待决策，用户同意后调用 squad_extend(kind="implement", rounds=3, reason="用户批准的追加理由", confirmed=true) 追加轮次再派 rework；每次扩展都要重新取得用户明确确认，可重复扩展，不自动续跑；用户拒绝或未回复时保持暂停。Lead 在 brain 批准后收尾。',
+        `- 记忆目录：\`${taskDir}\``,
+      ].join('\n')
   return `# 小队任务 \`${taskId}\`
 
 ## 目标
@@ -480,16 +600,7 @@ ${workspaceBlock}
 
 ## 共享记忆协议
 
-- 任何派单动手前先读本文件。
-- Lead 先审方案再实现：\`brain\` 写 \`PLAN.md\` 后由 Lead 审核并用 \`squad_approve_plan\` 批准（Lead 只批准**方案**，归档 \`PLAN-APPROVED.md\`）；设计问题须带编号缺陷再派 \`phase="design"\` 返工；默认初始设计 + 3 轮返工 = 4 次 design 派单，未扩展时第 5 次暂停：先向用户说明阻塞点与已完成部分并等待决策，用户同意后调用 squad_extend(kind="design", rounds=3, reason="用户批准的追加理由", confirmed=true) 追加轮次再派 design；每次扩展都要重新取得用户明确确认，可重复扩展，不自动续跑；用户拒绝或未回复时保持暂停。未批准前不派 implement/rework（无 brain 任务豁免）。
-- \`brain\` 写 \`PLAN.md\`（方案 + 编号验收标准）与 \`REVIEW.md\`（逐条结论与证据）。
-- \`worker\` 写 \`REPORT.md\`（改动、执行的命令、测试证据）。
-- PLAN-APPROVED.md 是实现、返工与验收的唯一权威规格；PLAN.md 只用于设计，不能覆盖批准归档。
-- 仅任务快照豁免方案门禁且无批准归档时，按 TASK.md 与 Lead 本轮派单执行；仍须逐条 AC 留证。
-- AC 映射：沿用 TASK.md 的 AC 编号；未编号时按条目顺序从 AC1 开始编号。PLAN.md 为每条 AC 指定改动文件、测试名、验证命令与期望值；REPORT.md/REVIEW.md 按批准方案逐条记录 AC 编号、文件路径、测试名、命令、退出码、关键输出与结论。
-- 每个成员在调用 \`squad_report\` 前，向 \`JOURNAL.md\` 追加一条简短记录。
-- 实现验收只有 \`brain\` 能批准（\`REVIEW.md\` 以 \`VERDICT: APPROVED\` 结束），与 Lead 的方案批准相互独立；实现返工独立计数，默认 3 轮，未扩展时第 4 次暂停：先向用户说明阻塞点与已完成部分并等待决策，用户同意后调用 squad_extend(kind="implement", rounds=3, reason="用户批准的追加理由", confirmed=true) 追加轮次再派 rework；每次扩展都要重新取得用户明确确认，可重复扩展，不自动续跑；用户拒绝或未回复时保持暂停。Lead 在 brain 批准后收尾。
-- 记忆目录：\`${taskDir}\`
+${protocol}
 
 ## 成员
 
@@ -499,22 +610,41 @@ ${members}
 `
 }
 
+function deliverableOf(agent, phase) {
+  if (agent.role === 'brain') {
+    return phase === 'review'
+      ? '业务验收轮以 PLAN-APPROVED.md 为唯一业务规格写 REVIEW.md，逐条 AC 给结论与证据；需要时代签技术验收（TECH-REVIEW.md，对照 SPEC.md）。'
+      : '设计轮写 PLAN.md 的业务方案与 AC 映射（对外行为、用户可见结果、边界场景、验收标准）。'
+  }
+  if (agent.role === 'architect') {
+    if (phase === 'spec') return '发布/修订技术规格 SPEC.md（代码结构、模块职责、表与迁移、领域模型、接口与错误、验证用例；不适用处明确说明），版本号以派单为准。'
+    if (phase === 'tech-review') return '技术验收轮以当前 SPEC.md 为唯一技术规格写 TECH-REVIEW.md：代码审查、亲自运行验证测试、逐条记录命令/退出码/关键输出与编号缺陷，最后一行 VERDICT。'
+    return '写 REPORT.md，按 PLAN-APPROVED.md + SPEC.md 逐条 AC 记录改动、测试名、命令、退出码、关键输出与结论（接手实现时按 worker 规程执行并自测）。'
+  }
+  return '写 REPORT.md，按 PLAN-APPROVED.md + SPEC.md 逐条 AC 记录改动、测试名、命令、退出码、关键输出与结论；豁免任务按 TASK.md 与 Lead 本轮派单逐条 AC 留证。'
+}
+
 function renderDispatch({ taskId, taskDir, phase, round, agent, message, includeCharter, config, workspace, worktrees = [] }) {
-  const deliverable =
-    agent.role === 'brain'
-      ? '设计轮写 PLAN.md 的可执行规格与 AC 映射；验收轮依据 PLAN-APPROVED.md 写 REVIEW.md，逐条 AC 给结论与证据。'
-      : '写 REPORT.md，按 PLAN-APPROVED.md 逐条 AC 记录改动、测试名、命令、退出码、关键输出与结论；豁免任务按 TASK.md 与 Lead 本轮派单逐条 AC 留证。'
+  const deliverable = deliverableOf(agent, phase)
   const charter = includeCharter ? `\n角色章程：\n${charterFor(agent, config)}\n` : ''
   const repoBlock = worktrees.length > 1 ? `${repoLines(worktrees).join('\n')}\n` : ''
+  const readHint =
+    phase === 'spec'
+      ? '先读 TASK.md 与 PLAN-APPROVED.md；spec 轮读取既有 SPEC.md（存在时）；读取 JOURNAL.md 最后 80 行。'
+      : phase === 'tech-review'
+        ? '先读 TASK.md；读取 SPEC.md、REPORT.md 与 TECH-REVIEW.md（存在时）；读取 JOURNAL.md 最后 80 行。'
+        : phase === 'review'
+          ? '先读 TASK.md；读取 PLAN-APPROVED.md、REPORT.md 与 TECH-REVIEW.md（存在时）；读取 JOURNAL.md 最后 80 行。'
+          : '先读 TASK.md；设计轮读取 PLAN.md（存在时）；实现/返工读取 SPEC.md；读取 JOURNAL.md 最后 80 行。'
   return `[Agent Squad] task=${taskId} phase=${phase} round=${round} role=${agent.role}
 ${charter}
 共享记忆：${taskDir}
 工作区：${workspace}
 ${repoBlock}（只在工作区内改动；动手前先确认 pwd 与它一致，不要写回源 checkout。）
-先读 TASK.md；设计轮读取 PLAN.md（存在时）；读取 JOURNAL.md 最后 80 行。
-- PLAN-APPROVED.md 是实现、返工与验收的唯一权威规格；PLAN.md 只用于设计，不能覆盖批准归档。
+${readHint}
+- PLAN-APPROVED.md 是业务方案与业务验收的唯一权威规格；SPEC.md 是技术实现、返工与技术验收的唯一权威规格；PLAN.md 只用于设计，不能覆盖批准归档。
 - 仅任务快照豁免方案门禁且无批准归档时，按 TASK.md 与 Lead 本轮派单执行；仍须逐条 AC 留证。
-- AC 映射：沿用 TASK.md 的 AC 编号；未编号时按条目顺序从 AC1 开始编号。PLAN.md 为每条 AC 指定改动文件、测试名、验证命令与期望值；REPORT.md/REVIEW.md 按批准方案逐条记录 AC 编号、文件路径、测试名、命令、退出码、关键输出与结论。
+- AC 映射：沿用 TASK.md 的 AC 编号；未编号时按条目顺序从 AC1 开始编号。PLAN.md/SPEC.md 为每条 AC 指定改动文件、测试名、验证命令与期望值；REPORT.md/TECH-REVIEW.md/REVIEW.md 按对应规格逐条记录 AC 编号、文件路径、测试名、命令、退出码、关键输出与结论。
 
 Lead 的本轮派单：
 ${message}
@@ -533,7 +663,7 @@ function formatMembers(members) {
 }
 
 async function fileSummary(taskDir) {
-  const names = ['TASK.md', 'PLAN.md', 'REVIEW.md', 'REPORT.md', 'JOURNAL.md']
+  const names = ['TASK.md', 'PLAN.md', 'SPEC.md', 'TECH-REVIEW.md', 'REVIEW.md', 'REPORT.md', 'JOURNAL.md']
   const parts = []
   for (const fileName of names) {
     try {
@@ -550,10 +680,14 @@ async function fileSummary(taskDir) {
 /** Deterministic one-page brief; the only file an external agent must read first. */
 async function writeBrief({ taskDir, state, agent, phase, round }) {
   const budget = budgetOf(state)
+  const flow = flowOf(state)
+  const reworkLine = flow.specRequired
+    ? `rework: tech=${state.techReworkRounds ?? 0}/${budget.techLimit} business=${state.businessReworkRounds ?? 0}/${budget.businessLimit}`
+    : `rework=${state.reworkRounds ?? 0}/${budget.reworkLimit}`
   const lines = [
     `# BRIEF · ${state.taskId}`,
     '',
-    `phase=${phase} round=${round} rework=${state.reworkRounds ?? 0}/${budget.reworkLimit}`,
+    `phase=${phase} round=${round} ${reworkLine}`,
     `agent=${agent.name} role=${agent.role}`,
     '',
     '## 目标 / 验收 / 约束',
@@ -562,19 +696,19 @@ async function writeBrief({ taskDir, state, agent, phase, round }) {
     '## 必读',
     '- TASK.md',
     '- PLAN.md（仅设计轮；存在时）',
-    '- PLAN-APPROVED.md（实现、返工与验收；豁免且无归档时按 TASK.md 与本轮派单）',
-    '- REVIEW.md（存在时：上一轮验收结论）',
+    '- PLAN-APPROVED.md（业务方案；实现、返工与验收；豁免且无归档时按 TASK.md 与本轮派单）',
+    '- SPEC.md（技术规格；spec/实现/返工/技术验收轮）',
+    '- TECH-REVIEW.md（存在时：上一轮技术验收结论）',
+    '- REVIEW.md（存在时：上一轮业务验收结论）',
     '- REPORT.md（存在时：实现证据）',
     '- JOURNAL.md 最后 40 行',
     '',
-    '- PLAN-APPROVED.md 是实现、返工与验收的唯一权威规格；PLAN.md 只用于设计，不能覆盖批准归档。',
+    '- PLAN-APPROVED.md 是业务方案与业务验收的唯一权威规格；SPEC.md 是技术实现、返工与技术验收的唯一权威规格；PLAN.md 只用于设计，不能覆盖批准归档。',
     '- 仅任务快照豁免方案门禁且无批准归档时，按 TASK.md 与 Lead 本轮派单执行；仍须逐条 AC 留证。',
-    '- AC 映射：沿用 TASK.md 的 AC 编号；未编号时按条目顺序从 AC1 开始编号。PLAN.md 为每条 AC 指定改动文件、测试名、验证命令与期望值；REPORT.md/REVIEW.md 按批准方案逐条记录 AC 编号、文件路径、测试名、命令、退出码、关键输出与结论。',
+    '- AC 映射：沿用 TASK.md 的 AC 编号；未编号时按条目顺序从 AC1 开始编号。PLAN.md/SPEC.md 为每条 AC 指定改动文件、测试名、验证命令与期望值；REPORT.md/TECH-REVIEW.md/REVIEW.md 按对应规格逐条记录 AC 编号、文件路径、测试名、命令、退出码、关键输出与结论。',
     '',
     '## 交付',
-    agent.role === 'brain'
-      ? '- 设计轮写 PLAN.md；验收轮写 REVIEW.md（逐条 AC + 证据）'
-      : '- 写 REPORT.md（逐条 AC：文件路径、测试名、命令、退出码、关键输出与结论）',
+    `- ${deliverableOf(agent, phase)}`,
     '- 只回复 ≤150 字摘要 + 文件路径，不回贴正文',
   ]
   await writeFile(join(taskDir, 'BRIEF.md'), `${lines.join('\n')}\n`, 'utf8')
@@ -584,18 +718,30 @@ async function writeBrief({ taskDir, state, agent, phase, round }) {
 function dispatchPrompt({ mode, taskId, taskDir, phase, round, agent, message, workspace, config, includeCharter = true, worktrees = [] }) {
   const charter = includeCharter ? `\n角色章程：\n${charterFor(agent, config)}\n` : ''
   const repoBlock = worktrees.length > 1 ? `${repoLines(worktrees).join('\n')}\n` : ''
+  const deliverFile =
+    agent.role === 'brain'
+      ? phase === 'review'
+        ? 'REVIEW.md（需要时代签 TECH-REVIEW.md）'
+        : 'PLAN.md'
+      : agent.role === 'architect'
+        ? phase === 'spec'
+          ? 'SPEC.md'
+          : phase === 'tech-review'
+            ? 'TECH-REVIEW.md'
+            : 'REPORT.md'
+        : 'REPORT.md'
   return `[Agent Squad · ${mode}] task=${taskId} phase=${phase} round=${round} role=${agent.role}
 工作区：${workspace}
 ${repoBlock}共享记忆：${taskDir}
-先读 BRIEF.md 与 TASK.md；设计轮读取 PLAN.md（存在时），实现、返工与验收读取 PLAN-APPROVED.md；按需读取 REVIEW.md / REPORT.md。
+先读 BRIEF.md 与 TASK.md；设计轮读取 PLAN.md（存在时），spec 轮读取 PLAN-APPROVED.md 与既有 SPEC.md，实现、返工与验收读取 PLAN-APPROVED.md + SPEC.md；按需读取 TECH-REVIEW.md / REVIEW.md / REPORT.md。
 ${charter}
-- PLAN-APPROVED.md 是实现、返工与验收的唯一权威规格；PLAN.md 只用于设计，不能覆盖批准归档。
+- PLAN-APPROVED.md 是业务方案与业务验收的唯一权威规格；SPEC.md 是技术实现、返工与技术验收的唯一权威规格；PLAN.md 只用于设计，不能覆盖批准归档。
 - 仅任务快照豁免方案门禁且无批准归档时，按 TASK.md 与 Lead 本轮派单执行；仍须逐条 AC 留证。
-- AC 映射：沿用 TASK.md 的 AC 编号；未编号时按条目顺序从 AC1 开始编号。PLAN.md 为每条 AC 指定改动文件、测试名、验证命令与期望值；REPORT.md/REVIEW.md 按批准方案逐条记录 AC 编号、文件路径、测试名、命令、退出码、关键输出与结论。
+- AC 映射：沿用 TASK.md 的 AC 编号；未编号时按条目顺序从 AC1 开始编号。PLAN.md/SPEC.md 为每条 AC 指定改动文件、测试名、验证命令与期望值；REPORT.md/TECH-REVIEW.md/REVIEW.md 按对应规格逐条记录 AC 编号、文件路径、测试名、命令、退出码、关键输出与结论。
 本轮交办：
 ${message}
 
-交付：把结果写入 ${agent.role === 'brain' ? 'PLAN.md（验收轮写 REVIEW.md）' : 'REPORT.md'}；只回复 ≤150 字摘要 + 文件路径，不要回贴全文。`
+交付：把结果写入 ${deliverFile}；只回复 ≤150 字摘要 + 文件路径，不要回贴全文。`
 }
 
 /** Best-effort Codex token read from the newest session rollout touched after `since`. */
@@ -654,6 +800,12 @@ function createTools(ctx, config, runtime, store) {
           items: { type: 'string' },
           description: 'Subset of configured teammate names. Defaults to every configured agent.',
         },
+        flow: {
+          type: 'string',
+          enum: ['full', 'simple'],
+          description:
+            'Task flow. "full" (default): business plan → Lead approval → technical spec → implementation → technical acceptance → business acceptance. "simple": legacy gates only; choose it explicitly for non-code tasks.',
+        },
         repos: {
           type: 'array',
           items: { type: 'string', minLength: 1 },
@@ -702,6 +854,19 @@ function createTools(ctx, config, runtime, store) {
         ? requested.filter((wanted) => !roster.some((agent) => agent.name === wanted))
         : []
       const taskId = newTaskId()
+      // Flow snapshot at creation: `full` requires an architect participant to
+      // publish the technical spec; without one the task keeps the legacy
+      // gates and the start output says so. Legacy states (created before
+      // flows existed) read as legacy through flowOf().
+      const requestedFlow = args.flow === 'simple' ? 'simple' : 'full'
+      const hasBrain = participants.some((agent) => agent.role === 'brain')
+      const hasArchitect = participants.some((agent) => agent.role === 'architect')
+      const specRequired = requestedFlow === 'full' && hasArchitect
+      const flowInfo = {
+        flow: specRequired ? 'full' : requestedFlow,
+        specRequired,
+        downgraded: requestedFlow === 'full' && !hasArchitect,
+      }
 
       // --- explicit multi/single repository path (strict, no fallback) -------
       if (args.repos !== undefined) {
@@ -777,6 +942,7 @@ function createTools(ctx, config, runtime, store) {
               worktree: worktrees[0],
               worktrees,
               workspace: taskRoot,
+              flowInfo,
             }),
             'utf8',
           )
@@ -787,6 +953,18 @@ function createTools(ctx, config, runtime, store) {
             phase: 'design',
             round: 1,
             reworkRounds: 0,
+            flow: requestedFlow,
+            specRequired,
+            specPublished: false,
+            specVersion: 0,
+            codeEpoch: 0,
+            implementers: [],
+            techReview: null,
+            businessReview: null,
+            techReworkRounds: 0,
+            techReworkLimit: MAX_TECH_REWORK_ROUNDS,
+            businessReworkRounds: 0,
+            businessReworkLimit: MAX_BUSINESS_REWORK_ROUNDS,
             participants: participants.map((agent) => agent.name),
             gate: {
               reviewRequired: participants.some((agent) => agent.role === 'brain'),
@@ -880,11 +1058,17 @@ function createTools(ctx, config, runtime, store) {
           )
         }
         if (missing.length > 0) lines.push(`已忽略未配置的 agent：${missing.join(', ')}`)
-        if (!participants.some((agent) => agent.role === 'brain')) {
+        lines.push(`流程：${specRequired ? 'full（业务方案 → 技术规格 → 实现 → 技术验收 → 业务验收）' : requestedFlow === 'simple' ? 'simple（简化：无技术规格/双验收门禁）' : 'simple（兼容：未配置 architect，自动降级）'}`)
+        if (flowInfo.downgraded) {
+          lines.push('警告：没有 architect 参与，完整流程无法启用：本次任务按简化规则执行（无技术规格与技术验收门禁）。')
+        }
+        if (!hasBrain) {
           lines.push('警告：没有 brain 参与，任务豁免 PLAN 审批门禁，也无法获得最终的设计/验收评审。')
         }
         lines.push(
-          `下一步：squad_dispatch({ agent: "<name>", phase: "design", message: "<派单内容>" })；Lead 审核 PLAN.md 后用 squad_approve_plan 批准，再进入 implement。`,
+          specRequired
+            ? '下一步：squad_dispatch({ agent: "codex", phase: "design" }) 写业务方案；Lead 审核后 squad_approve_plan 批准，再派 gpt phase="spec" 发布技术规格，之后才允许 implement。'
+            : '下一步：squad_dispatch({ agent: "<name>", phase: "design", message: "<派单内容>" })；Lead 审核 PLAN.md 后用 squad_approve_plan 批准，再进入 implement。',
         )
         return lines.join('\n')
       }
@@ -936,6 +1120,7 @@ function createTools(ctx, config, runtime, store) {
           worktree,
           worktrees: worktree ? [{ ...worktree, repo: worktree.repositoryRoot }] : [],
           workspace: worktree ? worktree.path : undefined,
+          flowInfo,
         }),
         'utf8',
       )
@@ -946,6 +1131,18 @@ function createTools(ctx, config, runtime, store) {
         phase: 'design',
         round: 1,
         reworkRounds: 0,
+        flow: requestedFlow,
+        specRequired,
+        specPublished: false,
+        specVersion: 0,
+        codeEpoch: 0,
+        implementers: [],
+        techReview: null,
+        businessReview: null,
+        techReworkRounds: 0,
+        techReworkLimit: MAX_TECH_REWORK_ROUNDS,
+        businessReworkRounds: 0,
+        businessReworkLimit: MAX_BUSINESS_REWORK_ROUNDS,
         participants: participants.map((agent) => agent.name),
         // Acceptance gate snapshotted at task creation: later role edits cannot
         // relax the review requirement for this task (R09).
@@ -1003,11 +1200,17 @@ function createTools(ctx, config, runtime, store) {
         )
       }
       if (missing.length > 0) lines.push(`已忽略未配置的 agent：${missing.join(', ')}`)
-      if (!participants.some((agent) => agent.role === 'brain')) {
+      lines.push(`流程：${specRequired ? 'full（业务方案 → 技术规格 → 实现 → 技术验收 → 业务验收）' : requestedFlow === 'simple' ? 'simple（简化：无技术规格/双验收门禁）' : 'simple（兼容：未配置 architect，自动降级）'}`)
+      if (flowInfo.downgraded) {
+        lines.push('警告：没有 architect 参与，完整流程无法启用：本次任务按简化规则执行（无技术规格与技术验收门禁）。')
+      }
+      if (!hasBrain) {
         lines.push('警告：没有 brain 参与，任务豁免 PLAN 审批门禁，也无法获得最终的设计/验收评审。')
       }
       lines.push(
-        `下一步：squad_dispatch({ agent: "<name>", phase: "design", message: "<派单内容>" })；Lead 审核 PLAN.md 后用 squad_approve_plan 批准，再进入 implement。`,
+        specRequired
+          ? '下一步：squad_dispatch({ agent: "codex", phase: "design" }) 写业务方案；Lead 审核后 squad_approve_plan 批准，再派 gpt phase="spec" 发布技术规格，之后才允许 implement。'
+          : '下一步：squad_dispatch({ agent: "<name>", phase: "design", message: "<派单内容>" })；Lead 审核 PLAN.md 后用 squad_approve_plan 批准，再进入 implement。',
       )
       return lines.join('\n')
     },
@@ -1028,8 +1231,15 @@ function createTools(ctx, config, runtime, store) {
         },
         phase: {
           type: 'string',
-          enum: ['design', 'implement', 'review', 'rework'],
-          description: 'Pipeline phase. Use rework when sending review defects back to the worker.',
+          enum: ['design', 'spec', 'implement', 'tech-review', 'review', 'rework'],
+          description:
+            'Pipeline phase. Full flow: design (business plan) → spec (technical spec, architect) → implement → tech-review (architect) → review (business, brain). Use rework when sending acceptance defects back to a worker.',
+        },
+        rework_kind: {
+          type: 'string',
+          enum: ['tech', 'business'],
+          description:
+            'Full-flow rework quota to consume: "tech" (technical acceptance defects) or "business". Optional; defaults to the freshest failing acceptance.',
         },
         task_id: { type: 'string', description: 'Task id; defaults to the current task.' },
       },
@@ -1058,13 +1268,53 @@ function createTools(ctx, config, runtime, store) {
       if (!state) throw new Error(`未知小队任务 "${taskId}"。先调用 squad_start。`)
 
       const phase = args.phase ?? 'design'
+      const flow = flowOf(state)
       const treeRows = await treeRowsOf(ctx, lead, exec.signal)
       const existing = treeRows.find(
         (row) => (row.name ?? row.label ?? String(row.id)) === target.name,
       )
       const priorRework = Number(state.reworkRounds ?? 0)
       const budget = budgetOf(state)
-      if (phase === 'rework' && priorRework >= budget.reworkLimit) {
+      // Full-flow rework: resolve which acceptance the defects come from and
+      // check that quota; legacy tasks keep the single implement quota. All
+      // refusals happen before any shared file or state mutation.
+      let reworkKind = null
+      if (phase === 'rework' && flow.specRequired) {
+        const techVerdict = await readVerdict(taskDir, 'TECH-REVIEW.md')
+        const businessVerdict = await readVerdict(taskDir, 'REVIEW.md')
+        const businessPending =
+          bindingFresh(state.businessReview, state) && businessVerdict === 'CHANGES_REQUESTED'
+        const techPending =
+          bindingFresh(state.techReview, state) && techVerdict === 'CHANGES_REQUESTED'
+        if (args.rework_kind !== undefined) {
+          if (args.rework_kind !== 'tech' && args.rework_kind !== 'business') {
+            throw new Error('rework_kind 必须是 tech 或 business。')
+          }
+          reworkKind = args.rework_kind
+          const pending = reworkKind === 'business' ? businessPending : techPending
+          if (!pending) {
+            throw new Error(
+              `没有待返工的${reworkKind === 'business' ? '业务' : '技术'}验收结论：对应验收未给出 CHANGES_REQUESTED，或结论已因代码/规格变动失效。`,
+            )
+          }
+        } else if (businessPending) {
+          reworkKind = 'business'
+        } else if (techPending) {
+          reworkKind = 'tech'
+        } else {
+          throw new Error(
+            '没有待返工的验收结论：先派 tech-review/review 得到 CHANGES_REQUESTED，或确认验收结论未因后续代码/规格变动失效。',
+          )
+        }
+        const used = reworkKind === 'business' ? budget.businessUsed : budget.techUsed
+        const limit = reworkKind === 'business' ? budget.businessLimit : budget.techLimit
+        if (used >= limit) {
+          throw new Error(
+            `${reworkKind === 'business' ? '业务' : '技术'}返工已达上限 ${limit} 轮（已用 ${used}）。先向用户说明阻塞点与已完成部分并等待决策；用户同意后调用 squad_extend(kind="${reworkKind}", confirmed=true, reason="用户批准的追加理由") 追加轮次，再派 rework；用户拒绝或未回复时保持暂停，不得自动续跑。`,
+          )
+        }
+      }
+      if (phase === 'rework' && !flow.specRequired && priorRework >= budget.reworkLimit) {
         throw new Error(
           `返工已达上限 ${budget.reworkLimit} 轮（已用 ${budget.implementUsed}）。先向用户说明阻塞点与已完成部分并等待决策；用户同意后调用 squad_extend(kind="implement", confirmed=true, reason="用户批准的追加理由") 追加轮次，再派 rework；用户拒绝或未回复时保持暂停，不得自动续跑。`,
         )
@@ -1138,17 +1388,18 @@ function createTools(ctx, config, runtime, store) {
           }
         }
       }
-      // Plan gate, checked before any shared file (BRIEF) is written or an
+      // Phase gates, checked before any shared file (BRIEF) is written or an
       // executor is called, so a refusal leaves STATE/BRIEF/dispatch records
       // untouched. Design is refused once the PLAN is approved or the design
       // budget (initial + 3 rework rounds) is spent; implement/rework are
-      // refused until the Lead approves PLAN.md. Tasks without a brain
-      // participant are exempt (planRequired snapshot).
+      // refused until the Lead approves PLAN.md and (full flow) the architect
+      // has published SPEC.md. Tasks without a brain participant are exempt
+      // from the plan gate (planRequired snapshot).
       const plan = planGateOf(state)
       if (phase === 'design') {
         if (plan.planApproved) {
           throw new Error(
-            `任务 ${taskId} 的 PLAN 已批准（${plan.planApprovedAt ?? '?'}）：不能再派 design 返工，请进入 implement。`,
+            `任务 ${taskId} 的 PLAN 已批准（${plan.planApprovedAt ?? '?'}）：不能再派 design 返工，请派 architect 发布技术规格（phase="spec"）。`,
           )
         }
         if (plan.planRounds >= budget.designLimit) {
@@ -1157,10 +1408,73 @@ function createTools(ctx, config, runtime, store) {
           )
         }
       }
-      if ((phase === 'implement' || phase === 'rework') && plan.planRequired && !plan.planApproved) {
-        throw new Error(
-          `任务 ${taskId} 的 PLAN.md 尚未经 Lead 审核批准（planRounds=${plan.planRounds}/${budget.designLimit}）。先审核 PLAN.md 并调用 squad_approve_plan，再派 ${phase}。`,
-        )
+      if (phase === 'spec') {
+        if (!flow.specRequired) {
+          throw new Error(
+            `任务 ${taskId} 未启用完整流程（没有 architect 参与，或创建时选择了 flow="simple"）：不能派 spec，直接按简化流程派单。`,
+          )
+        }
+        if (target.role !== 'architect') {
+          throw new Error(`spec 阶段只能派 architect 角色；${target.name} 当前是 ${target.role}。`)
+        }
+        if (plan.planRequired && !plan.planApproved) {
+          throw new Error(
+            `任务 ${taskId} 的业务方案（PLAN.md）尚未经 Lead 审核批准：先派 brain 设计并 squad_approve_plan，再派 spec。`,
+          )
+        }
+      }
+      if (phase === 'implement' || phase === 'rework') {
+        if (plan.planRequired && !plan.planApproved) {
+          throw new Error(
+            `任务 ${taskId} 的 PLAN.md 尚未经 Lead 审核批准（planRounds=${plan.planRounds}/${budget.designLimit}）。先审核 PLAN.md 并调用 squad_approve_plan，再派 ${phase}。`,
+          )
+        }
+        if (flow.specRequired && !state.specPublished) {
+          throw new Error(
+            `任务 ${taskId} 的技术规格尚未交付：先派 architect（gpt）phase="spec" 发布 SPEC.md，再派 ${phase}；规格发布后即可派工，不需要 Lead 再审批。`,
+          )
+        }
+        if (flow.specRequired && target.role !== 'worker' && target.role !== 'architect') {
+          throw new Error(
+            `完整流程的 ${phase} 只能派 worker，或由 architect 接手实现；${target.name} 当前是 ${target.role}。`,
+          )
+        }
+      }
+      if (phase === 'tech-review') {
+        if (!flow.specRequired) {
+          throw new Error(
+            `任务 ${taskId} 未启用完整流程：没有技术验收阶段，业务验收直接派 brain（phase="review"）。`,
+          )
+        }
+        if (Number(state.codeEpoch ?? 0) === 0) {
+          throw new Error(
+            '任务还没有任何实现轮次（codeEpoch=0）：先派 worker phase="implement"，再派技术验收。',
+          )
+        }
+        if (target.role !== 'architect' && target.role !== 'brain') {
+          throw new Error(
+            `tech-review 只能派 architect（gpt），或由 brain（codex）在架构师接手实现后代签；${target.name} 当前是 ${target.role}。`,
+          )
+        }
+        const implementers = Array.isArray(state.implementers) ? state.implementers : []
+        if (implementers.includes(target.name)) {
+          throw new Error(
+            `${target.name} 已在本任务中写代码，不能签署自己改动的技术验收：改派 brain（codex）对照 SPEC.md 独立代签技术验收，业务验收仍由 codex 按业务方案单独签署，两份验收独立记录。`,
+          )
+        }
+      }
+      if (phase === 'review' && flow.specRequired) {
+        if (target.role !== 'brain') {
+          throw new Error(
+            `完整流程的业务验收只能派 brain 角色；${target.name} 当前是 ${target.role}。`,
+          )
+        }
+        const techVerdict = await readVerdict(taskDir, 'TECH-REVIEW.md')
+        if (!bindingFresh(state.techReview, state) || techVerdict !== 'APPROVED') {
+          throw new Error(
+            `技术验收未通过或已失效：业务验收前必须先有仍然新鲜的技术验收（TECH-REVIEW.md 以 VERDICT: APPROVED 结束，且验收后代码/规格未再变动）${bindingFresh(state.techReview, state) ? '' : '（旧结论已因代码/规格变动失效，需重新验收）'}。先派 tech-review。`,
+          )
+        }
       }
       await writeBrief({ taskDir, state, agent: target, phase, round })
 
@@ -1383,6 +1697,32 @@ function createTools(ctx, config, runtime, store) {
         if (reviewText) {
           await writeFile(join(taskDir, `REVIEW-R${round}.md`), reviewText, 'utf8').catch(() => {})
         }
+        // Full flow: bind the business acceptance to the code/spec version it
+        // examined; a later implement/rework/spec dispatch makes it stale.
+        if (flow.specRequired) {
+          state.businessReview = {
+            codeEpoch: Number(state.codeEpoch ?? 0),
+            specVersion: Number(state.specVersion ?? 0),
+            reviewer: target.name,
+            at: new Date().toISOString(),
+          }
+        }
+      }
+      if (phase === 'tech-review') {
+        const techText = await readFile(join(taskDir, 'TECH-REVIEW.md'), 'utf8').catch(() => '')
+        const techVerdicts = [
+          ...techText.matchAll(/VERDICT:\s*(APPROVED|CHANGES_REQUESTED)/gi),
+        ]
+        state.lastTechVerdict = techVerdicts.at(-1)?.[1]?.toUpperCase() ?? null
+        if (techText) {
+          await writeFile(join(taskDir, `TECH-REVIEW-R${round}.md`), techText, 'utf8').catch(() => {})
+        }
+        state.techReview = {
+          codeEpoch: Number(state.codeEpoch ?? 0),
+          specVersion: Number(state.specVersion ?? 0),
+          reviewer: target.name,
+          at: new Date().toISOString(),
+        }
       }
       state.phase = phase
       state.round = round
@@ -1406,7 +1746,47 @@ function createTools(ctx, config, runtime, store) {
         }
         state.planRounds = planRound
       }
-      if (phase === 'rework') state.reworkRounds = priorRework + 1
+      // Spec accounting: every spec dispatch publishes a new version; external
+      // executors archive SPEC.md synchronously as SPEC-V<n>.md (an archive
+      // failure throws with specVersion unchanged, mirroring design). Spec
+      // revisions consume no rework quota.
+      let specVersion
+      if (phase === 'spec') {
+        specVersion = Number(state.specVersion ?? 0) + 1
+        if (external) {
+          try {
+            const specText = await readFile(join(taskDir, 'SPEC.md'), 'utf8')
+            await writeFile(join(taskDir, `SPEC-V${specVersion}.md`), specText, 'utf8')
+          } catch (error) {
+            throw new Error(
+              `spec 派单已派发成功，但归档 SPEC-V${specVersion}.md 失败：${error instanceof Error ? error.message : String(error)}。specVersion 未增加；请补写 SPEC.md 后重试 spec。不会自动重派。`,
+            )
+          }
+        }
+        state.specVersion = specVersion
+        state.specPublished = true
+      }
+      // Code epoch: every implementation/rework dispatch (worker or the
+      // architect taking over) advances the candidate code version, so both
+      // acceptance bindings go stale until re-examined.
+      if (phase === 'implement' || phase === 'rework') {
+        state.codeEpoch = Number(state.codeEpoch ?? 0) + 1
+        const implementers = Array.isArray(state.implementers) ? state.implementers : []
+        if (!implementers.includes(target.name)) {
+          state.implementers = [...implementers, target.name]
+        }
+      }
+      if (phase === 'rework') {
+        if (flow.specRequired) {
+          if (reworkKind === 'business') {
+            state.businessReworkRounds = budget.businessUsed + 1
+          } else {
+            state.techReworkRounds = budget.techUsed + 1
+          }
+        } else {
+          state.reworkRounds = priorRework + 1
+        }
+      }
       // Executor switched away from local: drop the idle stale child record so
       // one agent never keeps two live bindings (R07).
       if (executor !== 'local' && state.children?.[target.name] && !childBusy) {
@@ -1420,6 +1800,8 @@ function createTools(ctx, config, runtime, store) {
         round,
         mode,
         ...(planRound === undefined ? {} : { planRound }),
+        ...(specVersion === undefined ? {} : { specVersion }),
+        ...(reworkKind ? { reworkKind } : {}),
         ...(external ? { provider: target.model } : {}),
         ...(tokens === undefined ? {} : { tokens }),
       })
@@ -1427,15 +1809,29 @@ function createTools(ctx, config, runtime, store) {
       await writeJson(join(taskDir, 'STATE.json'), state)
       await appendFile(
         join(taskDir, 'JOURNAL.md'),
-        `- ${new Date().toISOString()} lead → ${target.name} (${target.role}) phase=${phase} round=${round} mode=${mode}\n`,
+        `- ${new Date().toISOString()} lead → ${target.name} (${target.role}) phase=${phase} round=${round} mode=${mode}${reworkKind ? ` kind=${reworkKind}` : ''}\n`,
         'utf8',
       ).catch(() => {})
 
+      const reworkLine = flow.specRequired
+        ? `rework: tech=${state.techReworkRounds ?? 0}/${budget.techLimit} business=${state.businessReworkRounds ?? 0}/${budget.businessLimit}`
+        : `rework=${state.reworkRounds ?? 0}/${budget.reworkLimit}`
+      const phaseLines = [
+        ...(phase === 'design'
+          ? [`planRounds=${state.planRounds}/${budget.designLimit}（Lead 审核后用 squad_approve_plan 批准）`]
+          : []),
+        ...(phase === 'spec'
+          ? [`specVersion=${state.specVersion}${external ? `（已归档 SPEC-V${state.specVersion}.md）` : ''}（发布后即可派工，不需要 Lead 再审批）`]
+          : []),
+        ...(phase === 'tech-review'
+          ? [`techReview: codeEpoch=${state.codeEpoch ?? 0} specVersion=${state.specVersion ?? 0}${state.lastTechVerdict ? ` verdict=${state.lastTechVerdict}` : ''}（verdict 以 TECH-REVIEW.md 为准）`]
+          : []),
+      ]
       if (mode === 'local' || mode === 'local-resumed') {
         return [
           `${mode === 'local' ? '已创建' : '已续跑'}本地子代理 ${target.name} [${target.role}] model=${target.model} session=${sessionId}`,
-          `task=${taskId} phase=${phase} round=${round} rework=${state.reworkRounds ?? 0}/${budget.reworkLimit}`,
-          ...(phase === 'design' ? [`planRounds=${state.planRounds}/${budget.designLimit}（Lead 审核后用 squad_approve_plan 批准）`] : []),
+          `task=${taskId} phase=${phase} round=${round} ${reworkLine}`,
+          ...phaseLines,
           `workspace=${workspace}`,
           '它完成后会以完成通知唤醒你；返工用同一 child id 续跑。',
         ].join('\n')
@@ -1448,7 +1844,7 @@ function createTools(ctx, config, runtime, store) {
         return [
           `已外部派发 ${target.displayName} (${target.name}) [${target.role}] provider=${target.model}（一次性，不续跑）`,
           `task=${taskId} phase=${phase} round=${round} tokens=${tokens ?? 'unknown'} totalTokens=${state.tokens ?? 0}`,
-          ...(phase === 'design' ? [`planRounds=${state.planRounds}/${budget.designLimit}（已归档 PLAN-R${state.planRounds}.md；Lead 审核后用 squad_approve_plan 批准）`] : []),
+          ...phaseLines,
           `workspace=${workspace}`,
           '输出：',
           clipped || '（无文本输出）',
@@ -1456,8 +1852,8 @@ function createTools(ctx, config, runtime, store) {
       }
       return [
         `${mode === 'spawned' ? '已创建' : '已续跑'} ${target.name} [${target.role}] session=${sessionId}`,
-        `task=${taskId} phase=${phase} round=${round} rework=${state.reworkRounds ?? 0}/${budget.reworkLimit}`,
-        ...(phase === 'design' ? [`planRounds=${state.planRounds}/${budget.designLimit}（Lead 审核后用 squad_approve_plan 批准）`] : []),
+        `task=${taskId} phase=${phase} round=${round} ${reworkLine}`,
+        ...phaseLines,
         `workspace=${workspace}`,
         '队友完成后会调用 squad_report。结束本回合等报告；需要查看时用 squad_status。',
       ].join('\n')
@@ -1517,6 +1913,9 @@ function createTools(ctx, config, runtime, store) {
       const state = (await readJson(join(taskDir, 'STATE.json'))) ?? {}
       const plan = planGateOf(state)
       const budget = budgetOf(state)
+      const flow = flowOf(state)
+      const techVerdict = flow.specRequired ? await readVerdict(taskDir, 'TECH-REVIEW.md') : undefined
+      const businessVerdict = await readVerdict(taskDir, 'REVIEW.md')
       const extensions = Array.isArray(state.extensions) ? state.extensions : []
       const treeRows = await treeRowsOf(ctx, lead)
       const childIds = new Set(
@@ -1538,7 +1937,7 @@ function createTools(ctx, config, runtime, store) {
             ? [`工作区：worktree ${state.worktree.branch} @ ${state.worktree.path}（源仓库 ${state.worktree.repositoryRoot}）`]
             : ['工作区：原地开发']
       const lines = [
-        `${PLUGIN_MARKER}  task=${taskId}  phase=${state.phase ?? 'unknown'}  round=${state.round ?? '?'}  rework=${state.reworkRounds ?? 0}/${budget.reworkLimit}  created=${state.createdAt ?? '?'}`,
+        `${PLUGIN_MARKER}  task=${taskId}  phase=${state.phase ?? 'unknown'}  round=${state.round ?? '?'}  flow=${flow.flow}  created=${state.createdAt ?? '?'}`,
         `PLAN：planRequired=${plan.planRequired}  planRounds=${plan.planRounds}/${budget.designLimit}  planApproved=${plan.planApproved}${
           plan.planApproved
             ? `  planApprovedAt=${plan.planApprovedAt ?? '?'}（已归档 PLAN-APPROVED.md）`
@@ -1546,7 +1945,16 @@ function createTools(ctx, config, runtime, store) {
               ? '（未批准：implement/rework 会被拒绝，先 squad_approve_plan）'
               : ''
         }`,
-        `预算：design 上限=${budget.designLimit} 已用=${budget.designUsed} 剩余=${Math.max(0, budget.designLimit - budget.designUsed)}；implement 上限=${budget.reworkLimit} 已用=${budget.implementUsed} 剩余=${Math.max(0, budget.reworkLimit - budget.implementUsed)}`,
+        ...(flow.specRequired
+          ? [
+              `SPEC：specRequired=true  specPublished=${state.specPublished === true}  specVersion=${state.specVersion ?? 0}  codeEpoch=${state.codeEpoch ?? 0}  implementers=${(Array.isArray(state.implementers) ? state.implementers : []).join(',') || '—'}`,
+              `技术验收：${bindingFresh(state.techReview, state) ? '新鲜' : '失效/未验收'}  verdict=${techVerdict ?? state.lastTechVerdict ?? '—'}  reviewer=${state.techReview?.reviewer ?? '—'}（TECH-REVIEW.md）`,
+              `业务验收：${bindingFresh(state.businessReview, state) ? '新鲜' : '失效/未验收'}  verdict=${businessVerdict ?? state.lastVerdict ?? '—'}  reviewer=${state.businessReview?.reviewer ?? '—'}（REVIEW.md）`,
+              `预算：design 上限=${budget.designLimit} 已用=${budget.designUsed}；tech 上限=${budget.techLimit} 已用=${budget.techUsed} 剩余=${Math.max(0, budget.techLimit - budget.techUsed)}；business 上限=${budget.businessLimit} 已用=${budget.businessUsed} 剩余=${Math.max(0, budget.businessLimit - budget.businessUsed)}`,
+            ]
+          : [
+              `预算：design 上限=${budget.designLimit} 已用=${budget.designUsed} 剩余=${Math.max(0, budget.designLimit - budget.designUsed)}；implement 上限=${budget.reworkLimit} 已用=${budget.implementUsed} 剩余=${Math.max(0, budget.reworkLimit - budget.implementUsed)}`,
+            ]),
         ...(extensions.length === 0
           ? ['最近扩展：无']
           : [
@@ -1579,7 +1987,7 @@ function createTools(ctx, config, runtime, store) {
           : '- （无）',
         `文件：${await fileSummary(taskDir)}`,
         `累计 tokens（Codex session 统计）：${state.tokens ?? 0}`,
-        `最后验收结论：${state.lastVerdict ?? '—'}`,
+        `最后验收结论：${flow.specRequired ? `技术=${state.lastTechVerdict ?? '—'} 业务=${state.lastVerdict ?? '—'}` : state.lastVerdict ?? '—'}`,
         '已配置 agent：',
         rosterLine,
       ]
@@ -1727,7 +2135,7 @@ ${String(args.summary).trim()}
   const finish = defineTool({
     name: 'squad_finish',
     description:
-      '收尾任务：确认没有队友在运行且 brain 已 approved，提交 worktree 改动（可配置），把会话切回源目录，写出 FINAL.md 并给出分支/合并命令。',
+      '收尾任务：确认没有队友在运行且验收已 approved（完整流程需技术+业务双验收且仍然新鲜），提交 worktree 改动（可配置），把会话切回源目录，写出 FINAL.md 并给出分支/合并命令。',
     parameters: {
       type: 'object',
       additionalProperties: false,
@@ -1772,6 +2180,28 @@ ${String(args.summary).trim()}
       // treated conservatively: review is required unless the snapshot
       // explicitly recorded reviewRequired=false (R09).
       const reviewRequired = state.gate?.reviewRequired !== false
+      const flow = flowOf(state)
+      if (flow.specRequired) {
+        // Full flow: technical acceptance first, then business acceptance.
+        // Each must end with VERDICT: APPROVED and its binding must still be
+        // fresh — any code or spec dispatch after the review invalidates it.
+        const tech = await readFile(join(taskDir, 'TECH-REVIEW.md'), 'utf8').catch(() => '')
+        if (!tech) throw new Error('缺少 TECH-REVIEW.md：先让 gpt 技术验收（或由 codex 代签）并写 TECH-REVIEW.md。')
+        const techVerdicts = [
+          ...tech.matchAll(/VERDICT:\s*(APPROVED|CHANGES_REQUESTED)/gi),
+        ]
+        const techLast = techVerdicts.at(-1)?.[1]?.toUpperCase()
+        if (techLast !== 'APPROVED') {
+          throw new Error(
+            `TECH-REVIEW.md 最后一条 VERDICT 不是 APPROVED（当前：${techLast ?? '缺失'}）；需要以 \`VERDICT: APPROVED\` 结束。`,
+          )
+        }
+        if (!bindingFresh(state.techReview, state)) {
+          throw new Error(
+            '技术验收结论已失效：验收后代码或规格又发生了变动（codeEpoch/specVersion 不一致）。重新派 tech-review 通过后再收尾。',
+          )
+        }
+      }
       if (reviewRequired) {
         const review = await readFile(join(taskDir, 'REVIEW.md'), 'utf8').catch(() => '')
         if (!review) throw new Error('缺少 REVIEW.md：先让 brain 验收并写 REVIEW.md。')
@@ -1782,6 +2212,11 @@ ${String(args.summary).trim()}
         if (last !== 'APPROVED') {
           throw new Error(
             `REVIEW.md 最后一条 VERDICT 不是 APPROVED（当前：${last ?? '缺失'}）；需要以 \`VERDICT: APPROVED\` 结束。`,
+          )
+        }
+        if (flow.specRequired && !bindingFresh(state.businessReview, state)) {
+          throw new Error(
+            '业务验收结论已失效：验收后代码或规格又发生了变动（codeEpoch/specVersion 不一致）。重新派 review 通过后再收尾。',
           )
         }
       }
@@ -2053,7 +2488,9 @@ ${String(args.summary).trim()}
         `任务 ${taskId} 的 PLAN 已批准（第 ${plan.planRounds}/${designLimit} 次设计）。`,
         `批准时间：${approvedAt}`,
         `归档：${archived.map((name) => join(taskDir, name)).join('、')}`,
-        '下一步：squad_dispatch({ agent: "<worker>", phase: "implement" })；实现后仍需 brain 验收（REVIEW.md VERDICT: APPROVED）才能收尾。',
+        flowOf(state).specRequired
+          ? '下一步：squad_dispatch({ agent: "gpt", phase: "spec" }) 发布技术规格 SPEC.md；规格交付后即可派 worker implement，不需要 Lead 再审批。'
+          : '下一步：squad_dispatch({ agent: "<worker>", phase: "implement" })；实现后仍需 brain 验收（REVIEW.md VERDICT: APPROVED）才能收尾。',
       ].join('\n')
     },
   })
@@ -2061,12 +2498,12 @@ ${String(args.summary).trim()}
   const extend = defineTool({
     name: 'squad_extend',
     description:
-      '仅允许 Lead 在对应预算（design/implement）已耗尽且用户明确同意后调用：为当前任务追加轮次，提高该类预算上限并记录扩展历史。每次调用都必须先向用户说明阻塞点并取得本次同意，再传 confirmed=true；可重复扩展，但不得预先充值，也不会自动续跑派单。',
+      '仅允许 Lead 在对应预算（完整流程：design/tech/business；简化/兼容流程：design/implement）已耗尽且用户明确同意后调用：为当前任务追加轮次，提高该类预算上限并记录扩展历史。每次调用都必须先向用户说明阻塞点并取得本次同意，再传 confirmed=true；可重复扩展，但不得预先充值，也不会自动续跑派单。',
     parameters: {
       type: 'object',
       additionalProperties: false,
       properties: {
-        kind: { type: 'string', enum: ['design', 'implement'] },
+        kind: { type: 'string', enum: ['design', 'tech', 'business', 'implement'] },
         rounds: { type: 'integer', minimum: 1, default: 3 },
         reason: { type: 'string', minLength: 1 },
         confirmed: { type: 'boolean', const: true },
@@ -2088,8 +2525,8 @@ ${String(args.summary).trim()}
         throw new Error('squad_extend 仅允许 Lead 调用。')
       }
       const kind = args.kind
-      if (kind !== 'design' && kind !== 'implement') {
-        throw new Error('kind 必须是 design 或 implement。')
+      if (!['design', 'tech', 'business', 'implement'].includes(kind)) {
+        throw new Error('kind 必须是 design、tech、business 或 implement。')
       }
       const rounds = args.rounds === undefined ? 3 : args.rounds
       if (!(Number.isSafeInteger(rounds) && rounds > 0)) {
@@ -2121,8 +2558,28 @@ ${String(args.summary).trim()}
         throw new Error(`任务 ${taskId} 已经收尾，不能追加轮次。`)
       }
       const budget = budgetOf(state)
-      const used = kind === 'design' ? budget.designUsed : budget.implementUsed
-      const limit = kind === 'design' ? budget.designLimit : budget.reworkLimit
+      const flow = flowOf(state)
+      // Flow compatibility: full-flow tasks split the rework budget into
+      // tech/business; legacy and simple tasks keep the single implement kind.
+      if (flow.specRequired && kind === 'implement') {
+        throw new Error(
+          `任务 ${taskId} 走完整流程：没有 implement 返工预算。技术返工用 kind="tech"，业务返工用 kind="business"。`,
+        )
+      }
+      if (!flow.specRequired && (kind === 'tech' || kind === 'business')) {
+        throw new Error(
+          `任务 ${taskId} 未启用完整流程（无技术/业务返工预算）：用 kind="design" 或 kind="implement"。`,
+        )
+      }
+      const quota =
+        kind === 'design'
+          ? { used: budget.designUsed, limit: budget.designLimit }
+          : kind === 'tech'
+            ? { used: budget.techUsed, limit: budget.techLimit }
+            : kind === 'business'
+              ? { used: budget.businessUsed, limit: budget.businessLimit }
+              : { used: budget.implementUsed, limit: budget.reworkLimit }
+      const { used, limit } = quota
       if (used < limit) {
         throw new Error(
           `任务 ${taskId} 的 ${kind} 预算尚未到上限（已用 ${used}/${limit}），不能追加轮次。`,
@@ -2131,12 +2588,16 @@ ${String(args.summary).trim()}
       if (!Number.isSafeInteger(limit + rounds)) {
         throw new Error('追加后的预算上限超出安全整数范围。')
       }
-      // All checks passed: write back both effective limits, raising only the
+      // All checks passed: write back all effective limits, raising only the
       // selected budget, and append one history record. Nothing else changes.
       const extensions = Array.isArray(state.extensions) ? state.extensions : []
       state.designLimit = budget.designLimit
       state.reworkLimit = budget.reworkLimit
+      state.techReworkLimit = budget.techLimit
+      state.businessReworkLimit = budget.businessLimit
       if (kind === 'design') state.designLimit = limit + rounds
+      else if (kind === 'tech') state.techReworkLimit = limit + rounds
+      else if (kind === 'business') state.businessReworkLimit = limit + rounds
       else state.reworkLimit = limit + rounds
       state.extensions = [
         ...extensions,
@@ -2147,7 +2608,35 @@ ${String(args.summary).trim()}
     },
   })
 
-  return { start, dispatch, status, wait, report, finish, approvePlan, extend }
+  const enable = defineTool({
+    name: 'squad_enable',
+    description:
+      '为当前会话启用 Agent Squad（智能体小队）。仅当用户明确要求使用小队时调用（例如“用小队实现”“用智能体小队做这个任务”“use the agent squad”）；仅提到队友名字（codex/gpt/zcode/qoder）不算启用，普通任务直接自己做，不要调用本工具。插件重载后若小队会话失去身份，也用本工具恢复。调用后本会话成为 Squad Lead，获得 squad_* 工具与 Lead 章程。',
+    parameters: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {},
+    },
+    output: {
+      schema: { type: 'string' },
+      render: (_args, value) => [{ type: 'text', text: value }],
+    },
+    async execute(_args, exec) {
+      const lead = callingAgent(exec, 'squad_enable')
+      if (!runtime.isLeadEnabled(lead.id)) {
+        runtime.enableLead(lead)
+        return [
+          'Agent Squad 已为当前会话启用：你是 Squad Lead。',
+          '小队角色：codex [brain] 业务设计与验收；gpt [architect] 系统架构师（技术规格 + 技术验收，可接手实现）；zcode [worker] 后端实现与自测；qoder [worker] 前端产品实现与自测。',
+          '完整流程：squad_start → codex design（业务方案）→ Lead 审核后 squad_approve_plan → gpt spec（技术规格）→ worker implement → gpt tech-review → codex review（业务验收）→ squad_finish。非代码任务可在 squad_start 时传 flow="simple"。',
+          '用户没有明确要求时不要启用小队；提到队友名字也不算启用。',
+        ].join('\n')
+      }
+      return '当前会话已启用 Agent Squad（你是 Squad Lead）。用 squad_status 查看状态。'
+    },
+  })
+
+  return { start, dispatch, status, wait, report, finish, approvePlan, extend, enable }
 }
 
 /** Host plugin entry. */
@@ -2212,16 +2701,26 @@ export function apply(ctx, input) {
    * role (R08).
    */
   const pendingByName = new Map()
+  /**
+   * Session ids that explicitly opted into the squad (squad_enable). The squad
+   * is opt-in: a root session without an entry here never sees the Lead
+   * persona or the squad_* tools. In-memory only; after a plugin reload the
+   * Lead re-enables with squad_enable (kept visible to roots for recovery).
+   */
+  const enabledLeads = new Set()
 
   // 0.2.x membership: the Lead is the subagent-tree root; a teammate is a
   // bound child (dispatch snapshot), a pending spawn, or a roster name. An
   // unrelated subagent from another plugin resolves to no membership.
+  // A root only counts as the Lead once its session opted in (enabledLeads).
   const membershipOf = (agent) => {
     try {
       const subagents = ctx.get('subagents')
       const root = subagents?.rootOf(agent)
       if (root) {
-        if (root.id === agent.id) return { role: 'lead', name: 'lead' }
+        if (root.id === agent.id) {
+          return enabledLeads.has(agent.id) ? { role: 'lead', name: 'lead' } : undefined
+        }
         const binding = agentBindings.get(agent.id)
         if (binding) return { role: 'teammate', name: binding.name }
         let self
@@ -2235,6 +2734,7 @@ export function apply(ctx, input) {
         if (rosterName) return { role: 'teammate', name: rosterName }
       }
     } catch {}
+    if (agent?.__membership?.role === 'lead' && !enabledLeads.has(agent.id)) return undefined
     return agent?.__membership
   }
 
@@ -2246,6 +2746,7 @@ export function apply(ctx, input) {
       (resolved?.name ? pendingByName.get(resolved.name) : undefined)
     const membership = binding ? { role: 'teammate', name: binding.name } : resolved
     if (!membership) return
+    if (membership.role === 'lead' && !enabledLeads.has(agent.id)) return
     const configured = binding ?? configuredAgents(config).find((entry) => entry.name === membership.name)
     const text =
       membership.role === 'lead'
@@ -2307,9 +2808,29 @@ export function apply(ctx, input) {
     setPending: (name, agentConfig) => pendingByName.set(name, agentConfig),
     clearPending: (name) => pendingByName.delete(name),
     rebind: rebindSection,
+    isLeadEnabled: (sessionId) => enabledLeads.has(sessionId),
+    enableLead: (agent) => {
+      enabledLeads.add(agent.id)
+      try {
+        installSection(agent)
+      } catch (error) {
+        ctx.logger?.('agent-squad')?.warn?.('squad lead section install failed', error)
+      }
+    },
   }, store)
   const isLead = (agent) => membershipOf(agent)?.role === 'lead'
   const isTeammate = (agent) => membershipOf(agent)?.role === 'teammate'
+  // The enable gate is offered to every subagent-tree root that has not opted
+  // in yet: an un-enabled root sees exactly one squad tool, squad_enable.
+  const isEnableCandidate = (agent) => {
+    if (enabledLeads.has(agent.id)) return false
+    try {
+      const subagents = ctx.get('subagents')
+      return subagents?.rootOf(agent)?.id === agent.id
+    } catch {
+      return false
+    }
+  }
 
   // Global registrations are owned by this plugin's context, so a reload removes
   // them atomically; per-agent visibility comes from the step-time condition.
@@ -2322,6 +2843,7 @@ export function apply(ctx, input) {
     [tools.wait, isLead],
     [tools.finish, isLead],
     [tools.report, isTeammate],
+    [tools.enable, isEnableCandidate],
   ]) {
     ctx.tools.register(definition, { when: ({ agent }) => condition(agent) })
   }
@@ -2351,5 +2873,8 @@ export function apply(ctx, input) {
       ctx.logger?.('agent-squad')?.warn?.('squad section install failed', error)
     }
   })
-  ctx.on('agent/disposed', ({ agent }) => uninstallSection(agent))
+  ctx.on('agent/disposed', ({ agent }) => {
+    enabledLeads.delete(agent.id)
+    uninstallSection(agent)
+  })
 }

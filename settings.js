@@ -14,15 +14,19 @@ import { copyFile, mkdir, readFile, rename, rm, stat, writeFile } from 'node:fs/
 import { homedir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 
-/** On-disk schema version. */
-export const SETTINGS_VERSION = 1
+/** On-disk schema version. v1 held three agents; v2 adds the gpt architect. */
+export const SETTINGS_VERSION = 2
 
 /** Fixed, read-only agent ids in display order. */
-export const FIXED_IDS = ['codex', 'zcode', 'qoder']
+export const FIXED_IDS = ['codex', 'gpt', 'zcode', 'qoder']
 
 export const EXECUTORS = ['external', 'local', 'team']
 
-/** Factory defaults: an all-team roster that needs no external providers. */
+/** Roster roles: brain = business design/acceptance, architect = technical
+ * spec/acceptance, worker = implementation. */
+export const ROLES = ['brain', 'architect', 'worker']
+
+/** Factory defaults: brain + architect on pinned local models, team workers. */
 export const DEFAULT_AGENTS = [
   {
     id: 'codex',
@@ -30,7 +34,15 @@ export const DEFAULT_AGENTS = [
     role: 'brain',
     executor: 'team',
     model: '',
-    description: '负责方案设计与验收标准，并对实现做最终验收。',
+    description: '业务设计与验收：给出业务方案、对外行为与验收标准，并做业务验收。',
+  },
+  {
+    id: 'gpt',
+    displayName: 'gpt',
+    role: 'architect',
+    executor: 'local',
+    model: 'openai/gpt-6.2-sol',
+    description: '系统架构师：发布技术规格并做技术验收；worker 不可用或技术返工到限时可接手实现。',
   },
   {
     id: 'zcode',
@@ -38,7 +50,7 @@ export const DEFAULT_AGENTS = [
     role: 'worker',
     executor: 'team',
     model: '',
-    description: '按已批准方案实现并运行测试。',
+    description: '后端 worker：实现后端代码并自测。',
   },
   {
     id: 'qoder',
@@ -46,7 +58,7 @@ export const DEFAULT_AGENTS = [
     role: 'worker',
     executor: 'team',
     model: '',
-    description: '第二执行者，负责并行任务或前端偏重的改动。',
+    description: '前端 worker：实现前端产品代码并自测。',
   },
 ]
 
@@ -119,6 +131,8 @@ export function validateAgentsAndWorktree(agents, worktree) {
       message: `agents must be exactly ${FIXED_IDS.length} entries`,
     }
   }
+  // v1 rosters (three agents, no gpt slot) are structurally invalid as v2;
+  // migrateSettings inserts the architect row before validation runs.
   const names = []
   for (let index = 0; index < agents.length; index += 1) {
     const entry = agents[index]
@@ -137,7 +151,7 @@ export function validateAgentsAndWorktree(agents, worktree) {
     if (entry.id !== FIXED_IDS[index]) fields[`${prefix}.id`] = 'ID_READONLY'
     if (!isNonEmptyString(entry.displayName)) fields[`${prefix}.displayName`] = 'NAME_REQUIRED'
     else names.push(entry.displayName.trim().toLowerCase())
-    if (entry.role !== 'brain' && entry.role !== 'worker') fields[`${prefix}.role`] = 'ROLE_INVALID'
+    if (!ROLES.includes(entry.role)) fields[`${prefix}.role`] = 'ROLE_INVALID'
     if (!EXECUTORS.includes(entry.executor)) fields[`${prefix}.executor`] = 'EXECUTOR_INVALID'
     if (typeof entry.model !== 'string') fields[`${prefix}.model`] = 'MODEL_INVALID'
     else if (entry.executor === 'local' && entry.model.split('/').length !== 2) {
@@ -207,7 +221,7 @@ export function seedFromBundle(bundleAgents, worktreeDir) {
   for (const entry of Array.isArray(bundleAgents) ? bundleAgents : []) {
     if (isPlainObject(entry) && FIXED_IDS.includes(entry.name)) {
       rows.set(entry.name, {
-        role: entry.role === 'brain' ? 'brain' : 'worker',
+        role: ROLES.includes(entry.role) ? entry.role : 'worker',
         description: typeof entry.description === 'string' ? entry.description : '',
         provider: String(entry?.provider ?? ''),
         model: String(entry?.model ?? ''),
@@ -240,6 +254,27 @@ export function seedFromBundle(bundleAgents, worktreeDir) {
     }
   }
   return { agents, worktree, fallback: false }
+}
+
+/**
+ * Migrate a parsed v1 file (three agents: codex/zcode/qoder) to the v2 shape
+ * by inserting the architect row (from the effective defaults) at its fixed
+ * slot. Everything else — including the user's edits and the revision — is
+ * preserved byte-for-byte in meaning.
+ */
+export function migrateSettings(parsed, defaults) {
+  const fallback = DEFAULT_AGENTS.find((agent) => agent.id === 'gpt')
+  const architect =
+    defaults?.agents?.find((agent) => agent?.id === 'gpt') ?? { ...fallback }
+  const byId = new Map(
+    (Array.isArray(parsed.agents) ? parsed.agents : [])
+      .filter((entry) => isPlainObject(entry))
+      .map((entry) => [entry.id, entry]),
+  )
+  const agents = FIXED_IDS.map((id) => byId.get(id) ?? { ...defaults?.agents?.find((agent) => agent?.id === id) })
+    .filter((entry) => entry !== undefined)
+  if (agents.length !== FIXED_IDS.length) return undefined
+  return { ...parsed, version: SETTINGS_VERSION, agents }
 }
 
 /** Default settings file path, honoring $DSH_HOME. */
@@ -382,12 +417,36 @@ export function createSettingsStore(options = {}) {
       if (error instanceof SyntaxError) return restoreDefaults()
       throw new SettingsError('IO_ERROR', `cannot read settings: ${error.message}`, { status: 500 })
     }
-    if (!isPlainObject(parsed) || parsed.version !== SETTINGS_VERSION) {
+    if (!isPlainObject(parsed)) {
       throw new SettingsError(
         'UNKNOWN_VERSION',
         `settings version ${String(parsed?.version)} is not supported; file left untouched`,
         { status: 500 },
       )
+    }
+    if (parsed.version !== SETTINGS_VERSION) {
+      // v1 (three agents) migrates in place: insert the gpt architect row,
+      // keep every user edit and the revision, then converge the file to v2.
+      if (parsed.version !== 1) {
+        throw new SettingsError(
+          'UNKNOWN_VERSION',
+          `settings version ${String(parsed?.version)} is not supported; file left untouched`,
+          { status: 500 },
+        )
+      }
+      const migrated = migrateSettings(parsed, effectiveDefaults)
+      const revisionOk = Number.isSafeInteger(migrated?.revision) && migrated.revision >= 1
+      const shapeOk = migrated ? validateAgentsAndWorktree(migrated.agents, migrated.worktree).ok : false
+      if (!migrated || !revisionOk || !shapeOk) return restoreDefaults()
+      const saved = {
+        version: SETTINGS_VERSION,
+        revision: migrated.revision,
+        agents: migrated.agents,
+        worktree: migrated.worktree,
+      }
+      await writeAtomic(saved)
+      warn('settings v1 migrated to v2: inserted the gpt architect row')
+      return saved
     }
     const checked = validateAgentsAndWorktree(parsed.agents, parsed.worktree)
     if (!checked.ok) return restoreDefaults()

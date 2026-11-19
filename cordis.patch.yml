@@ -3,6 +3,9 @@
 # messaging, descendant discovery) and the Agent Teams task board itself, so
 # this bundle no longer mounts the removed experimental team runtime. It still
 # mounts the codex external provider and the experimental worktree service.
+#
+# The squad is opt-in: sessions must call squad_enable after an explicit user
+# request before any squad_* tool or Lead persona appears.
 
 - insert:
     - id: agent-squad-worktree-runtime
@@ -17,24 +20,31 @@
         # Repo-relative directory for plugin-created squad worktrees; the
         # settings page stores the live value in ~/.dsh/agent-squad/settings.json.
         worktreeDir: .agents/worktrees
-        # Hybrid: Lead stays DeepSeek; codex is an external one-shot consultant;
-        # workers are local pinned-model children (GLM, continuable). These rows
-        # only seed the settings file on first run.
+        # Hybrid: Lead stays DeepSeek; codex is an external one-shot brain;
+        # gpt is the architect on a pinned local model; workers are local
+        # pinned-model children (GLM, continuable). These rows only seed the
+        # settings file on first run.
         agents:
           - name: codex
             role: brain
             provider: codex
             context: fresh
-            description: 负责方案设计与验收标准，并对实现做最终验收。
+            description: 业务设计与验收：给出业务方案、对外行为与验收标准，并做业务验收。
+          - name: gpt
+            role: architect
+            provider: ''
+            model: openai/gpt-6.2-sol
+            context: fresh
+            description: 系统架构师：发布技术规格并做技术验收；可接手实现（不能自签技术验收）。
           - name: zcode
             role: worker
             provider: ''
             model: zai-coding-cn/glm-5.3
             context: fresh
-            description: 按已批准方案实现并运行测试（GLM 本地子代理，可续跑）。
+            description: 后端 worker：实现后端代码并自测（GLM 本地子代理，可续跑）。
           - name: qoder
             role: worker
             provider: ''
             model: zai-coding-cn/glm-5.3
             context: fresh
-            description: 第二执行者，负责并行任务或前端偏重的改动（GLM 本地子代理）。
+            description: 前端 worker：实现前端产品代码并自测（GLM 本地子代理）。
