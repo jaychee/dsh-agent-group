@@ -296,7 +296,7 @@ function runtimeAgent(settingsAgent, config) {
     description: settingsAgent.description ?? '',
     executor: settingsAgent.executor,
     model: settingsAgent.model ?? '',
-    reasoning: ['low', 'high', 'max'].includes(settingsAgent.reasoning)
+    reasoning: ['low', 'high', 'xhigh', 'max'].includes(settingsAgent.reasoning)
       ? settingsAgent.reasoning
       : '',
     context: bundle.context === 'fork' ? 'fork' : 'fresh',

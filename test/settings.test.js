@@ -964,7 +964,8 @@ test('T04 validation rejects invalid rosters with field paths and HTTP refuses n
     validateAgentsAndWorktree(agents, worktree)
 
   assert.equal(valid(four(validAgent('codex', { role: 'brain' }), validAgent('zcode'), validAgent('qoder'))).ok, true)
-  assert.equal(valid([validAgent('codex', { role: 'brain' }), validAgent('gpt', { role: 'architect', executor: 'local', model: 'openai/gpt-6.2-sol' }), validAgent('zcode'), validAgent('qoder')]).ok, true)
+  assert.equal(valid(four(validAgent('codex', { role: 'brain' }), validAgent('zcode'), validAgent('qoder'))).ok, true)
+  assert.equal(valid([validAgent('codex', { role: 'brain' }), validAgent('gpt', { role: 'architect', executor: 'local', model: 'openai/gpt-6.2-sol', reasoning: 'xhigh' }), validAgent('zcode'), validAgent('qoder')]).ok, true)
   assert.equal(valid(four(validAgent('codex', { role: 'brain' }), validAgent('zcode'), validAgent('qoder', { role: 'architect' }))).ok, true)
 
   const cases = [
@@ -1009,6 +1010,14 @@ test('T04 validation rejects invalid rosters with field paths and HTTP refuses n
       ),
       field: 'agents.gpt.role',
       code: 'ROLE_INVALID',
+    },
+    {
+      name: 'unknown reasoning effort',
+      agents: four(validAgent('codex', { role: 'brain' }), validAgent('zcode'), validAgent('qoder')).map((agent) =>
+        agent.id === 'gpt' ? { ...agent, reasoning: 'extreme' } : agent,
+      ),
+      field: 'agents.gpt.reasoning',
+      code: 'REASONING_INVALID',
     },
     {
       name: 'local model without provider',

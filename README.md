@@ -238,7 +238,7 @@ token：GLM implement 26,295 / rework 26,459（cache 主导）；Codex 设计 + 
   "worktree": { "directory": ".agents/worktrees" } }
 ```
 
-- **字段**：四个成员固定 id（codex/gpt/zcode/qoder，只读），可编辑 `displayName/role/executor/model/reasoning/description`；worktree 只有 `directory`（仓库相对路径，拒绝绝对路径与 `..`）。`reasoning`（思考强度，''/low/high/max）仅对固定模型执行者生效（local，或 `provider/model` 形式的外部一次性），派发时作为 `reasoningEffort` 传给子代理；纯外部 provider（codex-cli 等）不显示该控件。
+- **字段**：四个成员固定 id（codex/gpt/zcode/qoder，只读），可编辑 `displayName/role/executor/model/reasoning/description`；worktree 只有 `directory`（仓库相对路径，拒绝绝对路径与 `..`）。`reasoning`（思考强度，''/low/high/xhigh/max）仅对固定模型执行者生效（local，或 `provider/model` 形式的外部一次性），派发时作为 `reasoningEffort` 传给子代理；纯外部 provider（codex-cli 等）不显示该控件。
 - **role 三态**：`brain`（业务设计与验收）| `architect`（系统架构师）| `worker`（实现与自测）。
 - **executor 三态**：`external`（外部 provider，一次性派发）、`local`（`provider/model` 固定模型本地子代理，可续跑）、`team`（进程内队友，可续跑）。校验：名称唯一、至少一个 brain、local 模型必须在模型目录内、external provider 必须已注册。
 - **迁移**：v1（三成员）文件读取时自动插入 gpt 架构师行并升为 v2，用户既有编辑与 revision 全部保留。

@@ -163,7 +163,7 @@ export function validateAgentsAndWorktree(agents, worktree) {
     }
     if (
       entry.reasoning !== undefined &&
-      !['', 'low', 'high', 'max'].includes(entry.reasoning)
+      !['', 'low', 'high', 'xhigh', 'max'].includes(entry.reasoning)
     ) {
       fields[`${prefix}.reasoning`] = 'REASONING_INVALID'
     }
