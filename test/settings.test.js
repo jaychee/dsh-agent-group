@@ -636,11 +636,46 @@ test('T03 dispatch reads fresh settings and routes external/local/team executors
     )
 
     // Idle + changed binding → next dispatch uses the new binding (new child).
+    snapshot = await settingsStore.read()
+    await settingsStore.save({
+      expectedRevision: snapshot.revision,
+      agents: snapshot.agents.map((agent) =>
+        agent.id === 'zcode' ? { ...agent, executor: 'external', model: 'p2/m9' } : agent,
+      ),
+      worktree: snapshot.worktree,
+    })
     const local3 = await tool('squad_dispatch').execute(
       { agent: 'zcode', message: 'next', phase: 'implement' },
       exec,
     )
     assert.match(local3, /已外部派发/)
+
+    // External `provider/model` form → ONE-SHOT pinned spawn: provider=spawn
+    // with agentOptions, no name, no member created, no children entry.
+    {
+      const before = host.members.length
+      const out = await tool('squad_dispatch').execute(
+        { agent: 'zcode', message: 'one-shot probe', phase: 'implement' },
+        exec,
+      )
+      assert.match(out, /已外部派发 zcode \(zcode\).*provider=p2\/m9（一次性，不续跑）/)
+      const act = host.activations.at(-1)
+      assert.equal(act.provider, 'spawn')
+      assert.deepEqual(act.agentOptions, { provider: 'p2', model: 'm9' })
+      assert.equal(act.name, undefined)
+      assert.equal(host.members.length, before)
+      const oneShotTask = /task=(t-\S+) /.exec(out)[1]
+      const st = JSON.parse(
+        await readFile(join(workspace, '.agent-squad', oneShotTask, 'STATE.json'), 'utf8'),
+      )
+      assert.equal(st.children?.zcode, undefined)
+      // Second dispatch is a brand-new activation (fresh context).
+      await tool('squad_dispatch').execute(
+        { agent: 'zcode', message: 'one-shot again', phase: 'implement' },
+        exec,
+      )
+      assert.notEqual(host.activations.at(-1).childId, act.childId)
+    }
 
     // R09: roles edited after start cannot relax the acceptance gate snapshotted
     // at task creation. A second task runs with only codex (brain) as the

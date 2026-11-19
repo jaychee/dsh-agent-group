@@ -1086,9 +1086,11 @@ function createTools(ctx, config, runtime, store) {
       })
 
       const executor = target.executor
-      const slash = executor === 'local' ? target.model.indexOf('/') : -1
+      const slash = executor === 'local' || executor === 'external'
+        ? target.model.indexOf('/')
+        : -1
       const pinned =
-        executor === 'local' && slash > 0
+        slash > 0
           ? { provider: target.model.slice(0, slash), model: target.model.slice(slash + 1) }
           : undefined
       const external = executor === 'external'
@@ -1153,7 +1155,9 @@ function createTools(ctx, config, runtime, store) {
       let sessionId
       let externalText = ''
       let tokens
-      if (pinned) {
+      // local + `provider/model` = continuable pinned child; the same form on
+      // an external executor falls through to the one-shot branch below.
+      if (pinned && !external) {
         const subagents = ctx.get('subagents')
         if (!subagents) {
           throw new Error('本地固定模型子代理需要宿主 subagents 服务，但当前不可用。')
@@ -1238,8 +1242,12 @@ function createTools(ctx, config, runtime, store) {
         const startedAt = Date.now()
         const tokensBefore =
           target.model === 'codex' ? await captureCodexTokens(startedAt - 600000) : undefined
+        // An external `provider/model` form runs a ONE-SHOT pinned child:
+        // fresh context on every dispatch, no name/binding, no children
+        // entry — the continuable path is the local/team executors.
         const activation = await subagents.startActivation({
-          provider: target.model,
+          provider: pinned ? 'spawn' : target.model,
+          ...(pinned ? { agentOptions: { provider: pinned.provider, model: pinned.model } } : {}),
           label: `${taskId}/${phase}/${target.name}`,
           prompt: [{ type: 'text', text: prompt }],
           parent: lead,
@@ -1281,6 +1289,12 @@ function createTools(ctx, config, runtime, store) {
           'utf8',
         ).catch(() => {})
         state.tokens = (state.tokens ?? 0) + (tokens ?? 0)
+        // An external dispatch obsoletes any stale continuable binding for
+        // this name — the activity guard above proved it idle before we got
+        // here, so drop the record instead of resuming a dead child later.
+        if (state.children?.[target.name] !== undefined) {
+          delete state.children[target.name]
+        }
       } else if (!existing) {
         // Team executor: a named continuable child on the Lead's subagent
         // tree (the 0.2.x replacement for agentTeams.spawnTeammate).
