@@ -187,7 +187,9 @@ export async function createSquadWorktree({
     branch,
     repositoryRoot,
     baseCommit,
-    sourceDirectory,
+    // Inside a linked checkout the new worktree was branched from the main
+    // repository, so that is where finish must return the session.
+    sourceDirectory: linkedCheckout ? repositoryRoot : sourceDirectory,
     reused: false,
   }
 }

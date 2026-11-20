@@ -1089,6 +1089,25 @@ async function activeTaskCount(store) {
   return Object.values(registry.tasks).filter((row) => row.active === true).length
 }
 
+/**
+ * Point the memory root's current file at the most recently created task that
+ * is still active, so a closed task never stays "current". Leaves the file
+ * untouched when no task remains active.
+ */
+async function repointCurrent(store, closedTaskId) {
+  const registry = await readTaskRegistry(store)
+  const others = Object.entries(registry.tasks)
+    .filter(([id, row]) => id !== closedTaskId && row.active === true && row.memoryRoot)
+    .sort((a, b) => String(b[1].createdAt ?? '').localeCompare(String(a[1].createdAt ?? '')))
+  if (others.length === 0) return
+  const [nextId, nextRow] = others[0]
+  await writeJson(join(nextRow.memoryRoot, 'current.json'), {
+    taskId: nextId,
+    memoryRoot: nextRow.memoryRoot,
+    worktree: nextRow.worktree ?? null,
+  })
+}
+
 /** True when `directory` sits inside a worktree owned by another active task. */
 async function insideOtherTaskWorktree(store, directory) {
   try {
@@ -3027,6 +3046,7 @@ ${String(args.summary).trim()}
         state.verdict = 'approved'
         state.commit = state.baseDelivered.commits?.[0]?.commit ?? null
         await markTaskActive(store, taskId, false).catch(() => {})
+        await repointCurrent(store, taskId).catch(() => {})
         state.finishSummary = summary
         await writeJson(join(taskDir, 'STATE.json'), state)
         await writeFile(
@@ -3212,6 +3232,7 @@ ${String(args.summary).trim()}
       state.commit = commit
       state.finishSummary = summary
       await markTaskActive(store, taskId, false).catch(() => {})
+      await repointCurrent(store, taskId).catch(() => {})
       await writeJson(join(taskDir, 'STATE.json'), state)
       await writeFile(
         join(taskDir, 'FINAL.md'),

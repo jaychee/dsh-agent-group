@@ -5701,6 +5701,20 @@ test('T20 a second task gets its own worktree and a runtime-safe child name', as
     }
     assert.notEqual(nameA, nameB)
     assert.ok(nameA.includes(taskA.slice(2, 8)) || nameA.includes(taskA), nameA)
+
+    // D1: a task started from inside another task's checkout still records the
+    // MAIN repository as its source, so finish returns the session there.
+    assert.equal(stateB.worktree.sourceDirectory, repo)
+    assert.equal(stateB.worktree.repositoryRoot, repo)
+
+    // D2: closing one task re-points `current` at the remaining active task.
+    await writeFile(join(repo, '.agents', 'worktrees', `squad-${taskA}`, '.agent-squad', taskA, 'REVIEW.md'), '# R\n\nVERDICT: APPROVED\n', 'utf8')
+    assert.match(await tool('squad_finish').execute({ summary: 'A done', task_id: taskA }, exec), /收尾/)
+    const currentB = JSON.parse(
+      await readFile(join(repo, '.agents', 'worktrees', `squad-${taskB}`, '.agent-squad', 'current.json'), 'utf8'),
+    )
+    assert.equal(currentB.taskId, taskB)
+    assert.equal(currentB.memoryRoot, join(repo, '.agents', 'worktrees', `squad-${taskB}`, '.agent-squad'))
   } finally {
     delete process.env.DSH_HOME
     if (repo) await cleanupSquadArtifacts([repo]).catch(() => {})
