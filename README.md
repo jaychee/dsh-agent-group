@@ -81,6 +81,16 @@
 - 三轮技术返工仍未通过时，Lead 先向用户说明阻塞点并等待决策；用户同意继续后直接派 gpt 接手，**不需要再次确认选人**；
 - gpt 接手写代码后可以自测，但**不能签署自己改动的技术验收**（插件会拒绝）：tech-review 改派 codex 对照 SPEC.md 独立代签技术验收，业务验收仍由 codex 按业务方案单独签署，两份验收独立记录。
 
+### 架构师容错（failover，额度耗尽自动交接）
+
+gpt（架构师）因**额度耗尽**等原因不可用时，插件把 gpt **挂起**并把架构师职责（SPEC.md 技术规格、TECH-REVIEW.md 技术验收）交给 **codex（brain）代行**，完成剩下的任务；gpt 挂起直到恢复：
+
+- **自动触发**：① 对 gpt 的派单失败且错误匹配额度特征（额度/余额/欠费/限流/quota/insufficient/balance/exceeded/429/rate limit）→ 自动挂起，报错附交接指引；② gpt 以 `squad_report` 上报 `blocked` 且摘要匹配额度特征 → 自动挂起。
+- **手动触发/恢复**（Lead 工具 `squad_failover`）：挂起 `squad_failover({ agent: "gpt", reason: "原因" })`；用户确认额度恢复后 `squad_failover({ agent: "gpt", recover: true })` 交还职责。
+- **挂起期间**：对 gpt 的任何派单被拒绝（提示改派 codex）；`spec` 阶段放行 codex（代行架构师，派单提示注明"代行架构师职责"）；`tech-review` 本就允许 codex。非额度类派单错误**不会**触发挂起。
+- **持久化**：挂起状态存 `~/.dsh/agent-squad/failover.json`，插件重载/DSH 重启后仍生效，直到显式恢复；`squad_status` 显示"挂起：gpt（自 …；自动/手动；原因 …）"。
+- 代行期间 codex 产出的 SPEC.md 与 TECH-REVIEW.md 是正式记录；验收新鲜度规则不变（代行产生的技术验收同样绑定 codeEpoch/specVersion）。
+
 ### 预算与上限
 
 - **设计预算（默认 4 次）**：初始设计 + 最多 3 轮返工；未扩展时第 5 次暂停。
@@ -138,7 +148,7 @@ node --test dsh-agent-squad/test/settings.test.js
 ASQ_LIVE_QODER=1 node --test --test-name-pattern='^T09 ' dsh-agent-squad/test/settings.test.js
 ```
 
-测试保持十一个顶层用例（T01–T11，T11 覆盖显式启用、完整流程门禁、双验收与接手代签）；实机模式由 qoder 一次派单修改两个临时仓库，各新增一次提交，并输出 `AC7 task=... cwd=... repo=... commit=... repo=... commit=...`。普通单测不能代替该证据。
+测试保持十二个顶层用例（T01–T12；T11 覆盖显式启用、完整流程门禁、双验收与接手代签，T12 覆盖架构师额度耗尽的自动挂起、brain 代行与恢复）；实机模式由 qoder 一次派单修改两个临时仓库，各新增一次提交，并输出 `AC7 task=... cwd=... repo=... commit=... repo=... commit=...`。普通单测不能代替该证据。
 
 ## B 模式：外部 provider（一次性）
 
@@ -354,7 +364,8 @@ token：GLM implement 26,295 / rework 26,459（cache 主导）；Codex 设计 + 
 | `squad_status` | Lead | 任务、阶段/轮次、流程（flow/specPublished/specVersion/codeEpoch/implementers）、双验收绑定与结论、全部仓库/worktree/分支/基线、PLAN 门禁、各类预算与最近 6 条扩展记录、成员状态、记忆文件、最近派单 |
 | `squad_wait` | Lead | 有界阻塞等待团队变化（通常不需要，报告会唤醒 Lead） |
 | `squad_finish` | Lead | 校验无队友运行 + 验收 approved（完整流程需技术+业务双验收且新鲜），逐仓提交并记录结果，切回主仓库源目录，写 FINAL.md 与每仓合并命令；多仓失败可重试 |
-| `squad_report` | brain / architect / worker | 把结果、阻塞或验收结论发回 Lead 并写 JOURNAL |
+| `squad_failover` | Lead（仅 Lead 可见） | 架构师容错：额度耗尽时挂起架构师（自动触发或手动 `reason`），职责由 brain 代行；`recover: true` 在用户确认恢复后解除挂起；挂起状态持久化于 failover.json |
+| `squad_report` | brain / architect / worker | 把结果、阻塞或验收结论发回 Lead 并写 JOURNAL；架构师上报额度耗尽的 blocked 会触发自动挂起 |
 
 ## 安装 / 卸载
 

@@ -37,8 +37,9 @@
 import { execFile } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
 import { appendFile, mkdir, readFile, readdir, rm, rmdir, stat, writeFile } from 'node:fs/promises'
+import { readFileSync } from 'node:fs'
 import { homedir } from 'node:os'
-import { join, resolve } from 'node:path'
+import { dirname, join, resolve } from 'node:path'
 import { setTimeout as delay } from 'node:timers/promises'
 import { promisify } from 'node:util'
 
@@ -155,6 +156,7 @@ const BRAIN_CHARTER = `你是小队里的 brain（业务设计与验收），与
 - 只有每条标准都有证据通过时才报 "approved"；否则报 "changes_requested"，给出编号缺陷清单和每项的最小修复方案。
 - REVIEW.md 的最后一行必须是机器可读的「VERDICT: APPROVED」或「VERDICT: CHANGES_REQUESTED」（Lead 的收尾门禁只认这一行）。
 - 当架构师接手实现时，由你对照 SPEC.md 亲自运行验证测试并代签技术验收：在 TECH-REVIEW.md 记录命令、退出码、关键输出与编号缺陷，最后一行同样是「VERDICT: APPROVED」或「VERDICT: CHANGES_REQUESTED」；之后再按业务方案单独签署业务验收，两份验收独立记录。
+- 架构师挂起（额度耗尽容错交接）时代行架构师职责：按架构师章程写 SPEC.md（技术规格）与 TECH-REVIEW.md（对照 SPEC 亲自运行验证测试）；业务验收仍按本章程单独签署，两份记录独立。架构师恢复后交还职责。
 - 不写生产代码；一次性探针脚本可以放在 /tmp。
 - 方案要克制：计划正文默认不超过约 80 行，除非任务确实更复杂并在 PLAN.md 里说明理由。
 - 不扩大范围，取满足目标的最小方案。`
@@ -207,6 +209,7 @@ const LEAD_POLICY = `Agent Squad 已启用：你是 Lead，小队里有按角色
 - 默认在 worktree 分支开发：squad_start 会创建新分支并切过去；不要在源 checkout 上直接改业务代码。
 - 收尾：双验收 approved 后调用 squad_finish（提交 worktree 改动、切回源目录、给出分支与合并命令）。
 - 队友共享你的工作目录与 .agent-squad 记忆，不要重复他们的工作。
+- 架构师容错：gpt 因额度耗尽不可用时（派单报出额度类错误或队友上报额度耗尽），插件会自动挂起 gpt 并提示改派；架构师职责（spec 与 tech-review）由 codex 代行完成剩下的任务。也可手动 squad_failover({ agent: "gpt", reason: "原因" }) 挂起。挂起期间派 gpt 会被拒绝；用户确认额度恢复后调用 squad_failover({ agent: "gpt", recover: true }) 交还职责。
 - 面向用户的回复必须使用用户所用的语言（用户用中文就用中文）；角色章程的语言不影响你回复用户的语言。`
 
 const DEFAULT_AGENTS = [
@@ -249,6 +252,9 @@ const DEFAULT_AGENTS = [
 - 边界：不改后端代码；涉及接口契约的问题报告 Lead 转交 zcode，不代改。`,
   },
 ]
+
+/** Quota-exhaustion signatures that auto-suspend an architect (failover). */
+const QUOTA_ERROR = /额度|余额|欠费|限流|quota|insufficient|balance|exceeded|429|rate.?limit/i
 
 /** Build a registry-ready tool definition from a JSON-Schema parameter object. */
 function defineTool(definition) {
@@ -611,14 +617,20 @@ ${members}
 }
 
 function deliverableOf(agent, phase) {
+  // The phase decides the artifact; the acting-architect note marks a brain
+  // covering a suspended architect (failover) or countersigning a takeover.
+  const acting = agent.role !== 'architect' && (phase === 'spec' || phase === 'tech-review')
+    ? '（代行架构师职责）' : ''
+  if (phase === 'spec') {
+    return `发布/修订技术规格 SPEC.md（代码结构、模块职责、表与迁移、领域模型、接口与错误、验证用例；不适用处明确说明），版本号以派单为准。${acting}`
+  }
+  if (phase === 'tech-review') {
+    return `技术验收轮以当前 SPEC.md 为唯一技术规格写 TECH-REVIEW.md：代码审查、亲自运行验证测试、逐条记录命令/退出码/关键输出与编号缺陷，最后一行 VERDICT。${acting}`
+  }
   if (agent.role === 'brain') {
-    return phase === 'review'
-      ? '业务验收轮以 PLAN-APPROVED.md 为唯一业务规格写 REVIEW.md，逐条 AC 给结论与证据；需要时代签技术验收（TECH-REVIEW.md，对照 SPEC.md）。'
-      : '设计轮写 PLAN.md 的业务方案与 AC 映射（对外行为、用户可见结果、边界场景、验收标准）。'
+    return '业务验收轮以 PLAN-APPROVED.md 为唯一业务规格写 REVIEW.md，逐条 AC 给结论与证据。'
   }
   if (agent.role === 'architect') {
-    if (phase === 'spec') return '发布/修订技术规格 SPEC.md（代码结构、模块职责、表与迁移、领域模型、接口与错误、验证用例；不适用处明确说明），版本号以派单为准。'
-    if (phase === 'tech-review') return '技术验收轮以当前 SPEC.md 为唯一技术规格写 TECH-REVIEW.md：代码审查、亲自运行验证测试、逐条记录命令/退出码/关键输出与编号缺陷，最后一行 VERDICT。'
     return '写 REPORT.md，按 PLAN-APPROVED.md + SPEC.md 逐条 AC 记录改动、测试名、命令、退出码、关键输出与结论（接手实现时按 worker 规程执行并自测）。'
   }
   return '写 REPORT.md，按 PLAN-APPROVED.md + SPEC.md 逐条 AC 记录改动、测试名、命令、退出码、关键输出与结论；豁免任务按 TASK.md 与 Lead 本轮派单逐条 AC 留证。'
@@ -719,17 +731,21 @@ function dispatchPrompt({ mode, taskId, taskDir, phase, round, agent, message, w
   const charter = includeCharter ? `\n角色章程：\n${charterFor(agent, config)}\n` : ''
   const repoBlock = worktrees.length > 1 ? `${repoLines(worktrees).join('\n')}\n` : ''
   const deliverFile =
-    agent.role === 'brain'
-      ? phase === 'review'
-        ? 'REVIEW.md（需要时代签 TECH-REVIEW.md）'
-        : 'PLAN.md'
-      : agent.role === 'architect'
-        ? phase === 'spec'
-          ? 'SPEC.md'
-          : phase === 'tech-review'
-            ? 'TECH-REVIEW.md'
+    phase === 'spec'
+      ? 'SPEC.md'
+      : phase === 'tech-review'
+        ? 'TECH-REVIEW.md'
+        : agent.role === 'brain'
+          ? phase === 'review'
+            ? 'REVIEW.md'
+            : 'PLAN.md'
+          : agent.role === 'architect'
+            ? 'REPORT.md'
             : 'REPORT.md'
-        : 'REPORT.md'
+  const actingNote =
+    agent.role !== 'architect' && (phase === 'spec' || phase === 'tech-review')
+      ? '\n注：架构师当前不可用时由你代行架构师职责，按上述规格交付。\n'
+      : ''
   return `[Agent Squad · ${mode}] task=${taskId} phase=${phase} round=${round} role=${agent.role}
 工作区：${workspace}
 ${repoBlock}共享记忆：${taskDir}
@@ -740,7 +756,7 @@ ${charter}
 - AC 映射：沿用 TASK.md 的 AC 编号；未编号时按条目顺序从 AC1 开始编号。PLAN.md/SPEC.md 为每条 AC 指定改动文件、测试名、验证命令与期望值；REPORT.md/TECH-REVIEW.md/REVIEW.md 按对应规格逐条记录 AC 编号、文件路径、测试名、命令、退出码、关键输出与结论。
 本轮交办：
 ${message}
-
+${actingNote}
 交付：把结果写入 ${deliverFile}；只回复 ≤150 字摘要 + 文件路径，不要回贴全文。`
 }
 
@@ -1260,6 +1276,18 @@ function createTools(ctx, config, runtime, store) {
           `未知 agent "${args.agent}"。已配置 agent：${roster.map((agent) => agent.name).join(', ') || '（无）'}`,
         )
       }
+      // Failover: a suspended teammate (e.g. the architect after quota
+      // exhaustion) refuses every dispatch until squad_failover recovers it.
+      if (runtime.isSuspended(target.name)) {
+        const record = runtime.suspendedRecord?.(target.name)
+        throw new Error(
+          `队友 ${target.name} 已挂起${record ? `（自 ${record.at}；原因：${clip(record.reason, 80)}）` : ''}，不能派单。` +
+            (target.role === 'architect'
+              ? `架构师职责由 brain 代行：squad_dispatch({ agent: "codex", phase: "spec" | "tech-review", … })。`
+              : '') +
+            `用户确认恢复后调用 squad_failover({ agent: "${target.name}", recover: true }) 解除挂起。`,
+        )
+      }
       const current = await readJson(join(directory, 'current.json'))
       const taskId = String(args.task_id ?? current?.taskId ?? '')
       if (!taskId) throw new Error('还没有小队任务。先调用 squad_start。')
@@ -1414,8 +1442,15 @@ function createTools(ctx, config, runtime, store) {
             `任务 ${taskId} 未启用完整流程（没有 architect 参与，或创建时选择了 flow="simple"）：不能派 spec，直接按简化流程派单。`,
           )
         }
-        if (target.role !== 'architect') {
-          throw new Error(`spec 阶段只能派 architect 角色；${target.name} 当前是 ${target.role}。`)
+        // Failover: the brain may act as architect while every roster
+        // architect is suspended (quota exhaustion handover).
+        const architectAvailable = roster.some(
+          (agent) => agent.role === 'architect' && !runtime.isSuspended(agent.name),
+        )
+        if (target.role !== 'architect' && !(target.role === 'brain' && !architectAvailable)) {
+          throw new Error(
+            `spec 阶段只能派 architect 角色${architectAvailable ? '' : '（架构师已挂起时可由 brain 代行）'}；${target.name} 当前是 ${target.role}。`,
+          )
         }
         if (plan.planRequired && !plan.planApproved) {
           throw new Error(
@@ -1863,6 +1898,10 @@ function createTools(ctx, config, runtime, store) {
   // R07: process-local dispatch lock keyed by Lead + fixed agent id. It closes
   // the window between the STATE read and the provisional provisioning record,
   // which a persisted record alone cannot cover. Held only for this call.
+  // Failover: an architect dispatch that dies with a quota-like error (额度
+  // exhausted, 429, insufficient balance…) auto-suspends that architect and
+  // enriches the error with the handover guidance; the brain then covers the
+  // architect duties for the remaining phases.
   const dispatchInFlight = new Set()
   const dispatchExecute = dispatch.execute
   dispatch.execute = async (args, exec) => {
@@ -1875,6 +1914,24 @@ function createTools(ctx, config, runtime, store) {
     dispatchInFlight.add(key)
     try {
       return await dispatchExecute(args, exec)
+    } catch (error) {
+      const name = String(args.agent ?? '')
+      const message = error instanceof Error ? error.message : String(error)
+      let handover = null
+      try {
+        const roster = settingsRoster(await store.read(), config)
+        const target = roster.find((agent) => agent.name === name)
+        if (
+          target?.role === 'architect' &&
+          !runtime.isSuspended(name) &&
+          QUOTA_ERROR.test(message)
+        ) {
+          await runtime.suspendAgent(name, `派单失败自动挂起：${firstLine(message)}`, true)
+          handover = `${message}\n[${name} 已因额度问题自动挂起] 架构师职责改由 brain（codex）代行：重派 squad_dispatch({ agent: "codex", phase: "${args.phase ?? 'design'}", … })；用户确认恢复后 squad_failover({ agent: "${name}", recover: true })。`
+        }
+      } catch {}
+      if (handover) throw new Error(handover)
+      throw error
     } finally {
       dispatchInFlight.delete(key)
     }
@@ -1938,6 +1995,12 @@ function createTools(ctx, config, runtime, store) {
             : ['工作区：原地开发']
       const lines = [
         `${PLUGIN_MARKER}  task=${taskId}  phase=${state.phase ?? 'unknown'}  round=${state.round ?? '?'}  flow=${flow.flow}  created=${state.createdAt ?? '?'}`,
+        (() => {
+          const rows = runtime.suspendedRows()
+          return rows.length === 0
+            ? '挂起：无'
+            : `挂起：${rows.map((row) => `${row.name}（自 ${row.at}；${row.auto ? '自动' : '手动'}；原因：${clip(row.reason, 60)}）→ 架构师职责由 brain 代行`).join('；')}`
+        })(),
         `PLAN：planRequired=${plan.planRequired}  planRounds=${plan.planRounds}/${budget.designLimit}  planApproved=${plan.planApproved}${
           plan.planApproved
             ? `  planApprovedAt=${plan.planApprovedAt ?? '?'}（已归档 PLAN-APPROVED.md）`
@@ -2108,6 +2171,14 @@ function createTools(ctx, config, runtime, store) {
         runtime.bindingOf(me.id) ??
         settingsRoster(await store.read(), config).find((agent) => agent.name === name)
       const role = configured?.role ?? 'worker'
+      // Failover: an architect reporting blocked with a quota-like summary
+      // (额度耗尽/429/insufficient…) auto-suspends it; the Lead gets the
+      // handover hint through the report text and squad_status.
+      if (args.status === 'blocked' && role === 'architect' && QUOTA_ERROR.test(String(args.summary ?? ''))) {
+        try {
+          await runtime.suspendAgent(name, `队友报告额度耗尽：${firstLine(args.summary)}`, true)
+        } catch {}
+      }
       if (current?.taskId) {
         const journal = join(directory, String(current.taskId), 'JOURNAL.md')
         await appendFile(
@@ -2608,6 +2679,60 @@ ${String(args.summary).trim()}
     },
   })
 
+  const failover = defineTool({
+    name: 'squad_failover',
+    description:
+      '架构师容错交接（仅 Lead）：把因额度耗尽等原因不可用的架构师（gpt）挂起，其职责（SPEC.md 技术规格、TECH-REVIEW.md 技术验收）由 brain（codex）代行直到恢复；挂起期间对它的派单被拒绝。派单报出额度类错误、或架构师 squad_report 上报额度耗尽时会自动挂起，此工具用于手动挂起与恢复。用户确认架构师已恢复（额度重置/换 key）后再传 recover: true。',
+    parameters: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        agent: { type: 'string', description: 'Teammate name, e.g. gpt.' },
+        reason: { type: 'string', description: 'Why the architect is suspended (required unless recovering).' },
+        recover: { type: 'boolean', description: 'true lifts the suspension instead of creating one.' },
+      },
+      required: ['agent'],
+    },
+    output: {
+      schema: { type: 'string' },
+      render: (_args, value) => [{ type: 'text', text: value }],
+    },
+    async execute(args, exec) {
+      const lead = callingAgent(exec, 'squad_failover')
+      const name = String(args.agent ?? '').trim()
+      if (!name) throw new Error('agent 必须是非空字符串。')
+      const roster = settingsRoster(await store.read(), config)
+      const target = roster.find((agent) => agent.name === name)
+      if (!target) {
+        throw new Error(`未知 agent "${name}"。已配置 agent：${roster.map((agent) => agent.name).join(', ') || '（无）'}`)
+      }
+      if (args.recover === true) {
+        if (!runtime.isSuspended(name)) throw new Error(`队友 ${name} 未挂起，无需恢复。`)
+        await runtime.recoverAgent(name)
+        return [
+          `队友 ${name} 已解除挂起，恢复架构师职责。`,
+          `下次派单恢复正常（spec/tech-review 重新派给它；挂起期间由 brain 代行的结论仍有效）。`,
+        ].join('\n')
+      }
+      if (args.recover !== undefined) throw new Error('recover 只能是 true（解除挂起）或省略（挂起）。')
+      if (target.role !== 'architect') {
+        throw new Error(`仅架构师支持挂起交接（brain 代行架构师职责）；${name} 当前是 ${target.role}。`)
+      }
+      if (runtime.isSuspended(name)) {
+        const record = runtime.suspendedRecord?.(name)
+        throw new Error(`${name} 已处于挂起状态${record ? `（自 ${record.at}；原因：${clip(record.reason, 80)}）` : ''}，不能重复挂起。`)
+      }
+      const reason = String(args.reason ?? '').trim()
+      if (!reason) throw new Error('reason 必须是非空字符串（挂起原因）。')
+      await runtime.suspendAgent(name, reason, false)
+      return [
+        `架构师 ${name} 已挂起（原因：${reason}）。`,
+        '架构师职责由 brain（codex）代行：squad_dispatch({ agent: "codex", phase: "spec" | "tech-review", … })；对挂起队友的派单会被拒绝。',
+        `用户确认恢复后调用 squad_failover({ agent: "${name}", recover: true })。`,
+      ].join('\n')
+    },
+  })
+
   const enable = defineTool({
     name: 'squad_enable',
     description:
@@ -2636,7 +2761,7 @@ ${String(args.summary).trim()}
     },
   })
 
-  return { start, dispatch, status, wait, report, finish, approvePlan, extend, enable }
+  return { start, dispatch, status, wait, report, finish, approvePlan, extend, enable, failover }
 }
 
 /** Host plugin entry. */
@@ -2676,6 +2801,20 @@ export function apply(ctx, input) {
     seed: seedFromBundle(config.agents, config.worktreeDir),
     logger: { warn: (text) => ctx.logger?.('agent-squad')?.warn?.(text) },
   })
+  // Failover state: suspended teammates (quota-exhausted architects) persist
+  // next to the settings file so reloads and restarts keep the handover in
+  // force until squad_failover recovers them. Loaded synchronously at apply
+  // so the very first dispatch already sees it.
+  const failoverPath = join(dirname(store.path), 'failover.json')
+  const suspended = new Map()
+  try {
+    const raw = JSON.parse(readFileSync(failoverPath, 'utf8'))
+    for (const [name, record] of Object.entries(raw?.suspended ?? {})) {
+      if (record && typeof record === 'object') suspended.set(name, record)
+    }
+  } catch {}
+  const persistFailover = () =>
+    writeJson(failoverPath, { suspended: Object.fromEntries(suspended) }).catch(() => {})
   // Settings page routes: register when the host web server is available.
   // `ctx.get()` at apply time can be undefined during startup in newer DSH
   // releases, so use a reactive injection instead of a one-shot check.
@@ -2817,6 +2956,24 @@ export function apply(ctx, input) {
         ctx.logger?.('agent-squad')?.warn?.('squad lead section install failed', error)
       }
     },
+    isSuspended: (name) => suspended.has(name),
+    suspendedRecord: (name) => suspended.get(name),
+    suspendedRows: () =>
+      [...suspended.entries()].map(([name, record]) => ({
+        name,
+        at: record.at ?? '?',
+        reason: record.reason ?? '',
+        auto: record.auto === true,
+      })),
+    suspendAgent: async (name, reason, auto) => {
+      suspended.set(name, { at: new Date().toISOString(), reason: String(reason ?? ''), auto: auto === true })
+      await persistFailover()
+      ctx.logger?.('agent-squad')?.warn?.(`failover: ${name} suspended (${auto ? 'auto' : 'manual'}): ${reason}`)
+    },
+    recoverAgent: async (name) => {
+      suspended.delete(name)
+      await persistFailover()
+    },
   }, store)
   const isLead = (agent) => membershipOf(agent)?.role === 'lead'
   const isTeammate = (agent) => membershipOf(agent)?.role === 'teammate'
@@ -2844,6 +3001,7 @@ export function apply(ctx, input) {
     [tools.finish, isLead],
     [tools.report, isTeammate],
     [tools.enable, isEnableCandidate],
+    [tools.failover, isLead],
   ]) {
     ctx.tools.register(definition, { when: ({ agent }) => condition(agent) })
   }

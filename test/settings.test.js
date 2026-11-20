@@ -1556,7 +1556,7 @@ test('T07 plan gate: lead review, design budget, squad_approve_plan, archives an
     // --- AC3: registration, opt-in gate and Lead-only visibility ------------
     const names = host.registered.map((entry) => entry.definition.name).sort()
     assert.deepEqual(names, [
-      'squad_approve_plan', 'squad_dispatch', 'squad_enable', 'squad_extend', 'squad_finish', 'squad_report', 'squad_start', 'squad_status', 'squad_wait',
+      'squad_approve_plan', 'squad_dispatch', 'squad_enable', 'squad_extend', 'squad_failover', 'squad_finish', 'squad_report', 'squad_start', 'squad_status', 'squad_wait',
     ])
     // Before opting in, the root sees ONLY the enable gate; the squad tools
     // and the Lead persona stay hidden (opt-in contract).
@@ -3562,7 +3562,7 @@ test('T10 budget extension requires user confirmation and resumes exhausted budg
       assert.deepEqual(
         host.registered.map((row) => row.definition.name).sort(),
         [
-          'squad_approve_plan', 'squad_dispatch', 'squad_enable', 'squad_extend', 'squad_finish',
+          'squad_approve_plan', 'squad_dispatch', 'squad_enable', 'squad_extend', 'squad_failover', 'squad_finish',
           'squad_report', 'squad_start', 'squad_status', 'squad_wait',
         ],
       )
@@ -4414,6 +4414,191 @@ test('T11 full flow: opt-in gate, spec/tech-review pipeline, dual acceptance, ta
       /未启用完整流程（无技术\/业务返工预算）：用 kind="design" 或 kind="implement"。/,
     )
     assert.match(await tool('squad_finish').execute({ summary: 'S done', task_id: taskS }, exec), /收尾/)
+  } finally {
+    delete process.env.DSH_HOME
+    await rm(workspace, { recursive: true, force: true })
+    await rm(dshHome, { recursive: true, force: true })
+  }
+})
+
+/** T12 — architect failover: quota auto-suspend, brain handover, recovery, persistence. */
+test('T12 failover suspends a quota-exhausted architect and hands its duties to the brain', async () => {
+  const workspace = await tempRoot()
+  const dshHome = await tempRoot()
+  process.env.DSH_HOME = dshHome
+  try {
+    // All-team roster: codex brain, gpt architect, zcode worker.
+    const settingsPath = join(dshHome, 'agent-squad', 'settings.json')
+    await mkdir(join(dshHome, 'agent-squad'), { recursive: true })
+    await writeFile(
+      settingsPath,
+      JSON.stringify(
+        {
+          version: 2,
+          revision: 1,
+          agents: [
+            { id: 'codex', displayName: 'codex', role: 'brain', executor: 'team', model: '', description: 'b' },
+            { id: 'gpt', displayName: 'gpt', role: 'architect', executor: 'team', model: '', description: 'a' },
+            { id: 'zcode', displayName: 'zcode', role: 'worker', executor: 'team', model: '', description: 'w' },
+            { id: 'qoder', displayName: 'qoder', role: 'worker', executor: 'team', model: '', description: 'w2' },
+          ],
+          worktree: { directory: '.agents/worktrees' },
+        },
+        null,
+        2,
+      ),
+      'utf8',
+    )
+    const failoverPath = join(dshHome, 'agent-squad', 'failover.json')
+    const { apply } = await import('../index.js')
+    const host = mockHost(workspace, dshHome)
+    apply(host.ctx, { agents: BUNDLE_AGENTS })
+    const tool = (name) => host.registered.find((entry) => entry.definition.name === name).definition
+    const lead = { id: 'lead-1', session: { id: 'session-1' }, __membership: { role: 'lead', name: 'lead' } }
+    const exec = { agent: lead, signal: undefined }
+    await tool('squad_enable').execute({}, exec)
+    const dispatch = (args) => tool('squad_dispatch').execute(args, exec)
+    const failover = (args) => tool('squad_failover').execute(args, exec)
+    const startTask = async (goal, agents) => {
+      const out = await tool('squad_start').execute({ goal, acceptance: 'ok', agents }, exec)
+      return /任务 (t-\S+) 已创建/.exec(out)[1]
+    }
+
+    // --- task F: manual suspension, handover gates, recovery ----------------
+    const taskF = await startTask('F', ['codex', 'gpt', 'zcode'])
+    const dirF = join(workspace, '.agent-squad', taskF)
+    await dispatch({ agent: 'codex', message: 'plan', phase: 'design' })
+    await writeFile(join(dirF, 'PLAN.md'), '# PLAN F\n', 'utf8')
+    await tool('squad_approve_plan').execute({ task_id: taskF }, exec)
+
+    // Before suspension the brain cannot take the spec round.
+    await assert.rejects(dispatch({ agent: 'codex', message: 's', phase: 'spec' }), /spec 阶段只能派 architect 角色；codex 当前是 brain。/)
+    // Failover tool validation: reason required; only architects.
+    await assert.rejects(failover({ agent: 'gpt' }), /reason 必须是非空字符串/)
+    await assert.rejects(failover({ agent: 'zcode', reason: 'x' }), /仅架构师支持挂起交接.*zcode 当前是 worker/)
+    // Manual suspension persists and shows in status.
+    const suspendOut = await failover({ agent: 'gpt', reason: '额度耗尽（手动验证）' })
+    assert.match(suspendOut, /架构师 gpt 已挂起/)
+    assert.match(suspendOut, /squad_dispatch\({ agent: "codex", phase: "spec" \| "tech-review", … }\)/)
+    assert.deepEqual(
+      Object.keys(JSON.parse(await readFile(failoverPath, 'utf8')).suspended),
+      ['gpt'],
+    )
+    await assert.rejects(failover({ agent: 'gpt', reason: 'again' }), /已处于挂起状态/)
+    const statusSuspended = await tool('squad_status').execute({}, exec)
+    assert.match(statusSuspended, /挂起：gpt（自 .+；手动；原因：额度耗尽（手动验证））→ 架构师职责由 brain 代行/)
+    // Suspended architect refuses dispatch with handover guidance.
+    await assert.rejects(
+      dispatch({ agent: 'gpt', message: 'spec', phase: 'spec' }),
+      /gpt 已挂起.*架构师职责由 brain 代行：squad_dispatch\({ agent: "codex", phase: "spec" \| "tech-review", … }\).*squad_failover\({ agent: "gpt", recover: true }\)/s,
+    )
+    // The brain now covers the spec round (acting architect).
+    const specOut = await dispatch({ agent: 'codex', message: 'write spec', phase: 'spec' })
+    assert.match(specOut, /已(创建|续跑) codex \[brain\]/)
+    const specPrompt = host.spawned.at(-1).prompt.map((block) => block.text).join('')
+    assert.match(specPrompt, /代行架构师职责/)
+    assert.match(specPrompt, /SPEC\.md/)
+    const stateF = JSON.parse(await readFile(join(dirF, 'STATE.json'), 'utf8'))
+    assert.equal(stateF.specPublished, true)
+    assert.equal(stateF.specVersion, 1)
+    // tech-review to the brain stays allowed; implement first (codeEpoch).
+    await dispatch({ agent: 'zcode', message: 'impl', phase: 'implement' })
+    const trOut = await dispatch({ agent: 'codex', message: 'tech', phase: 'tech-review' })
+    assert.match(trOut, /已续跑 codex \[brain\]/)
+
+    // Recovery restores the architect and closes the acting gate.
+    const recoverOut = await failover({ agent: 'gpt', recover: true })
+    assert.match(recoverOut, /已解除挂起/)
+    assert.deepEqual(JSON.parse(await readFile(failoverPath, 'utf8')).suspended, {})
+    await assert.rejects(failover({ agent: 'gpt', recover: true }), /未挂起，无需恢复/)
+    await assert.rejects(dispatch({ agent: 'codex', message: 's', phase: 'spec' }), /spec 阶段只能派 architect 角色；codex 当前是 brain。/)
+    assert.match(await dispatch({ agent: 'gpt', message: 'spec again', phase: 'spec' }), /已创建 gpt \[architect\]/)
+    const statusRestored = await tool('squad_status').execute({}, exec)
+    assert.match(statusRestored, /挂起：无/)
+
+    // --- auto-suspend: dispatch dies with a quota-like error ----------------
+    const taskG = await startTask('G', ['codex', 'gpt', 'zcode'])
+    const dirG = join(workspace, '.agent-squad', taskG)
+    await dispatch({ agent: 'codex', message: 'plan', phase: 'design' })
+    await writeFile(join(dirG, 'PLAN.md'), '# PLAN G\n', 'utf8')
+    await tool('squad_approve_plan').execute({ task_id: taskG }, exec)
+    const originalStart = host.subagents.startActivation
+    const originalSend = host.subagents.sendMessage
+    const gptMemberId = host.members.find((member) => member.name === 'gpt')?.id
+    const installQuotaThrow = (message) => {
+      host.subagents.startActivation = async (spec) => {
+        if (spec.name === 'gpt') throw new Error(message)
+        return originalStart(spec)
+      }
+      host.subagents.sendMessage = async (from, targetId, content) => {
+        if (targetId === gptMemberId) throw new Error(message)
+        return originalSend(from, targetId, content)
+      }
+    }
+    installQuotaThrow('HTTP 429 quota exceeded：账户额度耗尽')
+    try {
+      await assert.rejects(
+        dispatch({ agent: 'gpt', message: 'spec', phase: 'spec' }),
+        (error) =>
+          /额度耗尽/.test(error.message) &&
+          /gpt 已因额度问题自动挂起.*squad_dispatch\({ agent: "codex", phase: "spec", … }\).*squad_failover\({ agent: "gpt", recover: true }\)/s.test(error.message),
+      )
+    } finally {
+      host.subagents.startActivation = originalStart
+      host.subagents.sendMessage = originalSend
+    }
+    const autoRecord = JSON.parse(await readFile(failoverPath, 'utf8')).suspended.gpt
+    assert.match(autoRecord.reason, /派单失败自动挂起：HTTP 429/)
+    assert.equal(autoRecord.auto, true)
+    assert.match(await tool('squad_status').execute({}, exec), /挂起：gpt（自 .+；自动；/)
+    // Non-quota dispatch errors do NOT suspend.
+    await tool('squad_failover').execute({ agent: 'gpt', recover: true }, exec)
+    installQuotaThrow('spawn crashed for unrelated reasons')
+    try {
+      await assert.rejects(dispatch({ agent: 'gpt', message: 'spec', phase: 'spec' }), /spawn crashed/)
+      assert.equal(JSON.parse(await readFile(failoverPath, 'utf8')).suspended.gpt, undefined)
+    } finally {
+      host.subagents.startActivation = originalStart
+      host.subagents.sendMessage = originalSend
+    }
+
+    // --- auto-suspend: the architect reports blocked with a quota summary ---
+    await dispatch({ agent: 'gpt', message: 'spec', phase: 'spec' })
+    const gptAgent = [...host.agentsById.values()].find((agent) => agent.__membership?.name === 'gpt')
+    assert.ok(gptAgent, 'spawned gpt member exists')
+    const reportOut = await tool('squad_report').execute(
+      { status: 'blocked', summary: 'API 报 429 quota：模型额度已耗尽，无法继续' },
+      { agent: gptAgent, signal: undefined },
+    )
+    assert.match(reportOut, /status=blocked/)
+    assert.match(JSON.parse(await readFile(failoverPath, 'utf8')).suspended.gpt.reason, /队友报告额度耗尽/)
+    await assert.rejects(dispatch({ agent: 'gpt', message: 'again', phase: 'spec' }), /已挂起/)
+
+    // --- persistence: a fresh plugin generation keeps the suspension --------
+    {
+      await tool('squad_failover').execute({ agent: 'gpt', recover: true }, exec)
+      await writeFile(failoverPath, JSON.stringify({ suspended: { gpt: { at: '2026-11-20T00:00:00.000Z', reason: '重启前挂起', auto: true } } }, null, 2), 'utf8')
+      const host2 = mockHost(workspace, dshHome)
+      apply(host2.ctx, { agents: BUNDLE_AGENTS })
+      const tool2 = (name) => host2.registered.find((entry) => entry.definition.name === name).definition
+      const exec2 = { agent: { id: 'lead-2', session: { id: 'session-2' }, __membership: { role: 'lead', name: 'lead' } }, signal: undefined }
+      await tool2('squad_enable').execute({}, exec2)
+      const out = await tool2('squad_start').execute({ goal: 'P', acceptance: 'ok', agents: ['codex', 'gpt', 'zcode'] }, exec2)
+      const taskP = /任务 (t-\S+) 已创建/.exec(out)[1]
+      const dirP = join(workspace, '.agent-squad', taskP)
+      await tool2('squad_dispatch').execute({ agent: 'codex', message: 'plan', phase: 'design' }, exec2)
+      await writeFile(join(dirP, 'PLAN.md'), '# PLAN P\n', 'utf8')
+      await tool2('squad_approve_plan').execute({ task_id: taskP }, exec2)
+      await assert.rejects(
+        tool2('squad_dispatch').execute({ agent: 'gpt', message: 'spec', phase: 'spec' }, exec2),
+        /gpt 已挂起（自 2026-11-20T00:00:00.000Z；原因：重启前挂起）/,
+      )
+      // And the brain may act while the persisted suspension is in force.
+      assert.match(
+        await tool2('squad_dispatch').execute({ agent: 'codex', message: 'acting spec', phase: 'spec' }, exec2),
+        /已(创建|续跑) codex \[brain\]/,
+      )
+    }
   } finally {
     delete process.env.DSH_HOME
     await rm(workspace, { recursive: true, force: true })
