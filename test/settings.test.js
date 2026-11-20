@@ -700,7 +700,7 @@ test('T03 dispatch reads fresh settings and routes external/local/team executors
       worktree: snapshot.worktree,
     })
     const local3 = await tool('squad_dispatch').execute(
-      { agent: 'zcode', message: 'next', phase: 'implement' },
+      { agent: 'zcode', message: 'next', phase: 'implement', background: false },
       exec,
     )
     assert.match(local3, /已外部派发/)
@@ -710,7 +710,7 @@ test('T03 dispatch reads fresh settings and routes external/local/team executors
     {
       const before = host.members.length
       const out = await tool('squad_dispatch').execute(
-        { agent: 'zcode', message: 'one-shot probe', phase: 'implement' },
+        { agent: 'zcode', message: 'one-shot probe', phase: 'implement', background: false },
         exec,
       )
       assert.match(out, /已外部派发 zcode \(zcode\).*provider=p2\/m9（一次性，不续跑）/)
@@ -831,7 +831,7 @@ test('T03 dispatch reads fresh settings and routes external/local/team executors
     const spawnedBeforeQoder = host.spawned.length
     const runsBefore = host.runIds.length
     const qoderOut = await tool('squad_dispatch').execute(
-      { agent: 'qoder', message: 'qoder test', phase: 'implement' },
+      { agent: 'qoder', message: 'qoder test', phase: 'implement', background: false },
       exec,
     )
     assert.match(qoderOut, /已外部派发 qoder/)
@@ -3072,6 +3072,7 @@ test('T09 multi-repository lifecycle, validation, rollback and compatibility', a
               agent: 'qoder',
               message: '只把任务根下两个 worktree 里的 hello.txt 分别改为 A\\n（1-repo-k）与 B\\n（2-repo-l）；不要提交，不要改其他文件。',
               phase: 'implement',
+              background: false, // this test asserts the files right after the run
             },
             { agent: lead, signal: controller.signal },
           )
@@ -4611,13 +4612,13 @@ test('T12 failover suspends a quota-exhausted architect and hands its duties to 
   }
 })
 
-/** T13 — parallel development: background external dispatch + subagent guidance. */
-test('T13 background dispatch unblocks the Lead for parallel workers', async () => {
+/** T13 — parallel by default: background external dispatch + subagent guidance. */
+test('T13 background dispatch is the default for external implement and unblocks the Lead', async () => {
   const workspace = await tempRoot()
   const dshHome = await tempRoot()
   process.env.DSH_HOME = dshHome
   try {
-    // zcode external mock provider (blocking by default), qoder local.
+    // zcode external mock provider, qoder local.
     const settingsPath = join(dshHome, 'agent-squad', 'settings.json')
     await mkdir(join(dshHome, 'agent-squad'), { recursive: true })
     await writeFile(
@@ -4655,30 +4656,27 @@ test('T13 background dispatch unblocks the Lead for parallel workers', async () 
     )
     const task = /任务 (t-\S+) 已创建/.exec(startOut)[1]
 
-    // Validation: background is external-only and implement/rework-only.
+    // Validation: explicit background:true outside external implement/rework
+    // is rejected; background:false is the blocking opt-out.
     await assert.rejects(
       dispatch({ agent: 'qoder', message: 'x', phase: 'implement', background: true }),
       /background 仅支持 external 执行者（一次性外部 provider）；local\/team 执行者本就不阻塞。/,
     )
     await assert.rejects(
-      dispatch({ agent: 'zcode', message: 'x', phase: 'implement', background: false }),
-      /background 只能是 true（后台派发）或省略。/,
+      dispatch({ agent: 'zcode', message: 'x', phase: 'design', background: true }),
+      /background 仅支持 implement\/rework 阶段；design\/spec\/review\/tech-review 需要同步读取交付物，不能后台派发。/,
     )
 
-    // Blocking dispatch stays the default (output included).
-    const blocking = await dispatch({ agent: 'zcode', message: 'serial', phase: 'implement' })
-    assert.match(blocking, /已外部派发 zcode/)
-    assert.match(blocking, /输出：/)
-
-    // Background dispatch: returns immediately, no output section, recorded.
-    const bg = await dispatch({ agent: 'zcode', message: 'parallel part', phase: 'implement', background: true })
+    // Parallel-by-default: an external implement dispatch WITHOUT any flag
+    // runs in the background — no output section, delivery 'parent'.
+    const bg = await dispatch({ agent: 'zcode', message: 'parallel part', phase: 'implement' })
     assert.match(bg, /已后台派发 zcode \(zcode\) \[worker\] provider=mock-ext（不阻塞，可继续派其他队友）/)
-    assert.ok(!/输出：/.test(bg), 'background dispatch must not include the run output')
+    assert.ok(!/输出：/.test(bg), 'default external implement must not block on the output')
     assert.match(bg, /结果完成时会以后台消息送达/)
     assert.equal(host.activations.at(-1).delivery, 'parent')
-    const state = JSON.parse(await readFile(join(workspace, '.agent-squad', task, 'STATE.json'), 'utf8'))
+    let state = JSON.parse(await readFile(join(workspace, '.agent-squad', task, 'STATE.json'), 'utf8'))
     assert.equal(state.dispatches.at(-1).mode, 'external-background')
-    assert.equal(state.codeEpoch, 2) // both implement dispatches bumped the epoch
+    assert.equal(state.codeEpoch, 1)
     assert.deepEqual(state.implementers, ['zcode'])
     assert.match(await readFile(join(workspace, '.agent-squad', task, 'RUNS.md'), 'utf8'), /mode=background/)
 
@@ -4690,29 +4688,29 @@ test('T13 background dispatch unblocks the Lead for parallel workers', async () 
       /已创建本地子代理 qoder/,
     )
 
-    // squad_status renders the running background executors.
+    // squad_status renders the running background executors; finish waits.
     const bgChild = host.activations.find((row) => row.provider === 'mock-ext' && row.childId)?.childId
     host.markRunning(bgChild ?? 'bg-unknown')
     const statusOut = await tool('squad_status').execute({}, exec)
     assert.match(statusOut, /后台执行器运行中：[12] 个（background 派发，结果将以消息送达；squad_finish 会等待）/)
-    // finish waits for the background run.
     await assert.rejects(
       tool('squad_finish').execute({ summary: 'nope' }, exec),
       /仍有队友在运行/,
     )
     host.unmarkRunning(bgChild ?? 'bg-unknown')
 
-    // Review/design-family phases refuse background (deliverable read
-    // synchronously); legacy rework without a pending acceptance is free-form
-    // and may background like implement.
-    await assert.rejects(
-      dispatch({ agent: 'zcode', message: 'x', phase: 'design', background: true }),
-      /background 仅支持 implement\/rework 阶段；design\/spec\/review\/tech-review 需要同步读取交付物，不能后台派发。/,
-    )
+    // Explicit background:false restores the blocking call with inline output.
+    const blocking = await dispatch({ agent: 'zcode', message: 'serial', phase: 'implement', background: false })
+    assert.match(blocking, /已外部派发 zcode/)
+    assert.match(blocking, /输出：/)
+    state = JSON.parse(await readFile(join(workspace, '.agent-squad', task, 'STATE.json'), 'utf8'))
+    assert.equal(state.dispatches.at(-1).mode, 'external')
+    assert.equal(state.codeEpoch, 3) // bg zcode + qoder + blocking zcode
 
-    // Charter guidance: the worker prompt carries the subagent parallel hint.
+    // Charter guidance: worker prompts carry the parallel-by-default hint.
     const workerPrompt = host.activations.at(-1).prompt.map((block) => block.text).join('')
-    assert.match(workerPrompt, /可并行的独立文件\/模块/)
+    assert.match(workerPrompt, /并行默认：本轮交办包含多个独立文件\/模块时/)
+    assert.match(workerPrompt, /子代理\/并行能力同时开发/)
   } finally {
     delete process.env.DSH_HOME
     await rm(workspace, { recursive: true, force: true })

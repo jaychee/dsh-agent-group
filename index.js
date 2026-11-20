@@ -179,7 +179,7 @@ const WORKER_CHARTER = `你是小队里的执行者，严格按已批准的业�
 - 规格缺失、矛盾或明显错误时立即停止实现，报 "blocked"，引用 PLAN-APPROVED.md/SPEC.md 的具体章节与编号，并列出缺失项或冲突原文；需要归档而文件缺失时明确引用文件名；豁免任务引用 TASK.md 章节或 Lead 派单条目。规格有问题上报 Lead 转 gpt 修订发布，不自行偏离或改用 PLAN.md。
 - 按 SPEC.md 指定的测试名、输入与期望输出写或更新测试，并亲自运行每条 AC 的验收命令；豁免任务按 TASK.md 与 Lead 本轮派单执行。
 - 在 REPORT.md 逐条 AC 给证据：AC 编号、改动文件路径、测试名、实际命令、退出码、关键输出与结论；失败或未执行必须如实标注，不得只写“测试通过”。
-- 派单消息列出可并行的独立文件/模块时，可用你自己的子代理/并行能力同时开发这些部分以加速；边界不变：只改规格内文件、逐条 AC 留证、汇总写 REPORT.md。
+- 并行默认：实现工作包含多个独立文件/模块时，默认用你自己的子代理/并行能力同时开发；不独立的部分串行完成。边界不变：只改规格内文件、逐条 AC 留证、汇总写 REPORT.md。
 - 返工派单仍是在同一段对话里：逐条修复验收提出的编号缺陷，重跑完整相关测试，再次报告。`
 
 const LEAD_POLICY = `Agent Squad 已启用：你是 Lead，小队里有按角色分工的队友（brain=业务设计与验收，architect=系统架构师，worker=执行者）。
@@ -190,7 +190,7 @@ const LEAD_POLICY = `Agent Squad 已启用：你是 Lead，小队里有按角色
 3. Lead 亲自审核 PLAN.md：假装自己是没有上下文的架构师，无法只靠 PLAN 拍板技术设计的点按 D1 起连续编号，写明章节、缺失或矛盾、最小补全要求，派回 brain（phase="design"）返工迭代，默认初始设计 + ${MAX_DESIGN_REWORK_ROUNDS} 轮返工 = ${MAX_PLAN_ROUNDS} 次 design 派单，未扩展时第 ${MAX_PLAN_ROUNDS + 1} 次暂停：先向用户说明阻塞点与已完成部分并等待决策，用户同意后调用 squad_extend(kind="design", rounds=3, reason="用户批准的追加理由", confirmed=true) 追加轮次再派 design；每次扩展都要重新取得用户明确确认，可重复扩展，不自动续跑；用户拒绝或未回复时保持暂停。
 4. 方案合格后调用 squad_approve_plan 批准（归档 PLAN-APPROVED.md）。有 brain 参与的任务，PLAN 未批准前 implement/rework/spec 派单会被拒绝；没有 brain 参与的任务豁免此门禁。
 5. 派 architect（gpt），phase="spec"：读取 PLAN-APPROVED.md，发布技术规格 SPEC.md（代码结构、文件与模块职责、表与迁移、领域模型、接口与错误行为、各模块实现、可执行验证用例；不适用的明确说明）。规格可多轮修订、不占返工额度；发布后即可派工，不需要 Lead 再审批。
-6. 派 worker，phase="implement"：zcode 负责后端，qoder 负责前端产品代码；都按 PLAN-APPROVED.md + SPEC.md 实现并自测，写 REPORT.md。**提速**：① 派单消息里把可并行的独立文件/模块逐项列出，让 worker 用它自己的子代理并行开发；② 多个 worker 并行：external 执行者的 implement/rework 可传 background: true（后台派发、不阻塞，结果完成时以消息送达，可连续派多个），或先派不阻塞的 local/team 队友再派阻塞的外部队友。
+6. 派 worker，phase="implement"：zcode 负责后端，qoder 负责前端产品代码；都按 PLAN-APPROVED.md + SPEC.md 实现并自测，写 REPORT.md。**两层并行是默认运行方式**：① 小队层——external 执行者的 implement/rework 默认后台派发（不阻塞，结果完成时以消息送达），连续派多个 worker 并行跑（如 zcode 后端 + qoder 前端同时）；需要在本回合同步拿结果时才传 background: false；② worker 层——派单消息把可并行的独立文件/模块逐项列出，worker 默认用自己的子代理同时开发（只改规格内文件、逐条 AC 留证）。
 7. 派 gpt，phase="tech-review"：技术验收，附实际 diff 与测试证据，写 TECH-REVIEW.md。
 8. 技术验收 changes_requested → 把编号缺陷派回对应 worker，phase="rework"（技术返工额度 ${MAX_TECH_REWORK_ROUNDS} 轮，前后端共享、不因换人或规格修订重置；未扩展时第 4 轮暂停：先向用户说明阻塞点与已完成部分并等待决策，用户同意后调用 squad_extend(kind="tech", rounds=3, reason="用户批准的追加理由", confirmed=true) 追加轮次再派）。
 9. 技术验收 approved → 派 codex，phase="review"：业务验收，写 REVIEW.md。
@@ -649,6 +649,10 @@ function renderDispatch({ taskId, taskDir, phase, round, agent, message, include
         : phase === 'review'
           ? '先读 TASK.md；读取 PLAN-APPROVED.md、REPORT.md 与 TECH-REVIEW.md（存在时）；读取 JOURNAL.md 最后 80 行。'
           : '先读 TASK.md；设计轮读取 PLAN.md（存在时）；实现/返工读取 SPEC.md；读取 JOURNAL.md 最后 80 行。'
+  const parallelHint =
+    phase === 'implement' || phase === 'rework'
+      ? '并行默认：本轮交办包含多个独立文件/模块时，用你的子代理/并行能力同时开发；不独立的部分串行完成；只改规格内文件，逐条 AC 留证。'
+      : ''
   return `[Agent Squad] task=${taskId} phase=${phase} round=${round} role=${agent.role}
 ${charter}
 共享记忆：${taskDir}
@@ -661,7 +665,7 @@ ${readHint}
 
 Lead 的本轮派单：
 ${message}
-
+${parallelHint}
 交付物：${deliverable}
 汇报前：更新你的文件，向 JOURNAL.md 追加 2–5 行，然后调用 squad_report（status、简短总结、改动文件）。受阻写进报告，不要在对话里向 Lead 提问。`
 }
@@ -747,6 +751,10 @@ function dispatchPrompt({ mode, taskId, taskDir, phase, round, agent, message, w
     agent.role !== 'architect' && (phase === 'spec' || phase === 'tech-review')
       ? '\n注：架构师当前不可用时由你代行架构师职责，按上述规格交付。\n'
       : ''
+  const parallelHint =
+    phase === 'implement' || phase === 'rework'
+      ? '\n并行默认：本轮交办包含多个独立文件/模块时，用你的子代理/并行能力同时开发；不独立的部分串行完成；只改规格内文件，逐条 AC 留证。\n'
+      : ''
   return `[Agent Squad · ${mode}] task=${taskId} phase=${phase} round=${round} role=${agent.role}
 工作区：${workspace}
 ${repoBlock}共享记忆：${taskDir}
@@ -757,7 +765,7 @@ ${charter}
 - AC 映射：沿用 TASK.md 的 AC 编号；未编号时按条目顺序从 AC1 开始编号。PLAN.md/SPEC.md 为每条 AC 指定改动文件、测试名、验证命令与期望值；REPORT.md/TECH-REVIEW.md/REVIEW.md 按对应规格逐条记录 AC 编号、文件路径、测试名、命令、退出码、关键输出与结论。
 本轮交办：
 ${message}
-${actingNote}
+${parallelHint}${actingNote}
 交付：把结果写入 ${deliverFile}；只回复 ≤150 字摘要 + 文件路径，不要回贴全文。`
 }
 
@@ -1261,7 +1269,7 @@ function createTools(ctx, config, runtime, store) {
         background: {
           type: 'boolean',
           description:
-            'External executors only, implement/rework phases only: dispatch in the background so you can issue further dispatches concurrently. The result arrives as a message when it finishes; squad_finish still waits for it.',
+            'External implement/rework runs in the background BY DEFAULT (non-blocking; the result arrives as a message, so several workers can run in parallel). Pass false only when you need the result synchronously in this very turn.',
         },
         task_id: { type: 'string', description: 'Task id; defaults to the current task.' },
       },
@@ -1430,20 +1438,21 @@ function createTools(ctx, config, runtime, store) {
       // has published SPEC.md. Tasks without a brain participant are exempt
       // from the plan gate (planRequired snapshot).
       const plan = planGateOf(state)
-      // Background dispatch: external one-shot executors block the tool call
-      // until they return; background mode returns immediately (delivery
-      // 'parent') so the Lead can run several workers concurrently. Only the
-      // implement/rework phases qualify — the review/spec/design phases read
-      // the deliverable right after the result and must stay synchronous.
-      const background = args.background === true
-      if (args.background !== undefined && !background) {
-        throw new Error('background 只能是 true（后台派发）或省略。')
-      }
-      if (background && !external) {
-        throw new Error('background 仅支持 external 执行者（一次性外部 provider）；local/team 执行者本就不阻塞。')
-      }
-      if (background && phase !== 'implement' && phase !== 'rework') {
-        throw new Error('background 仅支持 implement/rework 阶段；design/spec/review/tech-review 需要同步读取交付物，不能后台派发。')
+      // Parallel-by-default (squad layer): external one-shot executors would
+      // block the tool call until they return, serializing the workers.
+      // implement/rework dispatches therefore default to background delivery
+      // ('parent': the result reaches the Lead as a message) so several
+      // workers can run concurrently; background:false forces the old
+      // blocking call. The review-family phases still read the deliverable
+      // right after the result and stay synchronous either way.
+      const background =
+        external && (phase === 'implement' || phase === 'rework') && args.background !== false
+      if (args.background === true && (!external || (phase !== 'implement' && phase !== 'rework'))) {
+        throw new Error(
+          !external
+            ? 'background 仅支持 external 执行者（一次性外部 provider）；local/team 执行者本就不阻塞。'
+            : 'background 仅支持 implement/rework 阶段；design/spec/review/tech-review 需要同步读取交付物，不能后台派发。',
+        )
       }
       if (phase === 'design') {
         if (plan.planApproved) {

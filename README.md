@@ -91,11 +91,11 @@ gpt（架构师）因**额度耗尽**等原因不可用时，插件把 gpt **挂
 - **持久化**：挂起状态存 `~/.dsh/agent-squad/failover.json`，插件重载/DSH 重启后仍生效，直到显式恢复；`squad_status` 显示"挂起：gpt（自 …；自动/手动；原因 …）"。
 - 代行期间 codex 产出的 SPEC.md 与 TECH-REVIEW.md 是正式记录；验收新鲜度规则不变（代行产生的技术验收同样绑定 codeEpoch/specVersion）。
 
-### 并行开发（提速）
+### 并行开发（默认运行方式，两层并行）
 
-- **worker 内部并行**：ZCode CLI 自带 subagent 体系（Task/Agent 工具），ACP 桥不过滤工具、权限自动放行——派单消息把可并行的独立文件/模块逐项列出时，zcode 会用自己的子代理并行开发这些部分（worker 章程已内置该引导；边界不变：只改规格内文件、逐条 AC 留证）。
-- **小队级并行**：external 执行者的 `implement`/`rework` 派单可传 `background: true`——后台派发（`delivery: 'parent'`），工具调用立即返回、结果完成时以后台消息送达 Lead，因此可以**连续并发派多个 worker**（如 zcode 后端 + qoder 前端同时跑）。`design/spec/review/tech-review` 需要同步读取交付物，不支持后台；local/team 执行者本就不阻塞。
-- `squad_status` 显示"后台执行器运行中：N 个"；`squad_finish` 会等所有后台执行器结束。同一 time 内对同一队友的重复派单仍受运行中守卫限制（R07）。
+- **worker 内部并行（默认）**：ZCode CLI 自带 subagent 体系（Task/Agent 工具），Qoder CLI 亦有 subagent（默认启用的实验设置）与 Workflow parallel/pipeline 编排；ACP/CLI 通道均不过滤工具、权限自动放行。worker 章程与 implement/rework 派单提示内置"并行默认"引导：交办包含多个独立文件/模块时，worker 默认用自己的子代理同时开发；不独立的部分串行完成；边界不变（只改规格内文件、逐条 AC 留证、汇总写 REPORT.md）。
+- **小队级并行（默认）**：external 执行者的 `implement`/`rework` 派单**默认后台派发**（`delivery: 'parent'`）——工具调用立即返回、结果完成时以后台消息送达 Lead，因此 Lead **默认可以连续并发派多个 worker**（如 zcode 后端 + qoder 前端同时跑）。需要在本回合同步拿到结果时传 `background: false` 恢复阻塞式；`design/spec/review/tech-review` 始终同步（需读取交付物）；local/team 执行者本就不阻塞。
+- `squad_status` 显示"后台执行器运行中：N 个"；`squad_finish` 会等所有后台执行器结束。同一队友运行中的重复派单仍受 R07 守卫限制。
 
 ### 预算与上限
 
@@ -364,7 +364,7 @@ token：GLM implement 26,295 / rework 26,459（cache 主导）；Codex 设计 + 
 | --- | --- | --- |
 | `squad_enable` | 任意会话根（未启用时） | 显式启用小队：仅当用户明确要求"用小队"时调用；仅提到队友名字不算启用。启用后本会话成为 Squad Lead |
 | `squad_start` | Lead | 可选 `repos: string[]`（默认当前仓库，首项为主仓）与 `flow: "full"\|"simple"`（默认 full；无 architect 参与者自动降级为简化规则并警告）；建 worktree 集合、写 TASK/JOURNAL/STATE 和门禁快照，最后发布 current |
-| `squad_dispatch` | Lead | 首次创建 / 之后续跑指定队友，推进 phase（design/spec/implement/tech-review/review/rework）与 round；design 受设计预算与已批准限制，spec 限 architect，implement/rework 受 PLAN 批准与规格交付门禁，tech-review 禁止自签，review（完整流程）要求技术验收新鲜通过；到预算上限时暂停并提示先问用户 |
+| `squad_dispatch` | Lead | 首次创建 / 之后续跑指定队友，推进 phase（design/spec/implement/tech-review/review/rework）与 round；design 受设计预算与已批准限制，spec 限 architect，implement/rework 受 PLAN 批准与规格交付门禁且 external 执行者默认后台派发（background: false 恢复阻塞），tech-review 禁止自签，review（完整流程）要求技术验收新鲜通过；到预算上限时暂停并提示先问用户 |
 | `squad_approve_plan` | Lead（仅 Lead 可见） | 审核通过 PLAN.md：补归档当前轮次 `PLAN-R<n>.md`，写 `PLAN-APPROVED.md` 与 `planApproved`/`planApprovedAt`；缺 PLAN、已收尾或已批准时拒绝 |
 | `squad_extend` | Lead（仅 Lead 可见） | 用户决策门禁：仅当对应预算（完整流程 `kind` = design/tech/business；简化/兼容 `kind` = design/implement）已到上限且用户明确同意后调用（`confirmed=true` 必填，`rounds` 正整数默认 3，`reason` 必填），提高该类上限并追加一条扩展记录；未到上限、未确认或非 Lead 一律拒绝；可重复扩展，不自动续跑 |
 | `squad_status` | Lead | 任务、阶段/轮次、流程（flow/specPublished/specVersion/codeEpoch/implementers）、双验收绑定与结论、全部仓库/worktree/分支/基线、PLAN 门禁、各类预算与最近 6 条扩展记录、成员状态、记忆文件、最近派单 |
