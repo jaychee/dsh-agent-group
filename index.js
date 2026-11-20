@@ -282,6 +282,8 @@ function resolveSettings(input) {
     agents,
     worktreeDir: text(config.worktreeDir, '.agents/worktrees'),
     workerProbe: config.workerProbe !== false,
+    /** How long a successful availability probe is reused (profile-wide). */
+    probeTtlMs: Number.isFinite(Number(config.probeTtlMs)) ? Number(config.probeTtlMs) : 600000,
     worktreeFrom: text(config.worktreeFrom, 'HEAD'),
     worktreeAutoCommit: config.worktreeAutoCommit !== false,
     qoderCommand: text(config.qoderCommand, 'qoderclicn'),
@@ -1912,13 +1914,18 @@ function createTools(ctx, config, runtime, store) {
         target.executor !== 'team'
       if (probeWanted) {
         const tried = new Set()
-        let needProbe = args.probe === true || state.probes?.[target.name]?.ok !== true
+        let needProbe =
+          args.probe === true ||
+          (args.probe !== false && runtime.probeFresh(target.name) !== false
+            ? false
+            : state.probes?.[target.name]?.ok !== true)
         while (needProbe && workerCapable(target) && target.executor !== 'team' && !tried.has(target.name)) {
           tried.add(target.name)
           const probe = await probeWorker(target, workspace, lead, exec.signal)
           if (probe.ok) {
             state.probes = { ...(state.probes ?? {}), [target.name]: { at: new Date().toISOString(), ok: true } }
             await writeJson(join(taskDir, 'STATE.json'), state)
+            await runtime.recordProbe(target.name, true).catch(() => {})
             needProbe = false
             break
           }
@@ -1928,6 +1935,7 @@ function createTools(ctx, config, runtime, store) {
             needProbe = false
             break
           }
+          await runtime.recordProbe(target.name, false).catch(() => {})
           await runtime.suspendAgent(target.name, `可用性探测失败：${detail}`, true, target.role)
           routeToSubstitute(`可用性探测失败：${detail}`)
           needProbe = state.probes?.[target.name]?.ok !== true
@@ -3643,6 +3651,24 @@ export function apply(ctx, input) {
   } catch {}
   const persistFailover = () =>
     writeJson(failoverPath, { suspended: Object.fromEntries(suspended) }).catch(() => {})
+  // Availability-probe cache: a worker that answered a probe recently is not
+  // probed again on the next dispatch (across tasks), so the gate costs at most
+  // one short round-trip per worker per TTL window.
+  const probeCachePath = join(dirname(store.path), 'probe-cache.json')
+  const probeCache = new Map()
+  try {
+    const raw = JSON.parse(readFileSync(probeCachePath, 'utf8'))
+    for (const [name, record] of Object.entries(raw?.probes ?? {})) {
+      if (record && Number.isFinite(Number(record.at))) probeCache.set(name, record)
+    }
+  } catch {}
+  const persistProbeCache = () =>
+    writeJson(probeCachePath, { probes: Object.fromEntries(probeCache) }).catch(() => {})
+  const probeFresh = (name) => {
+    const record = probeCache.get(name)
+    if (!record) return false
+    return Date.now() - Number(record.at) < config.probeTtlMs
+  }
   // Settings page routes: register when the host web server is available.
   // `ctx.get()` at apply time can be undefined during startup in newer DSH
   // releases, so use a reactive injection instead of a one-shot check.
@@ -3785,6 +3811,11 @@ export function apply(ctx, input) {
       }
     },
     isSuspended: (name) => suspended.has(name),
+    probeFresh,
+    recordProbe: async (name, ok) => {
+      probeCache.set(name, { at: Date.now(), ok: ok === true })
+      await persistProbeCache()
+    },
     suspendedRecord: (name) => suspended.get(name),
     suspendedRows: () =>
       [...suspended.entries()].map(([name, record]) => ({
@@ -3807,6 +3838,8 @@ export function apply(ctx, input) {
     recoverAgent: async (name) => {
       suspended.delete(name)
       await persistFailover()
+      probeCache.delete(name)
+      await persistProbeCache()
     },
   }, store)
   const isLead = (agent) => membershipOf(agent)?.role === 'lead'

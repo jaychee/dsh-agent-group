@@ -106,7 +106,9 @@ gpt（架构师）因**额度耗尽**等原因不可用时，插件把 gpt **挂
 
 - 后台任务在跑时，`squad_approve_plan` / `squad_deliver` / `squad_finish` 会拒绝并提示"后台任务仍在运行：…"，`squad_status` 进度里显示"后台运行中：…"；
 - 需要在本回合同步拿结果（脚本化、必须立刻读交付物）时传 `background: false` 恢复阻塞式；
-- local/team 执行者本就不阻塞。
+- local/team 执行者本就不阻塞；
+- **可用性探测**是唯一仍同步的步骤（约一次短往返）：成功后按 `probeTtlMs`（默认 10 分钟）在 profile 级 `probe-cache.json` 缓存，跨任务复用；`probe: true` 强制重探，`probe: false` 跳过，`workerProbe: false` 全局关闭；`squad_failover(recover)` 会清掉该成员的缓存；
+- `squad_wait` 按设计会阻塞（最长 10 分钟），非必要不要用。
 
 ### 进度同步与分层展示
 

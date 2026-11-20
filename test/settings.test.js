@@ -4983,6 +4983,27 @@ test('T15 worker availability probe suspends a quota-limited worker and substitu
     assert.match(warned, /\[可用性门禁\] qoder 探测异常（非额度类）：network unreachable；继续按计划派发/)
     assert.match(warned, /已外部派发 qoder/)
 
+    // --- cross-task cache: a fresh success is reused (no re-probe) ----------
+    {
+      // No architect participant → legacy gates (plan approval only).
+      const startNew = await tool('squad_start').execute(
+        { goal: 'H', acceptance: 'ok', agents: ['codex', 'zcode'] },
+        exec,
+      )
+      const taskH = /任务 (t-\S+) 已创建/.exec(startNew)[1]
+      const dirH = join(workspace, '.agent-squad', taskH)
+      await writeFile(join(dirH, 'PLAN.md'), '# PLAN H\n', 'utf8')
+      await tool('squad_approve_plan').execute({ task_id: taskH }, exec)
+      const before = probes().filter((row) => row.label === 'probe/zcode').length
+      // No probe flag: the profile-wide cache from the earlier success applies.
+      await dispatch({ agent: 'zcode', message: 'impl H', phase: 'implement', background: false })
+      assert.equal(probes().filter((row) => row.label === 'probe/zcode').length, before)
+      // probe:true still forces a fresh probe.
+      await dispatch({ agent: 'zcode', message: 'impl H2', phase: 'implement', background: false, probe: true })
+      assert.equal(probes().filter((row) => row.label === 'probe/zcode').length, before + 1)
+      assert.ok(await stat(join(dshHome, 'agent-squad', 'probe-cache.json')))
+    }
+
     // --- probe:false skips the gate -----------------------------------------
     {
       const before = probes().length
