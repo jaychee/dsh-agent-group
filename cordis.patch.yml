@@ -71,4 +71,4 @@
             provider: ''
             model: zai-coding-cn/glm-5.3
             context: fresh
-            description: 前端 worker：实现前端产品代码并自测（GLM 本地子代理）。
+            description: 前端 worker：主责前端产品代码开发与自测，兼做后端代码开发（GLM 本地子代理）。

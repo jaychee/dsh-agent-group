@@ -190,7 +190,7 @@ const LEAD_POLICY = `Agent Squad 已启用：你是 Lead，小队里有按角色
 3. Lead 亲自审核 PLAN.md：假装自己是没有上下文的架构师，无法只靠 PLAN 拍板技术设计的点按 D1 起连续编号，写明章节、缺失或矛盾、最小补全要求，派回 brain（phase="design"）返工迭代，默认初始设计 + ${MAX_DESIGN_REWORK_ROUNDS} 轮返工 = ${MAX_PLAN_ROUNDS} 次 design 派单，未扩展时第 ${MAX_PLAN_ROUNDS + 1} 次暂停：先向用户说明阻塞点与已完成部分并等待决策，用户同意后调用 squad_extend(kind="design", rounds=3, reason="用户批准的追加理由", confirmed=true) 追加轮次再派 design；每次扩展都要重新取得用户明确确认，可重复扩展，不自动续跑；用户拒绝或未回复时保持暂停。
 4. 方案合格后调用 squad_approve_plan 批准（归档 PLAN-APPROVED.md）。有 brain 参与的任务，PLAN 未批准前 implement/rework/spec 派单会被拒绝；没有 brain 参与的任务豁免此门禁。
 5. 派 architect（gpt），phase="spec"：读取 PLAN-APPROVED.md，发布技术规格 SPEC.md（代码结构、文件与模块职责、表与迁移、领域模型、接口与错误行为、各模块实现、可执行验证用例；不适用的明确说明）。规格可多轮修订、不占返工额度；发布后即可派工，不需要 Lead 再审批。
-6. 派 worker，phase="implement"：zcode 负责后端，qoder 负责前端产品代码；都按 PLAN-APPROVED.md + SPEC.md 实现并自测，写 REPORT.md。**两层并行是默认运行方式**：① 小队层——external 执行者的 implement/rework 默认后台派发（不阻塞，结果完成时以消息送达），连续派多个 worker 并行跑（如 zcode 后端 + qoder 前端同时）；需要在本回合同步拿结果时才传 background: false；② worker 层——派单消息把可并行的独立文件/模块逐项列出，worker 默认用自己的子代理同时开发（只改规格内文件、逐条 AC 留证）。
+6. 派 worker，phase="implement"：zcode 负责后端，qoder 主责前端（兼做后端）；都按 PLAN-APPROVED.md + SPEC.md 实现并自测，写 REPORT.md。任何开启了 worker 能力的角色（含 codex/gpt，或开启了 leaderWorker 的你）都可作为 worker 并行实现；实现过代码的角色不能签署自己实现的技术验收。**两层并行是默认运行方式**：① 小队层——external 执行者的 implement/rework 默认后台派发（不阻塞，结果完成时以消息送达），连续派多个 worker 并行跑（如 zcode 后端 + qoder 前端同时）；需要在本回合同步拿结果时才传 background: false；② worker 层——派单消息把可并行的独立文件/模块逐项列出，worker 默认用自己的子代理同时开发（只改规格内文件、逐条 AC 留证）。
 7. 派 gpt，phase="tech-review"：技术验收，附实际 diff 与测试证据，写 TECH-REVIEW.md。
 8. 技术验收 changes_requested → 把编号缺陷派回对应 worker，phase="rework"（技术返工额度 ${MAX_TECH_REWORK_ROUNDS} 轮，前后端共享、不因换人或规格修订重置；未扩展时第 4 轮暂停：先向用户说明阻塞点与已完成部分并等待决策，用户同意后调用 squad_extend(kind="tech", rounds=3, reason="用户批准的追加理由", confirmed=true) 追加轮次再派）。
 9. 技术验收 approved → 派 codex，phase="review"：业务验收，写 REVIEW.md。
@@ -198,7 +198,7 @@ const LEAD_POLICY = `Agent Squad 已启用：你是 Lead，小队里有按角色
 11. 两份验收都 approved 且仍然新鲜（代码/规格未再变动）→ squad_finish 收尾，随后向用户汇总交付结果。
 
 规则：
-- 你是组织者，不写业务代码；自己的改动只限协调文件与最终整合。
+- 你是组织者，默认不写业务代码；自己的改动只限协调文件与最终整合。若设置里开启了 Lead 的 worker 能力（leaderWorker），你可以直接作为 worker 实现代码并与队友并行，但仍不得签署自己实现的验收，业务方案/技术规格照常走流程。
 - 三种批准相互独立：squad_approve_plan 批准的是「业务方案」，TECH-REVIEW.md 的 VERDICT: APPROVED 批准的是「技术」，REVIEW.md 的 VERDICT: APPROVED 批准的是「业务」；任何一个不能替代另一个。代码、规格或方案变动后旧结论失效，不能用旧批准收尾。
 - worker 不可用时可直接指定 gpt 接手实现（phase="implement"/"rework"）；${MAX_TECH_REWORK_ROUNDS} 轮技术返工仍未通过时先问用户是否继续，获准继续后直接派 gpt 接手，不需要再次确认选人。gpt 接手写代码后不能自签技术验收：tech-review 改派 codex 对照 SPEC.md 独立代签技术验收，业务验收仍由 codex 按业务方案单独签署，两份验收独立记录。
 - 一个角色一个 agent。按能力选 worker：zcode 负责后端实现，qoder 负责前端产品实现与自测。
@@ -245,12 +245,13 @@ const DEFAULT_AGENTS = [
   {
     name: 'qoder',
     role: 'worker',
-    description: '前端 worker：实现前端产品代码并自测。',
+    description: '前端 worker：主责前端产品代码开发与自测，兼做后端代码开发。',
     provider: '',
     context: 'fresh',
     charter: `前端执行者分工：
-- 负责前端产品代码的实现：页面、样式、交互与前端状态，并编写/运行 UI 与组件测试、构建验证。
-- 边界：不改后端代码；涉及接口契约的问题报告 Lead 转交 zcode，不代改。`,
+- 主责前端产品代码的实现：页面、样式、交互与前端状态，并编写/运行 UI 与组件测试、构建验证。
+- 兼职后端：可承担后端代码（接口/脚本/数据层）的实现与测试；前端资源竞争时前端优先。
+- 边界：涉及接口契约的跨端问题报告 Lead 协调，不擅自改契约。`,
   },
 ]
 
@@ -306,6 +307,12 @@ function runtimeAgent(settingsAgent, config) {
     reasoning: ['low', 'high', 'xhigh', 'max'].includes(settingsAgent.reasoning)
       ? settingsAgent.reasoning
       : '',
+    // Worker capability: any role may act as an implementation worker when
+    // enabled (brain and architect included, plus the Lead via leaderWorker).
+    worker:
+      typeof settingsAgent.worker === 'boolean'
+        ? settingsAgent.worker
+        : settingsAgent.role !== 'brain',
     context: bundle.context === 'fork' ? 'fork' : 'fresh',
     charter: bundle.charter ?? '',
   }
@@ -1499,9 +1506,9 @@ function createTools(ctx, config, runtime, store) {
             `任务 ${taskId} 的技术规格尚未交付：先派 architect（gpt）phase="spec" 发布 SPEC.md，再派 ${phase}；规格发布后即可派工，不需要 Lead 再审批。`,
           )
         }
-        if (flow.specRequired && target.role !== 'worker' && target.role !== 'architect') {
+        if (flow.specRequired && target.worker !== true && target.role !== 'worker') {
           throw new Error(
-            `完整流程的 ${phase} 只能派 worker，或由 architect 接手实现；${target.name} 当前是 ${target.role}。`,
+            `完整流程的 ${phase} 需要 worker 能力：${target.name}（${target.role}）的 worker 能力未启用；在设置页开启后即可作为 worker 并行实现。`,
           )
         }
       }

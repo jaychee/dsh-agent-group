@@ -34,6 +34,7 @@ export const DEFAULT_AGENTS = [
     role: 'brain',
     executor: 'team',
     model: '',
+    worker: false,
     description: '业务设计与验收：给出业务方案、对外行为与验收标准，并做业务验收。',
   },
   {
@@ -42,6 +43,7 @@ export const DEFAULT_AGENTS = [
     role: 'architect',
     executor: 'local',
     model: 'openai/gpt-6.2-sol',
+    worker: true,
     description: '系统架构师：发布技术规格并做技术验收；worker 不可用或技术返工到限时可接手实现。',
   },
   {
@@ -50,6 +52,7 @@ export const DEFAULT_AGENTS = [
     role: 'worker',
     executor: 'team',
     model: '',
+    worker: true,
     description: '后端 worker：实现后端代码并自测。',
   },
   {
@@ -58,7 +61,8 @@ export const DEFAULT_AGENTS = [
     role: 'worker',
     executor: 'team',
     model: '',
-    description: '前端 worker：实现前端产品代码并自测。',
+    worker: true,
+    description: '前端 worker：主责前端产品代码开发与自测，兼做后端代码开发。',
   },
 ]
 
@@ -122,8 +126,11 @@ export function validateDirectory(value) {
  * @param {unknown} worktree
  * @returns {{ok: boolean, fields: Record<string, string>, message: string}}
  */
-export function validateAgentsAndWorktree(agents, worktree) {
+export function validateAgentsAndWorktree(agents, worktree, leaderWorker) {
   const fields = {}
+  if (leaderWorker !== undefined && typeof leaderWorker !== 'boolean') {
+    fields['leaderWorker'] = 'WORKER_INVALID'
+  }
   if (!Array.isArray(agents) || agents.length !== FIXED_IDS.length) {
     return {
       ok: false,
@@ -143,7 +150,7 @@ export function validateAgentsAndWorktree(agents, worktree) {
     }
     const unknown = Object.keys(entry).filter(
       (key) =>
-        !['id', 'displayName', 'role', 'executor', 'model', 'reasoning', 'description'].includes(
+        !['id', 'displayName', 'role', 'executor', 'model', 'reasoning', 'worker', 'description'].includes(
           key,
         ),
     )
@@ -166,6 +173,9 @@ export function validateAgentsAndWorktree(agents, worktree) {
       !['', 'low', 'high', 'xhigh', 'max'].includes(entry.reasoning)
     ) {
       fields[`${prefix}.reasoning`] = 'REASONING_INVALID'
+    }
+    if (entry.worker !== undefined && typeof entry.worker !== 'boolean') {
+      fields[`${prefix}.worker`] = 'WORKER_INVALID'
     }
     if (typeof entry.description !== 'string') fields[`${prefix}.description`] = 'DESCRIPTION_INVALID'
   }
@@ -207,7 +217,7 @@ function validateFileShape(value) {
   if (value.version !== SETTINGS_VERSION) {
     return { ok: false, fields: {}, message: `unknown settings version ${String(value.version)}` }
   }
-  const checked = validateAgentsAndWorktree(value.agents, value.worktree)
+  const checked = validateAgentsAndWorktree(value.agents, value.worktree, value.leaderWorker)
   return { ...checked, unknownVersion: false }
 }
 
@@ -222,6 +232,7 @@ export function seedFromBundle(bundleAgents, worktreeDir) {
     if (isPlainObject(entry) && FIXED_IDS.includes(entry.name)) {
       rows.set(entry.name, {
         role: ROLES.includes(entry.role) ? entry.role : 'worker',
+        worker: typeof entry.worker === 'boolean' ? entry.worker : undefined,
         description: typeof entry.description === 'string' ? entry.description : '',
         provider: String(entry?.provider ?? ''),
         model: String(entry?.model ?? ''),
@@ -240,6 +251,7 @@ export function seedFromBundle(bundleAgents, worktreeDir) {
       role: row.role,
       executor: pinned ? 'local' : external ? 'external' : 'team',
       model: pinned ? row.model : external ? row.provider : '',
+      worker: row.worker === undefined ? row.role !== 'brain' : row.worker,
       description: row.description,
     }
   })
@@ -250,10 +262,11 @@ export function seedFromBundle(bundleAgents, worktreeDir) {
     return {
       agents: DEFAULT_AGENTS.map((agent) => ({ ...agent })),
       worktree: { directory: DEFAULT_WORKTREE.directory },
+      leaderWorker: false,
       fallback: true,
     }
   }
-  return { agents, worktree, fallback: false }
+  return { agents, worktree, leaderWorker: false, fallback: false }
 }
 
 /**
@@ -290,6 +303,7 @@ function cloneSettings(settings) {
       revision: settings.revision,
       agents: settings.agents,
       worktree: settings.worktree,
+      leaderWorker: settings.leaderWorker === true,
     }),
   )
 }
@@ -326,10 +340,12 @@ export function createSettingsStore(options = {}) {
     ? {
         agents: seed.agents.map((agent) => ({ ...agent })),
         worktree: { directory: seed.worktree.directory },
+        leaderWorker: seed.leaderWorker === true,
       }
     : {
         agents: DEFAULT_AGENTS.map((agent) => ({ ...agent })),
         worktree: { directory: DEFAULT_WORKTREE.directory },
+        leaderWorker: false,
       }
   const defaultsInvalid = !seedChecked.ok
 
@@ -388,6 +404,7 @@ export function createSettingsStore(options = {}) {
       revision: 1,
       agents: effectiveDefaults.agents,
       worktree: effectiveDefaults.worktree,
+      leaderWorker: effectiveDefaults.leaderWorker,
     }
     await writeAtomic(fresh)
     return fresh
@@ -441,14 +458,15 @@ export function createSettingsStore(options = {}) {
       const saved = {
         version: SETTINGS_VERSION,
         revision: migrated.revision,
-        agents: migrated.agents,
+        agents: migrated.agents.map((agent) => ({ ...agent })),
         worktree: migrated.worktree,
+        leaderWorker: effectiveDefaults.leaderWorker,
       }
       await writeAtomic(saved)
       warn('settings v1 migrated to v2: inserted the gpt architect row')
       return saved
     }
-    const checked = validateAgentsAndWorktree(parsed.agents, parsed.worktree)
+    const checked = validateAgentsAndWorktree(parsed.agents, parsed.worktree, parsed.leaderWorker)
     if (!checked.ok) return restoreDefaults()
     if (!Number.isSafeInteger(parsed.revision) || parsed.revision < 1) return restoreDefaults()
     return {
@@ -456,6 +474,7 @@ export function createSettingsStore(options = {}) {
       revision: parsed.revision,
       agents: parsed.agents,
       worktree: parsed.worktree,
+      leaderWorker: parsed.leaderWorker === true,
     }
   }
 
@@ -479,6 +498,7 @@ export function createSettingsStore(options = {}) {
         JSON.stringify({
           agents: effectiveDefaults.agents,
           worktree: effectiveDefaults.worktree,
+          leaderWorker: effectiveDefaults.leaderWorker,
         }),
       ),
     /** Current settings (seeding the file on first read). */
@@ -488,12 +508,12 @@ export function createSettingsStore(options = {}) {
      * @param {object} request `{expectedRevision, agents, worktree}`
      * @returns the saved settings (revision incremented by exactly one).
      */
-    save: ({ expectedRevision, agents, worktree }) =>
+    save: ({ expectedRevision, agents, worktree, leaderWorker }) =>
       enqueue(async () => {
         if (!Number.isSafeInteger(expectedRevision) || expectedRevision < 1) {
           throw new SettingsError('REVISION_INVALID', 'expectedRevision must be a positive integer')
         }
-        const checked = validateAgentsAndWorktree(agents, worktree)
+        const checked = validateAgentsAndWorktree(agents, worktree, leaderWorker)
         if (!checked.ok) {
           throw new SettingsError('VALIDATION_FAILED', checked.message || 'invalid settings', {
             fields: checked.fields,
@@ -511,6 +531,7 @@ export function createSettingsStore(options = {}) {
           revision: current.revision + 1,
           agents,
           worktree,
+          leaderWorker: leaderWorker === true,
         }
         await writeAtomic(saved)
         return cloneSettings(saved)
@@ -520,6 +541,6 @@ export function createSettingsStore(options = {}) {
   }
 }
 
-function cloneable({ agents, worktree }) {
-  return { agents, worktree }
+function cloneable({ agents, worktree, leaderWorker }) {
+  return { agents, worktree, leaderWorker: leaderWorker === true }
 }

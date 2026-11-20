@@ -291,6 +291,7 @@ export function createRequestHandler({ store, models }) {
             expectedRevision: parsed.expectedRevision,
             agents: parsed.agents,
             worktree: parsed.worktree,
+            leaderWorker: parsed.leaderWorker === true,
           })
           send(200, { settings })
         } catch (error) {

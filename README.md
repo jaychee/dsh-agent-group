@@ -25,7 +25,9 @@
 | `lead` | 当前 DSH 会话（启用后） | 拆解流程、审核并批准业务方案、决定派单顺序、汇总交付；不写业务代码 | `squad_enable` / `squad_start` / `squad_dispatch` / `squad_approve_plan` / `squad_extend` / `squad_status` / `squad_wait` / `squad_finish` |
 | `brain` | codex | 业务方案（PLAN.md）与业务验收（REVIEW.md）；可澄清方案，改业务行为必须先请用户决策 | `squad_report` |
 | `architect` | gpt（本地固定模型 `openai/gpt-6.2-sol`） | 技术规格（SPEC.md）与技术验收（TECH-REVIEW.md）；worker 不可用或技术返工到限时接手实现，但不能自签自己改动的技术验收 | `squad_report` |
-| `worker` | zcode / qoder | zcode 后端实现自测；qoder 前端产品实现自测（替代此前"仅前端测试"的规则） | `squad_report` |
+| `worker` | zcode / qoder | zcode 后端实现自测；qoder **主责前端产品开发与自测，兼做后端代码开发** | `squad_report` |
+
+任何角色（含 brain、architect 与 Lead）都可以通过设置里的 **worker 能力开关**以 worker 身份并行实现代码：`agents[].worker`（brain 默认关、architect/worker 默认开）与顶层 `leaderWorker`（Lead 默认关）。开启后该角色可接 implement/rework 派单；实现过代码的角色不能签署自己实现的技术验收。
 
 角色章程可以在插件配置里整段替换（`brainCharter` / `architectCharter` / `workerCharter`），单个 agent 也可以用 `charter` 覆盖。默认章程为中文；Lead 策略额外要求**面向用户始终使用用户的语言**，章程语言不影响回复语言。
 
@@ -93,6 +95,7 @@ gpt（架构师）因**额度耗尽**等原因不可用时，插件把 gpt **挂
 
 ### 并行开发（默认运行方式，两层并行）
 
+- **任何角色都可当 worker**：设置页每个成员有 worker 能力开关（`agents[].worker`），另有顶层 `leaderWorker` 开关——brain（codex）、architect（gpt）与 Lead 开启后都能作为 Worker 参与并行实现（实现者不参与自签验收）。
 - **worker 内部并行（默认）**：ZCode CLI 自带 subagent 体系（Task/Agent 工具），Qoder CLI 亦有 subagent（默认启用的实验设置）与 Workflow parallel/pipeline 编排；ACP/CLI 通道均不过滤工具、权限自动放行。worker 章程与 implement/rework 派单提示内置"并行默认"引导：交办包含多个独立文件/模块时，worker 默认用自己的子代理同时开发；不独立的部分串行完成；边界不变（只改规格内文件、逐条 AC 留证、汇总写 REPORT.md）。
 - **小队级并行（默认）**：external 执行者的 `implement`/`rework` 派单**默认后台派发**（`delivery: 'parent'`）——工具调用立即返回、结果完成时以后台消息送达 Lead，因此 Lead **默认可以连续并发派多个 worker**（如 zcode 后端 + qoder 前端同时跑）。需要在本回合同步拿到结果时传 `background: false` 恢复阻塞式；`design/spec/review/tech-review` 始终同步（需读取交付物）；local/team 执行者本就不阻塞。
 - `squad_status` 显示"后台执行器运行中：N 个"；`squad_finish` 会等所有后台执行器结束。同一队友运行中的重复派单仍受 R07 守卫限制。
@@ -154,7 +157,7 @@ node --test dsh-agent-squad/test/settings.test.js
 ASQ_LIVE_QODER=1 node --test --test-name-pattern='^T09 ' dsh-agent-squad/test/settings.test.js
 ```
 
-测试保持十三个顶层用例（T01–T13；T11 完整流程与双验收，T12 架构师容错交接，T13 后台并行派发）；实机模式由 qoder 一次派单修改两个临时仓库，各新增一次提交，并输出 `AC7 task=... cwd=... repo=... commit=... repo=... commit=...`。普通单测不能代替该证据。
+测试保持十四个顶层用例（T01–T14；T11 完整流程与双验收，T12 架构师容错交接，T13 后台并行派发，T14 角色 worker 能力与 leaderWorker）；实机模式由 qoder 一次派单修改两个临时仓库，各新增一次提交，并输出 `AC7 task=... cwd=... repo=... commit=... repo=... commit=...`。普通单测不能代替该证据。
 
 ## B 模式：外部 provider（一次性）
 
@@ -254,7 +257,7 @@ token：GLM implement 26,295 / rework 26,459（cache 主导）；Codex 设计 + 
   "worktree": { "directory": ".agents/worktrees" } }
 ```
 
-- **字段**：四个成员固定 id（codex/gpt/zcode/qoder，只读），可编辑 `displayName/role/executor/model/reasoning/description`；worktree 只有 `directory`（仓库相对路径，拒绝绝对路径与 `..`）。`reasoning`（思考强度，''/low/high/xhigh/max）仅对固定模型执行者生效（local，或 `provider/model` 形式的外部一次性），派发时作为 `reasoningEffort` 传给子代理；纯外部 provider（codex-cli 等）不显示该控件。
+- **字段**：四个成员固定 id（codex/gpt/zcode/qoder，只读），可编辑 `displayName/role/executor/model/reasoning/worker/description`，以及顶层 `leaderWorker`（Lead 的 worker 能力）；worktree 只有 `directory`（仓库相对路径，拒绝绝对路径与 `..`）。`reasoning`（思考强度，''/low/high/xhigh/max）仅对固定模型执行者生效（local，或 `provider/model` 形式的外部一次性），派发时作为 `reasoningEffort` 传给子代理；纯外部 provider（codex-cli 等）不显示该控件。
 - **role 三态**：`brain`（业务设计与验收）| `architect`（系统架构师）| `worker`（实现与自测）。
 - **executor 三态**：`external`（外部 provider，一次性派发）、`local`（`provider/model` 固定模型本地子代理，可续跑）、`team`（进程内队友，可续跑）。校验：名称唯一、至少一个 brain、local 模型必须在模型目录内、external provider 必须已注册。
 - **迁移**：v1（三成员）文件读取时自动插入 gpt 架构师行并升为 v2，用户既有编辑与 revision 全部保留。

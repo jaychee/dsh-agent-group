@@ -4203,7 +4203,7 @@ test('T11 full flow: opt-in gate, spec/tech-review pipeline, dual acceptance, ta
       assert.equal(seeded.agents.find((agent) => agent.id === 'gpt').model, DEFAULT_AGENTS.find((agent) => agent.id === 'gpt').model)
       const qoder = seeded.agents.find((agent) => agent.id === 'qoder')
       assert.equal(qoder.role, 'worker')
-      assert.match(qoder.description, /前端产品代码并自测/)
+      assert.match(qoder.description, /主责前端产品代码开发与自测，兼做后端代码开发/)
       const zcode = seeded.agents.find((agent) => agent.id === 'zcode')
       assert.match(zcode.description, /后端代码并自测/)
     }
@@ -4711,6 +4711,135 @@ test('T13 background dispatch is the default for external implement and unblocks
     const workerPrompt = host.activations.at(-1).prompt.map((block) => block.text).join('')
     assert.match(workerPrompt, /并行默认：本轮交办包含多个独立文件\/模块时/)
     assert.match(workerPrompt, /子代理\/并行能力同时开发/)
+  } finally {
+    delete process.env.DSH_HOME
+    await rm(workspace, { recursive: true, force: true })
+    await rm(dshHome, { recursive: true, force: true })
+  }
+})
+
+/** T14 — per-role worker capability, lead worker config and qoder's scope. */
+test('T14 any role can act as a worker and the Lead has its own worker switch', async () => {
+  const workspace = await tempRoot()
+  const dshHome = await tempRoot()
+  process.env.DSH_HOME = dshHome
+  try {
+    const { createSettingsStore, validateAgentsAndWorktree } = await import('../settings.js')
+    const settingsPath = join(dshHome, 'agent-squad', 'settings.json')
+    await mkdir(join(dshHome, 'agent-squad'), { recursive: true })
+    await writeFile(
+      settingsPath,
+      JSON.stringify(
+        {
+          version: 2,
+          revision: 1,
+          leaderWorker: false,
+          agents: [
+            { id: 'codex', displayName: 'codex', role: 'brain', executor: 'team', model: '', description: 'b' },
+            { id: 'gpt', displayName: 'gpt', role: 'architect', executor: 'team', model: '', description: 'a' },
+            { id: 'zcode', displayName: 'zcode', role: 'worker', executor: 'local', model: 'p/m1', description: 'w' },
+            { id: 'qoder', displayName: 'qoder', role: 'worker', executor: 'local', model: 'p/fe', description: 'w2' },
+          ],
+          worktree: { directory: '.agents/worktrees' },
+        },
+        null,
+        2,
+      ),
+      'utf8',
+    )
+    const { apply } = await import('../index.js')
+    const host = mockHost(workspace, dshHome)
+    apply(host.ctx, { agents: BUNDLE_AGENTS })
+    const tool = (name) => host.registered.find((entry) => entry.definition.name === name).definition
+    const lead = { id: 'lead-1', session: { id: 'session-1' }, __membership: { role: 'lead', name: 'lead' } }
+    const exec = { agent: lead, signal: undefined }
+    await tool('squad_enable').execute({}, exec)
+    const dispatch = (args) => tool('squad_dispatch').execute(args, exec)
+    const settingsStore = createSettingsStore({ filePath: settingsPath })
+
+    // --- validation: worker / leaderWorker must be booleans -----------------
+    {
+      const base = (await settingsStore.read()).agents
+      const badWorker = base.map((agent) => (agent.id === 'codex' ? { ...agent, worker: 'yes' } : agent))
+      const checked = validateAgentsAndWorktree(badWorker, { directory: '.agents/worktrees' })
+      assert.equal(checked.ok, false)
+      assert.equal(checked.fields['agents.codex.worker'], 'WORKER_INVALID')
+      const badLeader = validateAgentsAndWorktree(base, { directory: '.agents/worktrees' }, 'yes')
+      assert.equal(badLeader.ok, false)
+      assert.equal(badLeader.fields.leaderWorker, 'WORKER_INVALID')
+      assert.equal(validateAgentsAndWorktree(base, { directory: '.agents/worktrees' }, true).ok, true)
+    }
+
+    // --- leaderWorker persists through save/read ---------------------------
+    {
+      const before = await settingsStore.read()
+      assert.equal(before.leaderWorker, false)
+      const saved = await settingsStore.save({
+        expectedRevision: before.revision,
+        agents: before.agents,
+        worktree: before.worktree,
+        leaderWorker: true,
+      })
+      assert.equal(saved.leaderWorker, true)
+      assert.equal((await settingsStore.read()).leaderWorker, true)
+    }
+
+    // --- full-flow task: brain as worker is gated by its capability --------
+    const startOut = await tool('squad_start').execute({ goal: 'W', acceptance: 'ok' }, exec)
+    const task = /任务 (t-\S+) 已创建/.exec(startOut)[1]
+    const dir = join(workspace, '.agent-squad', task)
+    await dispatch({ agent: 'codex', message: 'plan', phase: 'design' })
+    await writeFile(join(dir, 'PLAN.md'), '# PLAN W\n', 'utf8')
+    await tool('squad_approve_plan').execute({ task_id: task }, exec)
+    await dispatch({ agent: 'gpt', message: 'spec', phase: 'spec' })
+
+    // codex defaults to worker:false → implement refused with guidance.
+    await assert.rejects(
+      dispatch({ agent: 'codex', message: 'write code', phase: 'implement' }),
+      /完整流程的 implement 需要 worker 能力：codex（brain）的 worker 能力未启用；在设置页开启后即可作为 worker 并行实现。/,
+    )
+    // Enable codex's worker capability and retry: the brain now implements.
+    {
+      const snap = await settingsStore.read()
+      await settingsStore.save({
+        expectedRevision: snap.revision,
+        agents: snap.agents.map((agent) => (agent.id === 'codex' ? { ...agent, worker: true } : agent)),
+        worktree: snap.worktree,
+        leaderWorker: snap.leaderWorker,
+      })
+    }
+    assert.match(await dispatch({ agent: 'codex', message: 'write code', phase: 'implement' }), /已(创建|续跑) codex \[brain\]/)
+    let state = JSON.parse(await readFile(join(dir, 'STATE.json'), 'utf8'))
+    assert.deepEqual(state.implementers, ['codex'])
+    assert.equal(state.codeEpoch, 1)
+    // Independence: the implementer cannot sign its own technical acceptance.
+    await assert.rejects(
+      dispatch({ agent: 'codex', message: 'self sign', phase: 'tech-review' }),
+      /codex 已在本任务中写代码，不能签署自己改动的技术验收/,
+    )
+    // The architect (worker default true) still signs it.
+    assert.match(await dispatch({ agent: 'gpt', message: 'tech', phase: 'tech-review' }), /已(创建|续跑) gpt \[architect\]/)
+    state = JSON.parse(await readFile(join(dir, 'STATE.json'), 'utf8'))
+    assert.equal(state.techReview.reviewer, 'gpt')
+
+    // Worker-role agents stay unimpeded; qoder's charter covers backend too.
+    assert.match(await dispatch({ agent: 'qoder', message: 'frontend impl', phase: 'implement' }), /已创建本地子代理 qoder/)
+    const qoder = (await settingsStore.read()).agents.find((agent) => agent.id === 'qoder')
+    assert.equal(qoder.role, 'worker')
+    // Older rows omit `worker`; the runtime defaults worker-role agents to
+    // capable (proven by the successful dispatch above).
+    // The qoder-specific charter ships with the fallback defaults (a bundle
+    // that omits per-agent charters dispatches the generic worker charter).
+    const indexForQoder = await readFile(new URL('../index.js', import.meta.url), 'utf8')
+    assert.match(indexForQoder, /兼职后端：可承担后端代码（接口\/脚本\/数据层）的实现与测试；前端资源竞争时前端优先。/)
+
+    // --- policy / UI wiring carries the new switches -----------------------
+    const indexSource = await readFile(new URL('../index.js', import.meta.url), 'utf8')
+    const clientSource = await readFile(new URL('../client.js', import.meta.url), 'utf8')
+    assert.match(indexSource, /leaderWorker/)
+    assert.match(indexSource, /任何开启了 worker 能力的角色（含 codex\/gpt/)
+    assert.match(clientSource, /leaderWorker/)
+    assert.match(clientSource, /fieldWorker/)
   } finally {
     delete process.env.DSH_HOME
     await rm(workspace, { recursive: true, force: true })
