@@ -190,7 +190,8 @@ const LEAD_POLICY = `Agent Squad 已启用：你是 Lead，小队里有按角色
 3. Lead 亲自审核 PLAN.md：假装自己是没有上下文的架构师，无法只靠 PLAN 拍板技术设计的点按 D1 起连续编号，写明章节、缺失或矛盾、最小补全要求，派回 brain（phase="design"）返工迭代，默认初始设计 + ${MAX_DESIGN_REWORK_ROUNDS} 轮返工 = ${MAX_PLAN_ROUNDS} 次 design 派单，未扩展时第 ${MAX_PLAN_ROUNDS + 1} 次暂停：先向用户说明阻塞点与已完成部分并等待决策，用户同意后调用 squad_extend(kind="design", rounds=3, reason="用户批准的追加理由", confirmed=true) 追加轮次再派 design；每次扩展都要重新取得用户明确确认，可重复扩展，不自动续跑；用户拒绝或未回复时保持暂停。
 4. 方案合格后调用 squad_approve_plan 批准（归档 PLAN-APPROVED.md）。有 brain 参与的任务，PLAN 未批准前 implement/rework/spec 派单会被拒绝；没有 brain 参与的任务豁免此门禁。
 5. 派 architect（gpt），phase="spec"：读取 PLAN-APPROVED.md，发布技术规格 SPEC.md（代码结构、文件与模块职责、表与迁移、领域模型、接口与错误行为、各模块实现、可执行验证用例；不适用的明确说明）。规格可多轮修订、不占返工额度；发布后即可派工，不需要 Lead 再审批。
-6. 派 worker，phase="implement"：zcode 负责后端，qoder 主责前端（兼做后端）；都按 PLAN-APPROVED.md + SPEC.md 实现并自测，写 REPORT.md。任何开启了 worker 能力的角色（含 codex/gpt，或开启了 leaderWorker 的你）都可作为 worker 并行实现；实现过代码的角色不能签署自己实现的技术验收。**两层并行是默认运行方式**：① 小队层——external 执行者的 implement/rework 默认后台派发（不阻塞，结果完成时以消息送达），连续派多个 worker 并行跑（如 zcode 后端 + qoder 前端同时）；需要在本回合同步拿结果时才传 background: false；② worker 层——派单消息把可并行的独立文件/模块逐项列出，worker 默认用自己的子代理同时开发（只改规格内文件、逐条 AC 留证）。
+6. 派 worker，phase="implement"：zcode 负责后端，qoder 主责前端（兼做后端）；都按 PLAN-APPROVED.md + SPEC.md 实现并自测，写 REPORT.md。任何开启了 worker 能力的角色（含 codex/gpt，或开启了 leaderWorker 的你）都可作为 worker 并行实现；实现过代码的角色不能签署自己实现的技术验收。
+6.1 阶段化并行（强制）：拆分任务时把**通用/底层功能排在前面、串行开发**（一次只派一个 worker，不要同时派多个）；基础层完成后走技术+业务验收，再调用 **squad_deliver** 把基础层合并到 Base 分支（"当前项目所在分支"）。只有基础层交付后，才允许 **squad_parallel_start({ features: [...] })** 基于 Base 为每个业务特性拉独立 worktree/分支，并用 squad_dispatch({ …, feature: "<name>" }) 分派给多个 worker 并行开发；每个特性完成后 **squad_deliver({ feature: "<name>" })** 直接合入 Base。全部特性合并后，在 Base 分支上重新跑技术/业务验收（验收需对合并后的代码新鲜），再 squad_finish 收尾。**两层并行是默认运行方式**：① 小队层——external 执行者的 implement/rework 默认后台派发（不阻塞，结果完成时以消息送达），连续派多个 worker 并行跑（如 zcode 后端 + qoder 前端同时）；需要在本回合同步拿结果时才传 background: false；② worker 层——派单消息把可并行的独立文件/模块逐项列出，worker 默认用自己的子代理同时开发（只改规格内文件、逐条 AC 留证）。
 7. 派 gpt，phase="tech-review"：技术验收，附实际 diff 与测试证据，写 TECH-REVIEW.md。
 8. 技术验收 changes_requested → 把编号缺陷派回对应 worker，phase="rework"（技术返工额度 ${MAX_TECH_REWORK_ROUNDS} 轮，前后端共享、不因换人或规格修订重置；未扩展时第 4 轮暂停：先向用户说明阻塞点与已完成部分并等待决策，用户同意后调用 squad_extend(kind="tech", rounds=3, reason="用户批准的追加理由", confirmed=true) 追加轮次再派）。
 9. 技术验收 approved → 派 codex，phase="review"：业务验收，写 REVIEW.md。
@@ -453,6 +454,16 @@ async function git(directory, args) {
     maxBuffer: 8 * 1024 * 1024,
   })
   return stdout
+}
+
+/** Branch checked out in a source repository (null when detached). */
+async function sourceBranchOf(repo) {
+  try {
+    const out = (await git(repo, ['rev-parse', '--abbrev-ref', 'HEAD'])).trim()
+    return out === 'HEAD' || out === '' ? null : out
+  } catch {
+    return null
+  }
 }
 
 async function readJson(path) {
@@ -810,6 +821,55 @@ async function captureCodexTokens(since) {
   return undefined
 }
 
+
+/** Acceptance gate shared by squad_deliver and squad_finish. */
+async function acceptanceGateError(taskDir, state) {
+  const flow = flowOf(state)
+  if (flow.specRequired) {
+    const tech = await readFile(join(taskDir, 'TECH-REVIEW.md'), 'utf8').catch(() => '')
+    if (!tech) return '缺少 TECH-REVIEW.md：先让 gpt 技术验收（或由 codex 代签）并写 TECH-REVIEW.md。'
+    const techVerdicts = [...tech.matchAll(/VERDICT:\s*(APPROVED|CHANGES_REQUESTED)/gi)]
+    const techLast = techVerdicts.at(-1)?.[1]?.toUpperCase()
+    if (techLast !== 'APPROVED') {
+      return `TECH-REVIEW.md 最后一条 VERDICT 不是 APPROVED（当前：${techLast ?? '缺失'}）；需要以 \`VERDICT: APPROVED\` 结束。`
+    }
+    if (!bindingFresh(state.techReview, state)) {
+      return '技术验收结论已失效：验收后代码或规格又发生了变动（codeEpoch/specVersion 不一致）。重新派 tech-review 通过后再交付。'
+    }
+  }
+  const reviewRequired = state.gate?.reviewRequired !== false
+  if (reviewRequired) {
+    const review = await readFile(join(taskDir, 'REVIEW.md'), 'utf8').catch(() => '')
+    if (!review) return '缺少 REVIEW.md：先让 brain 验收并写 REVIEW.md。'
+    const verdicts = [...review.matchAll(/VERDICT:\s*(APPROVED|CHANGES_REQUESTED)/gi)]
+    const last = verdicts.at(-1)?.[1]?.toUpperCase()
+    if (last !== 'APPROVED') {
+      return `REVIEW.md 最后一条 VERDICT 不是 APPROVED（当前：${last ?? '缺失'}）；需要以 \`VERDICT: APPROVED\` 结束。`
+    }
+    if (flow.specRequired && !bindingFresh(state.businessReview, state)) {
+      return '业务验收结论已失效：验收后代码或规格又发生了变动（codeEpoch/specVersion 不一致）。重新派 review 通过后再交付。'
+    }
+  }
+  return null
+}
+
+/** Merge one squad branch into the source repository's Base branch. */
+async function mergeIntoBase({ repo, branch, baseBranch, message }) {
+  const current = (await git(repo, ['rev-parse', '--abbrev-ref', 'HEAD'])).trim()
+  if (current !== baseBranch) {
+    throw new Error(`源仓库 ${repo} 当前在 "${current}"，不是 Base 分支 "${baseBranch}"；请先切回 Base 分支再交付。`)
+  }
+  try {
+    await git(repo, ['merge', '--no-ff', branch, '-m', message])
+  } catch (error) {
+    const first = String(error?.message ?? error).split('\n')[0]
+    throw new Error(
+      `合并 ${branch} 到 ${baseBranch} 失败（${repo}）：${first}；请手动解决冲突后重试；本次交付未标记为完成。`,
+    )
+  }
+  return (await git(repo, ['rev-parse', '--short', 'HEAD'])).trim()
+}
+
 /** Build the six model-facing tools. */
 function createTools(ctx, config, runtime, store) {
   const start = defineTool({
@@ -924,7 +984,10 @@ function createTools(ctx, config, runtime, store) {
           signal: exec.signal,
         })
         const { taskRoot } = created
-        const worktrees = created.worktrees
+        const worktrees = []
+        for (const wt of created.worktrees) {
+          worktrees.push({ ...wt, sourceBranch: await sourceBranchOf(wt.repo) })
+        }
         const multi = worktrees.length > 1
         const memoryRoot = join(taskRoot, config.memoryDir)
         const taskDir = join(memoryRoot, taskId)
@@ -1015,6 +1078,8 @@ function createTools(ctx, config, runtime, store) {
             worktree: worktrees[0],
             worktrees,
             taskRoot,
+            baseDelivered: null,
+            features: [],
           })
           // Publish only after all three task files are complete.
           for (const location of sourceMemoryDirs) {
@@ -1121,6 +1186,7 @@ function createTools(ctx, config, runtime, store) {
           signal: exec.signal,
         })
         worktree = { ...created }
+        worktree.sourceBranch = await sourceBranchOf(created.repositoryRoot)
         if (created.reused) worktreeNote = '当前会话已在 linked worktree 内，复用当前 checkout。'
       } catch (error) {
         if (error?.fatal) throw error
@@ -1195,8 +1261,10 @@ function createTools(ctx, config, runtime, store) {
         extensions: [],
         dispatches: [],
         worktree: worktree ?? null,
-        worktrees: worktree ? [{ ...worktree, repo: worktree.repositoryRoot }] : [],
+        worktrees: worktree ? [{ ...worktree, repo: worktree.repositoryRoot, sourceBranch: worktree.sourceBranch }] : [],
         taskRoot: worktree ? worktree.path : sourceDirectory,
+        baseDelivered: null,
+        features: [],
       })
       await writeJson(join(memoryRoot, 'current.json'), {
         taskId,
@@ -1322,6 +1390,11 @@ function createTools(ctx, config, runtime, store) {
           enum: ['tech', 'business'],
           description:
             'Full-flow rework quota to consume: "tech" (technical acceptance defects) or "business". Optional; defaults to the freshest failing acceptance.',
+        },
+        feature: {
+          type: 'string',
+          description:
+            'Parallel phase only: the feature worktree (created by squad_parallel_start) this round works in. Required once the base/common delivery has been merged.',
         },
         probe: {
           type: 'boolean',
@@ -1455,7 +1528,31 @@ function createTools(ctx, config, runtime, store) {
       }
       const round = phase === 'rework' ? Number(state.round ?? 1) + 1 : Number(state.round ?? 1)
       const repoRows = worktreesOf(state)
-      const workspace = workspaceOf(state, sessionDirectory(ctx, lead))
+      const featureName = args.feature === undefined ? null : String(args.feature).trim()
+      let feature = null
+      if (featureName !== null && featureName !== '') {
+        feature = (Array.isArray(state.features) ? state.features : []).find((item) => item.name === featureName)
+        if (!feature) {
+          throw new Error(`未知 feature "${featureName}"：先调用 squad_parallel_start 创建特性 worktree。`)
+        }
+        if (feature.merged) throw new Error(`feature "${featureName}" 已交付并合入 Base，不能再派单。`)
+        if (!state.baseDelivered) {
+          throw new Error('并行特性派单前必须先交付通用功能：squad_deliver({ summary }) 把基础层合并到 Base 分支。')
+        }
+      }
+      if (state.baseDelivered && (phase === 'implement' || phase === 'rework') && !feature) {
+        throw new Error(
+          '通用功能已交付：并行阶段请用 feature 指定本次实现的特性（squad_dispatch({ …, feature: "<name>" })）；不能继续在基础层 worktree 上开发。',
+        )
+      }
+      // Parallel-phase reviews run against the merged Base branch in the source
+      // repository (the task worktree no longer holds the combined candidate).
+      const reviewOnBase = Boolean(state.baseDelivered) && (phase === 'tech-review' || phase === 'review')
+      const workspace = feature
+        ? feature.path
+        : reviewOnBase
+          ? repoRows[0]?.repo ?? sessionDirectory(ctx, lead)
+          : workspaceOf(state, sessionDirectory(ctx, lead))
       const hasWorkspace = Boolean(state.worktree || state.taskRoot)
 
       const moveTeammate = async (sessionId) => {
@@ -1733,6 +1830,7 @@ function createTools(ctx, config, runtime, store) {
           }
         } else {
           runtime.rebind(existingChild.id, target)
+          await moveTeammate(existingChild.id)
           await subagents.sendMessage(lead, existingChild.id, [{ type: 'text', text: prompt }], {
             signal: exec.signal,
           })
@@ -2005,6 +2103,7 @@ function createTools(ctx, config, runtime, store) {
         ...(planRound === undefined ? {} : { planRound }),
         ...(specVersion === undefined ? {} : { specVersion }),
         ...(reworkKind ? { reworkKind } : {}),
+        ...(feature ? { feature: feature.name } : {}),
         ...(substitutions.length > 0
           ? { substitutedFrom: substitutions.map((item) => item.from), substitutionReason: substitutions.at(-1).reason }
           : {}),
@@ -2200,6 +2299,21 @@ function createTools(ctx, config, runtime, store) {
             : ['工作区：原地开发']
       const lines = [
         `${PLUGIN_MARKER}  task=${taskId}  phase=${state.phase ?? 'unknown'}  round=${state.round ?? '?'}  flow=${flow.flow}  created=${state.createdAt ?? '?'}`,
+        (() => {
+          const features = Array.isArray(state.features) ? state.features : []
+          if (state.baseDelivered) {
+            return `并行：Base 已交付（${state.baseDelivered.summary ?? ''} @ ${state.baseDelivered.at}）；特性：${
+              features.length === 0
+                ? '无'
+                : features
+                    .map((item) => `${item.name}${item.merged ? `（已合并 ${item.commit ?? ''}）` : '（并行中）'}`)
+                    .join('、')
+            }`
+          }
+          return features.length > 0
+            ? `并行：基础层未交付；特性：${features.map((item) => item.name).join('、')}`
+            : '并行：串行阶段（基础层）'
+        })(),
         (() => {
           const rows = runtime.suspendedRows()
           return rows.length === 0
@@ -2465,50 +2579,62 @@ ${String(args.summary).trim()}
       // Prefer the gate snapshotted at start. A legacy STATE without a gate is
       // treated conservatively: review is required unless the snapshot
       // explicitly recorded reviewRequired=false (R09).
-      const reviewRequired = state.gate?.reviewRequired !== false
       const flow = flowOf(state)
-      if (flow.specRequired) {
-        // Full flow: technical acceptance first, then business acceptance.
-        // Each must end with VERDICT: APPROVED and its binding must still be
-        // fresh — any code or spec dispatch after the review invalidates it.
-        const tech = await readFile(join(taskDir, 'TECH-REVIEW.md'), 'utf8').catch(() => '')
-        if (!tech) throw new Error('缺少 TECH-REVIEW.md：先让 gpt 技术验收（或由 codex 代签）并写 TECH-REVIEW.md。')
-        const techVerdicts = [
-          ...tech.matchAll(/VERDICT:\s*(APPROVED|CHANGES_REQUESTED)/gi),
-        ]
-        const techLast = techVerdicts.at(-1)?.[1]?.toUpperCase()
-        if (techLast !== 'APPROVED') {
-          throw new Error(
-            `TECH-REVIEW.md 最后一条 VERDICT 不是 APPROVED（当前：${techLast ?? '缺失'}）；需要以 \`VERDICT: APPROVED\` 结束。`,
-          )
-        }
-        if (!bindingFresh(state.techReview, state)) {
-          throw new Error(
-            '技术验收结论已失效：验收后代码或规格又发生了变动（codeEpoch/specVersion 不一致）。重新派 tech-review 通过后再收尾。',
-          )
-        }
+      // Phase-2 guard first: every parallel feature must be delivered (merged
+      // into Base) before acceptance or closing make sense.
+      const features = Array.isArray(state.features) ? state.features : []
+      const unmerged = features.filter((item) => item.merged !== true)
+      if (unmerged.length > 0) {
+        throw new Error(
+          `仍有未交付合并的并行特性：${unmerged.map((item) => item.name).join(', ')}。先对每个特性执行 squad_deliver({ feature: "<name>" }) 合入 Base 再收尾。`,
+        )
       }
-      if (reviewRequired) {
-        const review = await readFile(join(taskDir, 'REVIEW.md'), 'utf8').catch(() => '')
-        if (!review) throw new Error('缺少 REVIEW.md：先让 brain 验收并写 REVIEW.md。')
-        const verdicts = [
-          ...review.matchAll(/VERDICT:\s*(APPROVED|CHANGES_REQUESTED)/gi),
-        ]
-        const last = verdicts.at(-1)?.[1]?.toUpperCase()
-        if (last !== 'APPROVED') {
-          throw new Error(
-            `REVIEW.md 最后一条 VERDICT 不是 APPROVED（当前：${last ?? '缺失'}）；需要以 \`VERDICT: APPROVED\` 结束。`,
-          )
-        }
-        if (flow.specRequired && !bindingFresh(state.businessReview, state)) {
-          throw new Error(
-            '业务验收结论已失效：验收后代码或规格又发生了变动（codeEpoch/specVersion 不一致）。重新派 review 通过后再收尾。',
-          )
-        }
-      }
+      const gateError = await acceptanceGateError(taskDir, state)
+      if (gateError) throw new Error(gateError)
 
       const summary = String(args.summary ?? '').trim() || '任务完成'
       const repoRows = worktreesOf(state)
+
+      // --- parallel workflow: Base already carries the merged deliveries ----
+      if (state.baseDelivered) {
+        const lines = [`任务 ${taskId} 收尾。`]
+        lines.push(
+          `通用功能已交付：${state.baseDelivered.summary ?? ''} @ ${state.baseDelivered.at}`,
+          ...(state.baseDelivered.commits ?? []).map(
+            (row) => `  仓库：${row.repo}  Base：${row.baseBranch}  合并提交：${row.commit}`,
+          ),
+        )
+        for (const item of features) {
+          lines.push(`  特性：${item.name} 分支 ${item.branch} → 已合入 Base（${item.mergedAt ?? '?'}）`)
+        }
+        const source = repoRows[0]?.repo
+        const workingDirectory = ctx.get('workingDirectory')
+        if (workingDirectory && source) {
+          try {
+            await workingDirectory.set(lead, source, exec.signal)
+            lines.push(`会话已切回源目录：${source}`)
+          } catch (error) {
+            lines.push(`切换回源目录失败：${error instanceof Error ? error.message : String(error)}`)
+          }
+        }
+        state.phase = 'done'
+        state.closedAt = new Date().toISOString()
+        state.verdict = 'approved'
+        state.commit = state.baseDelivered.commits?.[0]?.commit ?? null
+        state.finishSummary = summary
+        await writeJson(join(taskDir, 'STATE.json'), state)
+        await writeFile(
+          join(taskDir, 'FINAL.md'),
+          `# 收尾 · ${taskId}\n\n## 摘要\n\n${summary}\n\n## 交付\n\n${lines.join('\n')}\n`,
+          'utf8',
+        )
+        await appendFile(
+          join(taskDir, 'JOURNAL.md'),
+          `- ${new Date().toISOString()} lead: squad_finish（并行交付收尾，Base=${state.baseDelivered.commits?.[0]?.baseBranch ?? '?'}，features=${features.map((item) => item.name).join(',') || '无'}）\n`,
+          'utf8',
+        ).catch(() => {})
+        return lines.join('\n')
+      }
 
       // --- multi-repository finish: commit per repository (PLAN §26–§29) ----
       if (repoRows.length > 1) {
@@ -2951,6 +3077,259 @@ ${String(args.summary).trim()}
     },
   })
 
+
+  const parallelStart = defineTool({
+    name: 'squad_parallel_start',
+    description:
+      '（仅 Lead）开启并行阶段：通用功能已交付合并到 Base 分支后，为每个业务特性从 Base 拉取独立 worktree 与分支（squad-<task>-<feature>），之后用 squad_dispatch({ …, feature: "<name>" }) 派给不同 worker 并行开发。要求：任务已 squad_deliver、无队友运行、单仓任务。',
+    parameters: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        features: {
+          type: 'array',
+          minItems: 1,
+          items: {
+            type: 'object',
+            additionalProperties: false,
+            properties: {
+              name: { type: 'string', description: 'Feature id, lowercase letters/digits/hyphens, e.g. auth-api.' },
+              focus: { type: 'string', description: 'One-line focus of this feature for the worker brief.' },
+            },
+            required: ['name'],
+          },
+          description: 'Business features to develop in parallel, each gets its own worktree from the Base branch.',
+        },
+        task_id: { type: 'string', description: 'Task id; defaults to the current task.' },
+      },
+      required: ['features'],
+    },
+    output: {
+      schema: { type: 'string' },
+      render: (_args, value) => [{ type: 'text', text: value }],
+    },
+    async execute(args, exec) {
+      const lead = callingAgent(exec, 'squad_parallel_start')
+      const directory = await memoryDirectory(ctx, lead, config)
+      const current = await readJson(join(directory, 'current.json'))
+      const taskId = String(args.task_id ?? current?.taskId ?? '')
+      if (!taskId) throw new Error('还没有小队任务。先调用 squad_start。')
+      const taskDir = join(directory, taskId)
+      const state = await readJson(join(taskDir, 'STATE.json'))
+      if (!state) throw new Error(`未知小队任务 "${taskId}"。先调用 squad_start。`)
+      if (state.phase === 'done') throw new Error(`任务 ${taskId} 已经收尾，不能开启并行阶段。`)
+      if (!state.baseDelivered) {
+        throw new Error(
+          '并行阶段前必须先交付通用功能：squad_deliver({ summary }) 通过验收并把基础层合并到 Base 分支后，再 squad_parallel_start。',
+        )
+      }
+      const repoRows = worktreesOf(state)
+      if (repoRows.length !== 1) {
+        throw new Error('多仓任务暂不支持并行特性 worktree；请在单仓任务中使用。')
+      }
+      const repoRow = repoRows[0]
+      const baseBranch = repoRow.sourceBranch
+      if (!baseBranch) {
+        throw new Error('任务缺少 Base 分支信息（源仓库 detached HEAD 或旧任务）；无法基于 Base 拉取特性 worktree。')
+      }
+      const rows = await treeRowsOf(ctx, lead, exec.signal)
+      if (rows.some((row) => row.activity === 'running')) {
+        throw new Error('仍有队友在运行，等它们结束后再开启并行阶段。')
+      }
+      const list = Array.isArray(args.features) ? args.features : []
+      if (list.length === 0) throw new Error('features 不能为空。')
+      const seen = new Set()
+      for (const item of list) {
+        const name = String(item?.name ?? '').trim()
+        if (!/^[a-z0-9][a-z0-9-]{0,30}$/.test(name)) {
+          throw new Error(`feature 名不合法 "${name}"：只允许小写字母/数字/短横线，1–31 字符。`)
+        }
+        if (seen.has(name)) throw new Error(`feature 名重复：${name}`)
+        seen.add(name)
+        if ((state.features ?? []).some((row) => row.name === name)) {
+          throw new Error(`feature "${name}" 已存在。`)
+        }
+      }
+      const worktreeRoot = dirname(repoRow.path)
+      const created = []
+      for (const item of list) {
+        const name = String(item.name).trim()
+        const branch = `squad-${taskId}-${name}`
+        const path = join(worktreeRoot, `squad-${taskId}-${name}`)
+        if (await stat(path).then(() => true, () => false)) {
+          throw new Error(`特性 worktree 路径已存在：${path}`)
+        }
+        try {
+          await git(repoRow.repo, ['worktree', 'add', '-b', branch, path, baseBranch])
+        } catch (error) {
+          throw new Error(
+            `创建特性 worktree 失败（${name}）：${String(error?.message ?? error).split('\n')[0]}`,
+          )
+        }
+        const baseCommit = (await git(repoRow.repo, ['rev-parse', `${baseBranch}^{commit}`])).trim()
+        // Point the feature checkout at the shared task memory.
+        await ensureSelfIgnore(join(path, config.memoryDir))
+        await writeJson(join(path, config.memoryDir, 'current.json'), {
+          taskId,
+          memoryRoot: directory,
+          worktree: path,
+        })
+        created.push({
+          name,
+          focus: String(item?.focus ?? ''),
+          branch,
+          path,
+          baseBranch,
+          baseCommit,
+          merged: false,
+          createdAt: new Date().toISOString(),
+        })
+      }
+      state.features = [...(state.features ?? []), ...created]
+      state.stage = 'parallel'
+      await writeJson(join(taskDir, 'STATE.json'), state)
+      await appendFile(
+        join(taskDir, 'JOURNAL.md'),
+        `- ${new Date().toISOString()} lead: 开启并行阶段 features=${created.map((item) => item.name).join(',')}（Base=${baseBranch}）\n`,
+        'utf8',
+      ).catch(() => {})
+      const lines = [
+        `并行阶段已开启（Base 分支 ${baseBranch}）。`,
+        ...created.map(
+          (item) =>
+            `- ${item.name}：分支 ${item.branch}  路径 ${item.path}  基线 ${item.baseCommit.slice(0, 8)}${item.focus ? `  focus=${item.focus}` : ''}`,
+        ),
+        `下一步：squad_dispatch({ agent: "<worker>", phase: "implement", feature: "<name>", message: "…" })；每个特性完成后 squad_deliver({ feature: "<name>" }) 合入 Base。`,
+      ]
+      return lines.join('\n')
+    },
+  })
+
+  const deliver = defineTool({
+    name: 'squad_deliver',
+    description:
+      '（仅 Lead）交付并合并：不传 feature 时交付当前任务的基础层——校验验收门禁、提交 worktree 改动并把 squad 分支合入 Base 分支（源仓库当前分支）；传 feature 时把该特性的 worktree 分支合入 Base。源仓库必须切在 Base 分支上；合并冲突会报错且不标记完成。',
+    parameters: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        summary: { type: 'string', description: 'Delivery summary for the merge commit / FINAL.' },
+        feature: { type: 'string', description: 'Parallel feature to deliver; omit to deliver the base/common layer.' },
+        task_id: { type: 'string', description: 'Task id; defaults to the current task.' },
+      },
+    },
+    output: {
+      schema: { type: 'string' },
+      render: (_args, value) => [{ type: 'text', text: value }],
+    },
+    async execute(args, exec) {
+      const lead = callingAgent(exec, 'squad_deliver')
+      const directory = await memoryDirectory(ctx, lead, config)
+      const current = await readJson(join(directory, 'current.json'))
+      const taskId = String(args.task_id ?? current?.taskId ?? '')
+      if (!taskId) throw new Error('还没有小队任务。先调用 squad_start。')
+      const taskDir = join(directory, taskId)
+      const state = await readJson(join(taskDir, 'STATE.json'))
+      if (!state) throw new Error(`未知小队任务 "${taskId}"。先调用 squad_start。`)
+      if (state.phase === 'done') throw new Error(`任务 ${taskId} 已经收尾，不能再交付。`)
+      const rows = await treeRowsOf(ctx, lead, exec.signal)
+      if (rows.some((row) => row.activity === 'running')) {
+        throw new Error('仍有队友在运行，等它们结束后再交付。')
+      }
+      const summary = String(args.summary ?? '').trim()
+      const featureName = args.feature === undefined ? null : String(args.feature).trim()
+      const repoRow = worktreesOf(state)[0]
+      if (!repoRow) throw new Error('任务没有 worktree（原地开发），无法交付合并到 Base。')
+      const baseBranch = repoRow.sourceBranch
+      if (!baseBranch) {
+        throw new Error('任务缺少 Base 分支信息（源仓库 detached HEAD 或旧任务）；请手动合并。')
+      }
+
+      if (featureName !== null) {
+        if (!state.baseDelivered) {
+          throw new Error('并行特性交付前必须先交付通用功能：squad_deliver({ summary }) 合并基础层到 Base。')
+        }
+        const feature = (Array.isArray(state.features) ? state.features : []).find(
+          (item) => item.name === featureName,
+        )
+        if (!feature) throw new Error(`未知 feature "${featureName}"。`)
+        if (feature.merged) throw new Error(`feature "${featureName}" 已经交付合并。`)
+        let commit = null
+        if (config.worktreeAutoCommit) {
+          const dirty = (await git(feature.path, ['status', '--porcelain']).catch(() => '')).trim()
+          if (dirty) {
+            await git(feature.path, ['add', '-A'])
+            await git(feature.path, ['commit', '-m', `squad(${taskId}): feature ${feature.name}${summary ? ` — ${firstLine(summary)}` : ''}`])
+          }
+        }
+        commit = await mergeIntoBase({
+          repo: repoRow.repo,
+          branch: feature.branch,
+          baseBranch,
+          message: `squad(${taskId}): merge feature ${feature.name} into ${baseBranch}`,
+        })
+        feature.merged = true
+        feature.mergedAt = new Date().toISOString()
+        feature.commit = commit
+        await writeJson(join(taskDir, 'STATE.json'), state)
+        await appendFile(
+          join(taskDir, 'JOURNAL.md'),
+          `- ${new Date().toISOString()} lead: squad_deliver feature=${feature.name} base=${baseBranch} commit=${commit}\n`,
+          'utf8',
+        ).catch(() => {})
+        return [
+          `特性 ${feature.name} 已交付并合入 Base 分支 ${baseBranch}（合并提交 ${commit}）。`,
+          `worktree：${feature.path}  分支：${feature.branch}（保留，可手动清理）`,
+          '继续派下一个特性，或全部合并后跑最终技术/业务验收并 squad_finish。',
+        ].join('\n')
+      }
+
+      if (state.baseDelivered) {
+        throw new Error('通用功能已交付合并；后续请用 squad_deliver({ feature: "<name>" }) 交付各特性。')
+      }
+      const gateError = await acceptanceGateError(taskDir, state)
+      if (gateError) throw new Error(gateError)
+      const repoRows = worktreesOf(state)
+      const commits = []
+      for (const wt of repoRows) {
+        if (!wt.sourceBranch) {
+          throw new Error(`仓库 ${wt.repo} 缺少 Base 分支信息；请手动合并。`)
+        }
+        if (config.worktreeAutoCommit) {
+          const dirty = (await git(wt.path, ['status', '--porcelain']).catch(() => '')).trim()
+          if (dirty) {
+            await git(wt.path, ['add', '-A'])
+            await git(wt.path, ['commit', '-m', `squad(${taskId}): ${firstLine(summary) || 'base delivery'}`])
+          }
+        }
+        const commit = await mergeIntoBase({
+          repo: wt.repo,
+          branch: wt.branch,
+          baseBranch: wt.sourceBranch,
+          message: `squad(${taskId}): merge base into ${wt.sourceBranch}`,
+        })
+        commits.push({ repo: wt.repo, baseBranch: wt.sourceBranch, commit })
+      }
+      state.baseDelivered = {
+        at: new Date().toISOString(),
+        summary: summary || '通用功能交付',
+        commits,
+      }
+      state.stage = 'base-delivered'
+      await writeJson(join(taskDir, 'STATE.json'), state)
+      await appendFile(
+        join(taskDir, 'JOURNAL.md'),
+        `- ${new Date().toISOString()} lead: squad_deliver base commits=${commits.map((row) => `${row.repo}@${row.commit}`).join(',')}\n`,
+        'utf8',
+      ).catch(() => {})
+      return [
+        `通用功能已交付并合入 Base 分支。`,
+        ...commits.map((row) => `- ${row.repo} → ${row.baseBranch}（合并提交 ${row.commit}）`),
+        '下一步：squad_parallel_start({ features: [...] }) 基于 Base 拉特性 worktree，再并行派发各业务特性。',
+      ].join('\n')
+    },
+  })
+
   const enable = defineTool({
     name: 'squad_enable',
     description:
@@ -2979,7 +3358,7 @@ ${String(args.summary).trim()}
     },
   })
 
-  return { start, dispatch, status, wait, report, finish, approvePlan, extend, enable, failover }
+  return { start, dispatch, status, wait, report, finish, approvePlan, extend, enable, failover, parallelStart, deliver }
 }
 
 /** Host plugin entry. */
@@ -3226,6 +3605,8 @@ export function apply(ctx, input) {
     [tools.report, isTeammate],
     [tools.enable, isEnableCandidate],
     [tools.failover, isLead],
+    [tools.parallelStart, isLead],
+    [tools.deliver, isLead],
   ]) {
     ctx.tools.register(definition, { when: ({ agent }) => condition(agent) })
   }

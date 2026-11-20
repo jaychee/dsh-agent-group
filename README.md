@@ -100,6 +100,19 @@ gpt（架构师）因**额度耗尽**等原因不可用时，插件把 gpt **挂
 - **小队级并行（默认）**：external 执行者的 `implement`/`rework` 派单**默认后台派发**（`delivery: 'parent'`）——工具调用立即返回、结果完成时以后台消息送达 Lead，因此 Lead **默认可以连续并发派多个 worker**（如 zcode 后端 + qoder 前端同时跑）。需要在本回合同步拿到结果时传 `background: false` 恢复阻塞式；`design/spec/review/tech-review` 始终同步（需读取交付物）；local/team 执行者本就不阻塞。
 - `squad_status` 显示"后台执行器运行中：N 个"；`squad_finish` 会等所有后台执行器结束。同一队友运行中的重复派单仍受 R07 守卫限制。
 
+### 阶段化并行（强制工作流）
+
+拆分任务时的固定顺序（插件门禁强制，不是建议）：
+
+1. **基础层串行**：通用/底层功能排在前面，**一次只派一个 worker 串行开发**（不要同时派多个）；
+2. **基础层交付**：完成技术+业务验收后，`squad_deliver({ summary })` 把任务 worktree 分支**合并到 Base 分支**（"当前项目所在分支"，源仓库必须切在 Base 上）；合并冲突会报错且不标记完成；
+3. **开启并行**：只有基础层交付后，`squad_parallel_start({ features: [{ name, focus? }] })` 才允许执行——基于 **Base 分支 HEAD** 为每个业务特性创建独立 worktree 与分支 `squad-<task>-<feature>`（记录基线提交）；
+4. **并行开发**：`squad_dispatch({ …, feature: "<name>" })` 把特性派给不同 worker（默认后台并行，多个特性同时跑）；基础层交付后**不带 feature 的 implement/rework 会被拒绝**；
+5. **特性交付**：每个特性完成后 `squad_deliver({ feature: "<name>" })` 直接合入 Base；未全部合并前 `squad_finish` 会拒绝收尾；
+6. **最终验收**：全部特性合并后，技术/业务验收在 **Base 分支（源仓库）** 上重新执行（对合并后的代码新鲜），再 `squad_finish` 收尾（Base 已交付路径不再重复合并）。
+
+多仓任务暂不支持特性 worktree（`squad_parallel_start` 会拒绝）；`squad_status` 显示并行阶段、Base 交付与各特性合并状态。
+
 ### worker 可用性门禁（额度耗尽自动替代）
 
 每次 `implement`/`rework` 派单前，插件先对目标 worker 做一轮**轻量可用性探测**（同一任务同一 worker 探测成功即缓存；`probe: true` 强制重探、`probe: false` 跳过；`config.workerProbe: false` 全局关闭）。若探测返回**额度类错误**（limit/quota/429/余额/欠费/限流…）：
@@ -168,7 +181,7 @@ node --test dsh-agent-squad/test/settings.test.js
 ASQ_LIVE_QODER=1 node --test --test-name-pattern='^T09 ' dsh-agent-squad/test/settings.test.js
 ```
 
-测试保持十五个顶层用例（T01–T15；T11 完整流程与双验收，T12 架构师容错交接，T13 后台并行派发，T14 角色 worker 能力与 leaderWorker，T15 worker 可用性门禁与自动替代）；实机模式由 qoder 一次派单修改两个临时仓库，各新增一次提交，并输出 `AC7 task=... cwd=... repo=... commit=... repo=... commit=...`。普通单测不能代替该证据。
+测试保持十六个顶层用例（T01–T16；T11 完整流程与双验收，T12 架构师容错交接，T13 后台并行派发，T14 角色 worker 能力与 leaderWorker，T15 worker 可用性门禁与自动替代，T16 阶段化并行与 Base 分支合并）；实机模式由 qoder 一次派单修改两个临时仓库，各新增一次提交，并输出 `AC7 task=... cwd=... repo=... commit=... repo=... commit=...`。普通单测不能代替该证据。
 
 ## B 模式：外部 provider（一次性）
 
@@ -384,6 +397,8 @@ token：GLM implement 26,295 / rework 26,459（cache 主导）；Codex 设计 + 
 | `squad_status` | Lead | 任务、阶段/轮次、流程（flow/specPublished/specVersion/codeEpoch/implementers）、双验收绑定与结论、全部仓库/worktree/分支/基线、PLAN 门禁、各类预算与最近 6 条扩展记录、成员状态、记忆文件、最近派单 |
 | `squad_wait` | Lead | 有界阻塞等待团队变化（通常不需要，报告会唤醒 Lead） |
 | `squad_finish` | Lead | 校验无队友运行 + 验收 approved（完整流程需技术+业务双验收且新鲜），逐仓提交并记录结果，切回主仓库源目录，写 FINAL.md 与每仓合并命令；多仓失败可重试 |
+| `squad_parallel_start` | Lead（仅 Lead 可见） | 基础层交付后开启并行阶段：基于 Base 为每个特性创建独立 worktree/分支，供按 feature 并行派单 |
+| `squad_deliver` | Lead（仅 Lead 可见） | 交付并合并：基础层（通过验收后把 squad 分支合入 Base）或单个特性（`feature`，合入 Base）；源仓库须切在 Base，冲突报错不标记完成 |
 | `squad_failover` | Lead（仅 Lead 可见） | 架构师容错：额度耗尽时挂起架构师（自动触发或手动 `reason`），职责由 brain 代行；`recover: true` 在用户确认恢复后解除挂起；挂起状态持久化于 failover.json |
 | `squad_report` | brain / architect / worker | 把结果、阻塞或验收结论发回 Lead 并写 JOURNAL；架构师上报额度耗尽的 blocked 会触发自动挂起 |
 

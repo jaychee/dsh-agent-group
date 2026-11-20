@@ -1556,7 +1556,7 @@ test('T07 plan gate: lead review, design budget, squad_approve_plan, archives an
     // --- AC3: registration, opt-in gate and Lead-only visibility ------------
     const names = host.registered.map((entry) => entry.definition.name).sort()
     assert.deepEqual(names, [
-      'squad_approve_plan', 'squad_dispatch', 'squad_enable', 'squad_extend', 'squad_failover', 'squad_finish', 'squad_report', 'squad_start', 'squad_status', 'squad_wait',
+      'squad_approve_plan', 'squad_deliver', 'squad_dispatch', 'squad_enable', 'squad_extend', 'squad_failover', 'squad_finish', 'squad_parallel_start', 'squad_report', 'squad_start', 'squad_status', 'squad_wait',
     ])
     // Before opting in, the root sees ONLY the enable gate; the squad tools
     // and the Lead persona stay hidden (opt-in contract).
@@ -3563,8 +3563,8 @@ test('T10 budget extension requires user confirmation and resumes exhausted budg
       assert.deepEqual(
         host.registered.map((row) => row.definition.name).sort(),
         [
-          'squad_approve_plan', 'squad_dispatch', 'squad_enable', 'squad_extend', 'squad_failover', 'squad_finish',
-          'squad_report', 'squad_start', 'squad_status', 'squad_wait',
+          'squad_approve_plan', 'squad_deliver', 'squad_dispatch', 'squad_enable', 'squad_extend', 'squad_failover',
+          'squad_finish', 'squad_parallel_start', 'squad_report', 'squad_start', 'squad_status', 'squad_wait',
         ],
       )
     })
@@ -4967,6 +4967,185 @@ test('T15 worker availability probe suspends a quota-limited worker and substitu
   } finally {
     delete process.env.DSH_HOME
     await rm(workspace, { recursive: true, force: true })
+    await rm(dshHome, { recursive: true, force: true })
+  }
+})
+
+/** T16 — staged parallel workflow: serial base delivery, feature worktrees, merges. */
+test('T16 parallel features branch from the Base branch and merge back after delivery', async () => {
+  const root = await tempRoot()
+  const dshHome = await tempRoot()
+  process.env.DSH_HOME = dshHome
+  let repo
+  try {
+    repo = await makeGitRepo(root, 'parallel-repo', 'base', { 'README.md': 'seed\n' })
+    const settingsPath = join(dshHome, 'agent-squad', 'settings.json')
+    await mkdir(join(dshHome, 'agent-squad'), { recursive: true })
+    await writeFile(
+      settingsPath,
+      JSON.stringify(
+        {
+          version: 2,
+          revision: 1,
+          agents: [
+            { id: 'codex', displayName: 'codex', role: 'brain', executor: 'team', model: '', description: 'b' },
+            { id: 'gpt', displayName: 'gpt', role: 'architect', executor: 'team', model: '', description: 'a' },
+            { id: 'zcode', displayName: 'zcode', role: 'worker', executor: 'local', model: 'p/m1', description: 'w' },
+            { id: 'qoder', displayName: 'qoder', role: 'worker', executor: 'local', model: 'p/fe', description: 'w2' },
+          ],
+          worktree: { directory: '.agents/worktrees' },
+        },
+        null,
+        2,
+      ),
+      'utf8',
+    )
+    const host = mockHost(repo, dshHome)
+    const { apply } = await import('../index.js')
+    apply(host.ctx, { workerProbe: false, agents: BUNDLE_AGENTS })
+    const tool = (name) => host.registered.find((entry) => entry.definition.name === name).definition
+    const lead = { id: 'lead-1', session: { id: 'session-1' }, __membership: { role: 'lead', name: 'lead' } }
+    const exec = { agent: lead, signal: undefined }
+    await tool('squad_enable').execute({}, exec)
+    const dispatch = (args) => tool('squad_dispatch').execute(args, exec)
+    const taskDirOf = (task) => join(repo, '.agents', 'worktrees', `squad-${task}`, '.agent-squad', task)
+    const readState = async (task) =>
+      JSON.parse(await readFile(join(taskDirOf(task), 'STATE.json'), 'utf8'))
+    const writeVerdict = async (task, file, verdict) =>
+      writeFile(join(taskDirOf(task), file), `# ${file}\n\nVERDICT: ${verdict}\n`, 'utf8')
+
+    // --- serial base phase in the task worktree -----------------------------
+    const startOut = await tool('squad_start').execute({ goal: 'P', acceptance: 'ok' }, exec)
+    const task = /任务 (t-\S+) 已创建/.exec(startOut)[1]
+    const dir = taskDirOf(task)
+    let state = await readState(task)
+    assert.equal(state.stage, undefined)
+    assert.equal(state.worktree.sourceBranch, 'master')
+    await dispatch({ agent: 'codex', message: 'plan', phase: 'design' })
+    await writeFile(join(dir, 'PLAN.md'), '# PLAN\n', 'utf8')
+    await tool('squad_approve_plan').execute({ task_id: task }, exec)
+    await dispatch({ agent: 'gpt', message: 'spec', phase: 'spec' })
+    await dispatch({ agent: 'zcode', message: 'base impl', phase: 'implement' })
+    // Common code lands in the task worktree.
+    await writeFile(join(state.worktree.path, 'core.js'), 'module.exports = { core: true }\n', 'utf8')
+    // Parallel phase is gated until the base delivery is merged.
+    await assert.rejects(
+      tool('squad_parallel_start').execute({ features: [{ name: 'a' }] }, exec),
+      /并行阶段前必须先交付通用功能：squad_deliver\(\{ summary \}\) 通过验收并把基础层合并到 Base 分支后，再 squad_parallel_start。/,
+    )
+    // Delivery requires the acceptance gates.
+    await assert.rejects(tool('squad_deliver').execute({ summary: 'base' }, exec), /TECH-REVIEW\.md/)
+
+    // --- base acceptance, then deliver to Base ------------------------------
+    await writeVerdict(task, 'TECH-REVIEW.md', 'APPROVED')
+    await dispatch({ agent: 'gpt', message: 'tech', phase: 'tech-review' })
+    await writeVerdict(task, 'REVIEW.md', 'APPROVED')
+    await dispatch({ agent: 'codex', message: 'review', phase: 'review' })
+    const baseBefore = (await gitOut(repo, ['rev-parse', 'HEAD'])).trim()
+    const deliverOut = await tool('squad_deliver').execute({ summary: 'base' }, exec)
+    assert.match(deliverOut, /通用功能已交付并合入 Base 分支/)
+    assert.match(deliverOut, /squad_parallel_start/)
+    const baseAfter = (await gitOut(repo, ['rev-parse', 'HEAD'])).trim()
+    assert.notEqual(baseAfter, baseBefore)
+    assert.equal(await gitOut(repo, ['show', `${baseAfter}:core.js`]), 'module.exports = { core: true }')
+    state = await readState(task)
+    assert.equal(state.baseDelivered.summary, 'base')
+    assert.equal(state.baseDelivered.commits[0].baseBranch, 'master')
+    // A second base delivery is refused.
+    await assert.rejects(tool('squad_deliver').execute({ summary: 'again' }, exec), /通用功能已交付合并/)
+
+    // --- parallel phase: feature worktrees from Base -----------------------
+    const parallelOut = await tool('squad_parallel_start').execute(
+      { features: [{ name: 'feat-a', focus: 'api' }, { name: 'feat-b', focus: 'ui' }] },
+      exec,
+    )
+    assert.match(parallelOut, /并行阶段已开启（Base 分支 master）/)
+    assert.match(parallelOut, /feat-a：分支 squad-.*-feat-a/)
+    state = await readState(task)
+    assert.equal(state.features.length, 2)
+    for (const feature of state.features) {
+      // Branch point is exactly the delivered Base commit.
+      assert.equal(feature.baseCommit, baseAfter)
+      assert.ok(await stat(join(feature.path, '.agent-squad', 'current.json')))
+    }
+    // Feature names are unique and validated.
+    await assert.rejects(
+      tool('squad_parallel_start').execute({ features: [{ name: 'feat-a' }] }, exec),
+      /已存在/,
+    )
+    await assert.rejects(
+      tool('squad_parallel_start').execute({ features: [{ name: 'Bad Name' }] }, exec),
+      /feature 名不合法/,
+    )
+
+    // --- implement per feature: cwd follows the feature worktree ------------
+    const featureAPath = state.features.find((item) => item.name === 'feat-a').path
+    const featureBPath = state.features.find((item) => item.name === 'feat-b').path
+    assert.match(
+      await dispatch({ agent: 'zcode', message: 'impl a', phase: 'implement', feature: 'feat-a' }),
+      new RegExp(`workspace=${featureAPath.replace(/[.*+?^${}()|[\\]\\]/g, '\\$&')}`),
+    )
+    assert.match(
+      await dispatch({ agent: 'qoder', message: 'impl b', phase: 'implement', feature: 'feat-b' }),
+      new RegExp(`workspace=${featureBPath.replace(/[.*+?^${}()|[\\]\\]/g, '\\$&')}`),
+    )
+    // Without a feature the parallel phase refuses implement.
+    await assert.rejects(
+      dispatch({ agent: 'zcode', message: 'stray', phase: 'implement' }),
+      /并行阶段请用 feature 指定本次实现的特性/,
+    )
+    // Unknown/merged feature names are rejected.
+    await assert.rejects(
+      dispatch({ agent: 'zcode', message: 'x', phase: 'implement', feature: 'nope' }),
+      /未知 feature "nope"/,
+    )
+
+    // --- feature delivery merges into Base ---------------------------------
+    const featureA = state.features.find((item) => item.name === 'feat-a')
+    const featureB = state.features.find((item) => item.name === 'feat-b')
+    await writeFile(join(featureA.path, 'a.js'), 'module.exports = 1\n', 'utf8')
+    await writeFile(join(featureB.path, 'b.js'), 'module.exports = 2\n', 'utf8')
+    const deliverA = await tool('squad_deliver').execute({ feature: 'feat-a' }, exec)
+    assert.match(deliverA, /特性 feat-a 已交付并合入 Base 分支 master（合并提交 /)
+    assert.equal(await gitOut(repo, ['show', 'master:a.js']), 'module.exports = 1')
+    await assert.rejects(
+      tool('squad_deliver').execute({ feature: 'feat-a' }, exec),
+      /已经交付合并/,
+    )
+    // finish is refused while feat-b is still unmerged.
+    await assert.rejects(tool('squad_finish').execute({ summary: 'nope' }, exec), /仍有未交付合并的并行特性：feat-b/)
+    const deliverB = await tool('squad_deliver').execute({ feature: 'feat-b' }, exec)
+    assert.match(deliverB, /特性 feat-b 已交付并合入 Base 分支 master/)
+    assert.equal(await gitOut(repo, ['show', 'master:b.js']), 'module.exports = 2')
+
+    // --- final acceptance on the merged Base, then close --------------------
+    state = await readState(task)
+    assert.ok(state.features.every((item) => item.merged))
+    await writeVerdict(task, 'TECH-REVIEW.md', 'APPROVED')
+    const finalTech = await dispatch({ agent: 'gpt', message: 'final tech', phase: 'tech-review' })
+    assert.match(finalTech, new RegExp(`workspace=${repo.replace(/[.*+?^${}()|[\\]\\]/g, '\\$&')}`)) // reviews run on the merged Base
+    await writeVerdict(task, 'REVIEW.md', 'APPROVED')
+    await dispatch({ agent: 'codex', message: 'final review', phase: 'review' })
+    const statusOut = await tool('squad_status').execute({}, exec)
+    assert.match(statusOut, /并行：Base 已交付（base @ .+）；特性：feat-a（已合并 .+）、feat-b（已合并 .+）/)
+    const finishOut = await tool('squad_finish').execute({ summary: 'parallel done' }, exec)
+    assert.match(finishOut, /通用功能已交付/)
+    assert.match(finishOut, /特性：feat-a .*已合入 Base/)
+    state = await readState(task)
+    assert.equal(state.phase, 'done')
+    // The merged Base branch carries both features and the common layer.
+    assert.equal(await gitOut(repo, ['show', 'master:core.js']), 'module.exports = { core: true }')
+    {
+      const statusLines = (await gitOut(repo, ['status', '--porcelain']))
+        .split('\n')
+        .map((line) => line.trim())
+        .filter((line) => line && line !== '?? .agents/')
+      assert.deepEqual(statusLines, [])
+    }
+  } finally {
+    delete process.env.DSH_HOME
+    await cleanupSquadArtifacts([repo]).catch(() => {})
+    await rm(root, { recursive: true, force: true })
     await rm(dshHome, { recursive: true, force: true })
   }
 })
