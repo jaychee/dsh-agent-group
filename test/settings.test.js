@@ -4492,9 +4492,11 @@ test('T12 failover suspends a quota-exhausted architect and hands its duties to 
       dispatch({ agent: 'gpt', message: 'spec', phase: 'spec' }),
       /gpt 已挂起.*架构师职责由 brain 代行：squad_dispatch\({ agent: "codex", phase: "spec" \| "tech-review", … }\).*squad_failover\({ agent: "gpt", recover: true }\)/s,
     )
-    // The brain now covers the spec round (acting architect).
+    // The brain now covers the spec round (acting architect); the dispatch
+    // return itself carries the acting marker for auditability.
     const specOut = await dispatch({ agent: 'codex', message: 'write spec', phase: 'spec' })
     assert.match(specOut, /已(创建|续跑) codex \[brain\]/)
+    assert.match(specOut, /（代行架构师职责：架构师挂起，交付 SPEC\.md \/ TECH-REVIEW\.md）/)
     const specPrompt = host.spawned.at(-1).prompt.map((block) => block.text).join('')
     assert.match(specPrompt, /代行架构师职责/)
     assert.match(specPrompt, /SPEC\.md/)
@@ -4505,6 +4507,7 @@ test('T12 failover suspends a quota-exhausted architect and hands its duties to 
     await dispatch({ agent: 'zcode', message: 'impl', phase: 'implement' })
     const trOut = await dispatch({ agent: 'codex', message: 'tech', phase: 'tech-review' })
     assert.match(trOut, /已续跑 codex \[brain\]/)
+    assert.match(trOut, /（代行架构师职责：架构师挂起，交付 SPEC\.md \/ TECH-REVIEW\.md）/)
 
     // Recovery restores the architect and closes the acting gate.
     const recoverOut = await failover({ agent: 'gpt', recover: true })
@@ -4512,7 +4515,9 @@ test('T12 failover suspends a quota-exhausted architect and hands its duties to 
     assert.deepEqual(JSON.parse(await readFile(failoverPath, 'utf8')).suspended, {})
     await assert.rejects(failover({ agent: 'gpt', recover: true }), /未挂起，无需恢复/)
     await assert.rejects(dispatch({ agent: 'codex', message: 's', phase: 'spec' }), /spec 阶段只能派 architect 角色；codex 当前是 brain。/)
-    assert.match(await dispatch({ agent: 'gpt', message: 'spec again', phase: 'spec' }), /已创建 gpt \[architect\]/)
+    const gptSpecAgain = await dispatch({ agent: 'gpt', message: 'spec again', phase: 'spec' })
+    assert.match(gptSpecAgain, /已创建 gpt \[architect\]/)
+    assert.ok(!/代行架构师职责/.test(gptSpecAgain), 'regular architect dispatch carries no acting marker')
     const statusRestored = await tool('squad_status').execute({}, exec)
     assert.match(statusRestored, /挂起：无/)
 

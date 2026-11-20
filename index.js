@@ -1851,6 +1851,10 @@ function createTools(ctx, config, runtime, store) {
       const reworkLine = flow.specRequired
         ? `rework: tech=${state.techReworkRounds ?? 0}/${budget.techLimit} business=${state.businessReworkRounds ?? 0}/${budget.businessLimit}`
         : `rework=${state.reworkRounds ?? 0}/${budget.reworkLimit}`
+      const actingLine =
+        target.role !== 'architect' && (phase === 'spec' || phase === 'tech-review')
+          ? ['（代行架构师职责：架构师挂起，交付 SPEC.md / TECH-REVIEW.md）']
+          : []
       const phaseLines = [
         ...(phase === 'design'
           ? [`planRounds=${state.planRounds}/${budget.designLimit}（Lead 审核后用 squad_approve_plan 批准）`]
@@ -1867,6 +1871,7 @@ function createTools(ctx, config, runtime, store) {
           `${mode === 'local' ? '已创建' : '已续跑'}本地子代理 ${target.name} [${target.role}] model=${target.model} session=${sessionId}`,
           `task=${taskId} phase=${phase} round=${round} ${reworkLine}`,
           ...phaseLines,
+          ...actingLine,
           `workspace=${workspace}`,
           '它完成后会以完成通知唤醒你；返工用同一 child id 续跑。',
         ].join('\n')
@@ -1880,6 +1885,7 @@ function createTools(ctx, config, runtime, store) {
           `已外部派发 ${target.displayName} (${target.name}) [${target.role}] provider=${target.model}（一次性，不续跑）`,
           `task=${taskId} phase=${phase} round=${round} tokens=${tokens ?? 'unknown'} totalTokens=${state.tokens ?? 0}`,
           ...phaseLines,
+          ...actingLine,
           `workspace=${workspace}`,
           '输出：',
           clipped || '（无文本输出）',
@@ -1889,6 +1895,7 @@ function createTools(ctx, config, runtime, store) {
         `${mode === 'spawned' ? '已创建' : '已续跑'} ${target.name} [${target.role}] session=${sessionId}`,
         `task=${taskId} phase=${phase} round=${round} ${reworkLine}`,
         ...phaseLines,
+        ...actingLine,
         `workspace=${workspace}`,
         '队友完成后会调用 squad_report。结束本回合等报告；需要查看时用 squad_status。',
       ].join('\n')
