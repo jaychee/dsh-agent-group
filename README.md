@@ -111,6 +111,17 @@ gpt（架构师）因**额度耗尽**等原因不可用时，插件把 gpt **挂
 - **可用性探测**是唯一仍同步的步骤（约一次短往返）：成功后按 `probeTtlMs`（默认 10 分钟）在 profile 级 `probe-cache.json` 缓存，跨任务复用；`probe: true` 强制重探，`probe: false` 跳过，`workerProbe: false` 全局关闭；`squad_failover(recover)` 会清掉该成员的缓存；
 - `squad_wait` 按设计会阻塞（最长 10 分钟），非必要不要用。
 
+### 多任务（同一会话并发推进）
+
+任务注册在 profile 级 `~/.dsh/agent-squad/tasks.json`（`taskId → memoryRoot/worktree/active`），因此**不再依赖会话 cwd 的 `current.json` 指针**来寻址：
+
+- `squad_start` 可以连续创建多个任务；除"原地开发"任务外，不再因为上一个任务还有队友在跑而被拒绝；
+- 所有任务工具（`squad_dispatch` / `squad_status` / `squad_approve_plan` / `squad_deliver` / `squad_finish` / `squad_extend` / `squad_parallel_start`）都接受 `task_id`，按注册表直接定位，与当前 cwd 无关；未知 id 会明确报错；
+- **队友按任务隔离**：同时存在多个活动任务时，子代理以 `<taskId>/<name>` 命名（如 `t-mw.../zcode`），每个任务各自拥有 `zcode` 会话；重新派单只续跑本任务的子代理；单活动任务时仍用裸名 `zcode`（保持既有行为）；
+- 队友 `squad_report` 通过派单时记录的 `taskId` 绑定回到自己的任务，不会串到别的任务；
+- `squad_status` 增加"其他活动任务（用 task_id 寻址）"清单；收尾的任务自动从活动列表移除；
+- 限制：任务之间的 worktree 由各自 `squad_start` 创建，Lead 的 cwd 只会停在最近创建/切换的那个；跨任务操作请显式带 `task_id`。
+
 ### 进度同步与分层展示
 
 - **自动同步**：派单、方案批准、开启并行、交付、收尾以及收到队友 `squad_report` 时，插件自动把最新进度写入共享记忆的 `PROGRESS.md`（任务总览 → 分阶段进度 → 队员进度 → 并行特性，含门禁/验收状态、各队员最近一轮与运行状态）。
@@ -198,7 +209,7 @@ node --test dsh-agent-squad/test/settings.test.js
 ASQ_LIVE_QODER=1 node --test --test-name-pattern='^T09 ' dsh-agent-squad/test/settings.test.js
 ```
 
-测试保持十八个顶层用例（T01–T18；T11 完整流程与双验收，T12 架构师容错交接，T13 后台并行派发，T14 角色 worker 能力与 leaderWorker，T15 worker 可用性门禁与自动替代，T16 阶段化并行与 Base 分支合并，T17 分层进度与自动同步，T18 外部阶段非阻塞与延迟记账）；实机模式由 qoder 一次派单修改两个临时仓库，各新增一次提交，并输出 `AC7 task=... cwd=... repo=... commit=... repo=... commit=...`。普通单测不能代替该证据。
+测试保持十九个顶层用例（T01–T19；T11 完整流程与双验收，T12 架构师容错交接，T13 后台并行派发，T14 角色 worker 能力与 leaderWorker，T15 worker 可用性门禁与自动替代，T16 阶段化并行与 Base 分支合并，T17 分层进度与自动同步，T18 外部阶段非阻塞与延迟记账，T19 同会话多任务隔离与寻址）；实机模式由 qoder 一次派单修改两个临时仓库，各新增一次提交，并输出 `AC7 task=... cwd=... repo=... commit=... repo=... commit=...`。普通单测不能代替该证据。
 
 ## B 模式：外部 provider（一次性）
 
@@ -483,5 +494,5 @@ cd ~/.dsh/profiles/<profile> && pnpm add @deepseek-ai/dsh-subagent-acp@<运行�
 - **不自动合并**：`squad_finish` 只提交分支并给出合并命令，合不合、何时合由你决定。
 - **worktree 生命周期**：收尾成功或失败后，各仓 checkout 与分支均保留；逐仓用 `git -C <repo> worktree remove <path>` + `git -C <repo> branch -D <branch>` 清理。多仓创建事务失败才自动回滚本次产物；失败详情会报告，源文件与已有分支不删除。
 - 所有成员共享同一个任务工作区；多仓工作区包含多个子 worktree，不提供按成员隔离，写冲突靠 Lead 划分文件范围 + 双验收兜底。
-- 只支持单任务串行推进（`current.json` 只有一个指针）；并行任务需要多开会话。
+- **多任务**：同一会话可同时推进多个任务（见下方"多任务"），任务之间用 `task_id` 寻址；只有"原地开发（无 worktree）"的任务仍会因共用 checkout 而被守卫挡住。
 - 队友必须主动 `squad_report`；若模型漏报，用 `squad_status` 查看文件与状态，必要时 `squad_wait`。

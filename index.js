@@ -1052,6 +1052,83 @@ function pendingRunGate(state, action) {
   const list = pending.map((item) => `${item.agent} ${item.phase} r${item.round}`).join('、')
   return `后台任务仍在运行：${list}；结果以后台消息送达，等它到达（squad_status 可查看进度）后再${action}。`
 }
+
+/**
+ * Profile-level task registry: taskId → { memoryRoot, worktree, active }.
+ * Multi-task support needs task resolution that does not depend on the
+ * session cwd (which can only point at one worktree), so every task a squad
+ * starts is registered here and tools may address it with `task_id`.
+ */
+function taskRegistryPath(store) {
+  return join(dirname(store.path), 'tasks.json')
+}
+
+async function readTaskRegistry(store) {
+  const raw = await readJson(taskRegistryPath(store))
+  return raw && typeof raw === 'object' && raw.tasks && typeof raw.tasks === 'object'
+    ? { tasks: raw.tasks }
+    : { tasks: {} }
+}
+
+async function registerTask(store, row) {
+  const registry = await readTaskRegistry(store)
+  registry.tasks[row.taskId] = { ...(registry.tasks[row.taskId] ?? {}), ...row }
+  await writeJson(taskRegistryPath(store), registry)
+}
+
+async function markTaskActive(store, taskId, active) {
+  const registry = await readTaskRegistry(store)
+  if (!registry.tasks[taskId]) return
+  registry.tasks[taskId] = { ...registry.tasks[taskId], active: active === true }
+  await writeJson(taskRegistryPath(store), registry)
+}
+
+/** Number of tasks that have not finished yet. */
+async function activeTaskCount(store) {
+  const registry = await readTaskRegistry(store)
+  return Object.values(registry.tasks).filter((row) => row.active === true).length
+}
+
+/**
+ * Resolve the task a tool call targets.
+ * @param {string} [explicitTaskId] `args.task_id`; when absent the workspace
+ *   current pointer decides (backward compatible single-task behaviour).
+ * @returns {{taskId: string, taskDir: string, memoryRoot: string, current: object|undefined}}
+ */
+async function resolveTask({ ctx, agent, config, store, explicitTaskId }) {
+  const wanted = typeof explicitTaskId === 'string' ? explicitTaskId.trim() : ''
+  if (wanted !== '') {
+    const registry = await readTaskRegistry(store)
+    const row = registry.tasks[wanted]
+    if (!row?.memoryRoot) {
+      throw new Error(`未知小队任务 "${wanted}"：先 squad_start 创建，或核对任务 id。`)
+    }
+    return {
+      taskId: wanted,
+      taskDir: join(row.memoryRoot, wanted),
+      memoryRoot: row.memoryRoot,
+      current: { taskId: wanted, memoryRoot: row.memoryRoot, worktree: row.worktree ?? null },
+    }
+  }
+  const directory = await memoryDirectory(ctx, agent, config)
+  const current = await readJson(join(directory, 'current.json'))
+  const taskId = String(current?.taskId ?? '')
+  return {
+    taskId,
+    taskDir: taskId ? join(directory, taskId) : '',
+    memoryRoot: directory,
+    current,
+  }
+}
+
+/**
+ * Spawn name for a teammate. With more than one active task the name is
+ * prefixed so two tasks can each own a `zcode` child without colliding in the
+ * subagent tree; a single active task keeps the plain roster name.
+ */
+function childNameFor(taskId, name, activeTasks) {
+  return activeTasks > 1 ? `${taskId}/${name}` : name
+}
 /** Build the six model-facing tools. */
 function createTools(ctx, config, runtime, store) {
   const start = defineTool({
@@ -1101,22 +1178,24 @@ function createTools(ctx, config, runtime, store) {
       const sourceDirectory = sessionDirectory(ctx, lead)
       const settings = await store.read()
       const roster = settingsRoster(settings, config)
-      // R07: starting a new task must not steal `current.json` away from a task
-      // whose local children are still active.
+      // Multi-task: previous tasks stay addressable through the registry, so a
+      // new task no longer has to wait for the old one's children to finish.
+      // Only an in-place task sharing this exact memory root is refused, since
+      // both would fight over the same checkout.
       {
         const memory = await memoryDirectory(ctx, lead, config)
         const pointer = await readJson(join(memory, 'current.json'))
         const previous = pointer?.taskId
           ? await readJson(join(memory, pointer.taskId, 'STATE.json'))
           : undefined
-        if (previous && previous.phase !== 'done') {
+        if (previous && previous.phase !== 'done' && !previous.worktree) {
           const treeRows = await treeRowsOf(ctx, lead)
           const active = Object.entries(previous.children ?? {}).filter(
             ([, child]) => child.status === 'provisioning' || isRowRunning(treeRows, child.id),
           )
           if (active.length > 0) {
             throw new Error(
-              `当前任务 ${pointer.taskId} 仍有运行中的本地子代理：${active.map(([name]) => name).join(', ')}。先收尾或等它们完成，再开新任务。`,
+              `当前原地开发任务 ${pointer.taskId} 仍有运行中的本地子代理：${active.map(([name]) => name).join(', ')}。先收尾或等它们完成，再开新任务。`,
             )
           }
         }
@@ -1272,6 +1351,14 @@ function createTools(ctx, config, runtime, store) {
           for (const wt of worktrees) {
             await writeJson(join(wt.path, config.memoryDir, 'current.json'), pointer)
           }
+          await registerTask(store, {
+            taskId,
+            memoryRoot,
+            worktree: worktrees[0].path,
+            taskRoot,
+            active: true,
+            createdAt: new Date().toISOString(),
+          })
         } catch (error) {
           if (!multi) throw error
           // Multi-repository init/publish failure: restore every touched
@@ -1455,6 +1542,14 @@ function createTools(ctx, config, runtime, store) {
         memoryRoot,
         worktree: worktree?.path ?? null,
       })
+      await registerTask(store, {
+        taskId,
+        memoryRoot,
+        worktree: worktree?.path ?? null,
+        taskRoot: worktree?.path ?? sourceDirectory,
+        active: true,
+        createdAt: new Date().toISOString(),
+      })
       if (worktree) {
         const worktreeMemory = join(worktree.path, config.memoryDir)
         await ensureSelfIgnore(worktreeMemory)
@@ -1601,7 +1696,6 @@ function createTools(ctx, config, runtime, store) {
     },
     async execute(args, exec) {
       const lead = callingAgent(exec, 'squad_dispatch')
-      const directory = await memoryDirectory(ctx, lead, config)
       const settings = await store.read()
       const roster = settingsRoster(settings, config)
       // Target is mutable: the worker availability gate may hand the round to
@@ -1653,10 +1747,12 @@ function createTools(ctx, config, runtime, store) {
         }
         routeToSubstitute(detail)
       }
-      const current = await readJson(join(directory, 'current.json'))
-      const taskId = String(args.task_id ?? current?.taskId ?? '')
+      const resolved = await resolveTask({
+        ctx, agent: lead, config, store, explicitTaskId: args.task_id,
+      })
+      const { taskId, taskDir } = resolved
+      const directory = resolved.memoryRoot
       if (!taskId) throw new Error('还没有小队任务。先调用 squad_start。')
-      const taskDir = join(directory, taskId)
       const state = await readJson(join(taskDir, 'STATE.json'))
       if (!state) throw new Error(`未知小队任务 "${taskId}"。先调用 squad_start。`)
 
@@ -1666,9 +1762,13 @@ function createTools(ctx, config, runtime, store) {
       const phase = args.phase ?? 'design'
       const flow = flowOf(state)
       const treeRows = await treeRowsOf(ctx, lead, exec.signal)
-      const existing = treeRows.find(
-        (row) => (row.name ?? row.label ?? String(row.id)) === target.name,
-      )
+      const activeTasks = await activeTaskCount(store).catch(() => 1)
+      const spawnName = childNameFor(taskId, target.name, activeTasks)
+      const recordedChildId =
+        state.children?.[target.name]?.id ?? state.members?.[target.name]?.id
+      const existing =
+        (recordedChildId ? treeRows.find((row) => row.id === recordedChildId) : undefined) ??
+        treeRows.find((row) => (row.name ?? row.label ?? String(row.id)) === spawnName)
       const priorRework = Number(state.reworkRounds ?? 0)
       const budget = budgetOf(state)
       // Full-flow rework: resolve which acceptance the defects come from and
@@ -1993,7 +2093,7 @@ function createTools(ctx, config, runtime, store) {
         })
         if (existingChild === undefined) {
           const childId = randomUUID()
-          runtime.registerBinding(childId, target)
+          runtime.registerBinding(childId, { ...target, taskId })
           // Persist the provisional binding BEFORE creating the child so an
           // overlapping dispatch in another task sees the in-flight creation.
           state.children = {
@@ -2005,7 +2105,7 @@ function createTools(ctx, config, runtime, store) {
             const activation = await subagents.startActivation({
               provider: 'spawn',
               childId,
-              name: target.name,
+              name: spawnName,
               label: `${taskId}/${phase}/${target.name}`,
               prompt: [{ type: 'text', text: prompt }],
               parent: lead,
@@ -2027,7 +2127,7 @@ function createTools(ctx, config, runtime, store) {
             throw error
           }
         } else {
-          runtime.rebind(existingChild.id, target)
+          runtime.rebind(existingChild.id, { ...target, taskId })
           await moveTeammate(existingChild.id)
           await subagents.sendMessage(lead, existingChild.id, [{ type: 'text', text: prompt }], {
             signal: exec.signal,
@@ -2171,13 +2271,13 @@ function createTools(ctx, config, runtime, store) {
         const childId = randomUUID()
         // Publish this round's snapshots before spawning so an agent/created
         // fired mid-spawn already installs the dispatched identity (R08).
-        runtime.setPending(target.name, target)
+        runtime.setPending(spawnName, { ...target, taskId })
         let activation
         try {
           activation = await subagents.startActivation({
             provider,
             childId,
-            name: target.name,
+            name: spawnName,
             label: `${taskId}/${phase}/${target.name}`,
             prompt: [{ type: 'text', text: message }],
             parent: lead,
@@ -2190,10 +2290,11 @@ function createTools(ctx, config, runtime, store) {
         }
         mode = 'spawned'
         sessionId = activation.childId
+        state.members = { ...(state.members ?? {}), [target.name]: { id: sessionId } }
         await moveTeammate(sessionId)
         // Team members carry the dispatch-time settings snapshot, exactly like
         // local children, so later edits cannot restyle their identity (R08).
-        runtime.rebind(sessionId, target)
+        runtime.rebind(sessionId, { ...target, taskId })
       } else {
         const subagents = ctx.get('subagents')
         if (!subagents) {
@@ -2202,7 +2303,7 @@ function createTools(ctx, config, runtime, store) {
         await moveTeammate(existing.id)
         // Idle resume: refresh the binding and identity section to this
         // round's snapshot before the message is delivered (R08).
-        runtime.rebind(existing.id, target)
+        runtime.rebind(existing.id, { ...target, taskId })
         await subagents.sendMessage(
           lead,
           existing.id,
@@ -2530,6 +2631,20 @@ function createTools(ctx, config, runtime, store) {
             : ['工作区：原地开发']
       await flushPendingRuns({ ctx, lead, taskDir, state, signal: undefined }).catch(() => {})
       const progressBlock = await renderProgress({ taskDir, state, rows: treeRows })
+      // Multi-task overview: every non-finished task stays addressable.
+      let otherTasks = []
+      try {
+        const registry = await readTaskRegistry(store)
+        for (const [id, row] of Object.entries(registry.tasks)) {
+          if (id === taskId || row.active !== true) continue
+          const otherState = row.memoryRoot
+            ? await readJson(join(row.memoryRoot, id, 'STATE.json'))
+            : undefined
+          otherTasks.push(
+            `- ${id}  phase=${otherState?.phase ?? '?'}  round=${otherState?.round ?? '?'}  ${progressSummaryOf(otherState ?? { phase: '?' })}`,
+          )
+        }
+      } catch {}
       const lines = [
         `${PLUGIN_MARKER}  task=${taskId}  phase=${state.phase ?? 'unknown'}  round=${state.round ?? '?'}  flow=${flow.flow}  created=${state.createdAt ?? '?'}`,
         ...progressBlock.split('\n'),
@@ -2586,6 +2701,7 @@ function createTools(ctx, config, runtime, store) {
                 (item) => `- ${item.at} kind=${item.kind} rounds=${item.rounds} reason=${item.reason}`,
               ),
             ]),
+        ...(otherTasks.length > 0 ? ['其他活动任务（用 task_id 寻址）：', ...otherTasks] : []),
         `当前目录：${sessionDirectory(ctx, lead)}`,
         ...(backgroundRunning > 0
           ? [`后台执行器运行中：${backgroundRunning} 个（background 派发，结果将以消息送达；squad_finish 会等待）`]
@@ -2725,9 +2841,22 @@ function createTools(ctx, config, runtime, store) {
       } catch {}
       const name = binding?.name ?? selfName ?? me.__membership?.name ?? String(me.id)
       const root = rootId ?? 'lead'
-      const directory = await memoryDirectory(ctx, me, config)
-      const current = await readJson(join(directory, 'current.json'))
-      const taskId = current?.taskId ? String(current.taskId) : 'unknown'
+      // The binding records which task dispatched this child; with several
+      // active tasks the cwd pointer may belong to a different one.
+      let taskId = 'unknown'
+      let directory = await memoryDirectory(ctx, me, config)
+      if (binding?.taskId) {
+        try {
+          const resolved = await resolveTask({
+            ctx, agent: me, config, store, explicitTaskId: binding.taskId,
+          })
+          taskId = resolved.taskId
+          directory = resolved.memoryRoot
+        } catch {}
+      } else {
+        const current = await readJson(join(directory, 'current.json'))
+        taskId = current?.taskId ? String(current.taskId) : 'unknown'
+      }
       // Dispatch-time snapshot first; fall back to the current settings roster
       // for agents bound before snapshots existed (R08).
       const configured =
@@ -2743,8 +2872,8 @@ function createTools(ctx, config, runtime, store) {
         } catch {}
       }
       let reportProgress = null
-      if (current?.taskId) {
-        const reportTaskDir = join(directory, String(current.taskId))
+      if (taskId && taskId !== 'unknown') {
+        const reportTaskDir = join(directory, taskId)
         const journal = join(reportTaskDir, 'JOURNAL.md')
         await appendFile(
           journal,
@@ -2792,11 +2921,11 @@ ${String(args.summary).trim()}
     },
     async execute(args, exec) {
       const lead = callingAgent(exec, 'squad_finish')
-      const directory = await memoryDirectory(ctx, lead, config)
-      const current = await readJson(join(directory, 'current.json'))
-      const taskId = String(args.task_id ?? current?.taskId ?? '')
+      const resolved = await resolveTask({
+        ctx, agent: lead, config, store, explicitTaskId: args.task_id,
+      })
+      const { taskId, taskDir, memoryRoot: directory } = resolved
       if (!taskId) throw new Error('还没有小队任务。先调用 squad_start。')
-      const taskDir = join(directory, taskId)
       const state = await readJson(join(taskDir, 'STATE.json'))
       if (!state) throw new Error(`未知小队任务 "${taskId}"。`)
       if (state.phase === 'done') throw new Error(`任务 ${taskId} 已经收尾。`)
@@ -2866,6 +2995,7 @@ ${String(args.summary).trim()}
         state.closedAt = new Date().toISOString()
         state.verdict = 'approved'
         state.commit = state.baseDelivered.commits?.[0]?.commit ?? null
+        await markTaskActive(store, taskId, false).catch(() => {})
         state.finishSummary = summary
         await writeJson(join(taskDir, 'STATE.json'), state)
         await writeFile(
@@ -3050,6 +3180,7 @@ ${String(args.summary).trim()}
       state.verdict = 'approved'
       state.commit = commit
       state.finishSummary = summary
+      await markTaskActive(store, taskId, false).catch(() => {})
       await writeJson(join(taskDir, 'STATE.json'), state)
       await writeFile(
         join(taskDir, 'FINAL.md'),
@@ -3087,11 +3218,11 @@ ${String(args.summary).trim()}
     },
     async execute(args, exec) {
       const lead = callingAgent(exec, 'squad_approve_plan')
-      const directory = await memoryDirectory(ctx, lead, config)
-      const current = await readJson(join(directory, 'current.json'))
-      const taskId = String(args.task_id ?? current?.taskId ?? '')
+      const resolved = await resolveTask({
+        ctx, agent: lead, config, store, explicitTaskId: args.task_id,
+      })
+      const { taskId, taskDir, memoryRoot: directory } = resolved
       if (!taskId) throw new Error('还没有小队任务。先调用 squad_start。')
-      const taskDir = join(directory, taskId)
       const state = await readJson(join(taskDir, 'STATE.json'))
       if (!state) throw new Error(`未知小队任务 "${taskId}"。先调用 squad_start。`)
       if (state.phase === 'done') throw new Error(`任务 ${taskId} 已经收尾，不能批准 PLAN。`)
@@ -3363,11 +3494,11 @@ ${String(args.summary).trim()}
     },
     async execute(args, exec) {
       const lead = callingAgent(exec, 'squad_parallel_start')
-      const directory = await memoryDirectory(ctx, lead, config)
-      const current = await readJson(join(directory, 'current.json'))
-      const taskId = String(args.task_id ?? current?.taskId ?? '')
+      const resolved = await resolveTask({
+        ctx, agent: lead, config, store, explicitTaskId: args.task_id,
+      })
+      const { taskId, taskDir, memoryRoot: directory } = resolved
       if (!taskId) throw new Error('还没有小队任务。先调用 squad_start。')
-      const taskDir = join(directory, taskId)
       const state = await readJson(join(taskDir, 'STATE.json'))
       if (!state) throw new Error(`未知小队任务 "${taskId}"。先调用 squad_start。`)
       if (state.phase === 'done') throw new Error(`任务 ${taskId} 已经收尾，不能开启并行阶段。`)
@@ -3479,11 +3610,11 @@ ${String(args.summary).trim()}
     },
     async execute(args, exec) {
       const lead = callingAgent(exec, 'squad_deliver')
-      const directory = await memoryDirectory(ctx, lead, config)
-      const current = await readJson(join(directory, 'current.json'))
-      const taskId = String(args.task_id ?? current?.taskId ?? '')
+      const resolved = await resolveTask({
+        ctx, agent: lead, config, store, explicitTaskId: args.task_id,
+      })
+      const { taskId, taskDir, memoryRoot: directory } = resolved
       if (!taskId) throw new Error('还没有小队任务。先调用 squad_start。')
-      const taskDir = join(directory, taskId)
       const state = await readJson(join(taskDir, 'STATE.json'))
       if (!state) throw new Error(`未知小队任务 "${taskId}"。先调用 squad_start。`)
       if (state.phase === 'done') throw new Error(`任务 ${taskId} 已经收尾，不能再交付。`)

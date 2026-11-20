@@ -724,7 +724,7 @@ test('T03 dispatch reads fresh settings and routes external/local/team executors
       worktree: snapshot.worktree,
     })
     const resumeOutput = await tool('squad_dispatch').execute(
-      { agent: 'qoder', message: 'resume as worker', phase: 'implement' },
+      { agent: 'qoder', message: 'resume as worker', phase: 'implement', task_id: firstTaskId },
       exec,
     )
     assert.match(resumeOutput, /已续跑 qoder \[worker\]/)
@@ -4631,10 +4631,13 @@ test('T12 failover suspends a quota-exhausted architect and hands its duties to 
     await tool('squad_approve_plan').execute({ task_id: taskG }, exec)
     const originalStart = host.subagents.startActivation
     const originalSend = host.subagents.sendMessage
-    const gptMemberId = host.members.find((member) => member.name === 'gpt')?.id
+    const gptMemberId = host.members.find(
+      (member) => member.name === 'gpt' || String(member.name ?? '').endsWith('/gpt'),
+    )?.id
+    const isGptName = (name) => name === 'gpt' || String(name ?? '').endsWith('/gpt')
     const installQuotaThrow = (message) => {
       host.subagents.startActivation = async (spec) => {
-        if (spec.name === 'gpt') throw new Error(message)
+        if (isGptName(spec.name)) throw new Error(message)
         return originalStart(spec)
       }
       host.subagents.sendMessage = async (from, targetId, content) => {
@@ -5500,6 +5503,107 @@ test('T18 slow external phases return immediately, stay pending, then flush', as
     assert.deepEqual(state.pendingRuns, [])
     // Every acceptance is satisfied → finishing is allowed.
     assert.match(await tool('squad_finish').execute({ summary: 'done' }, exec), /收尾/)
+  } finally {
+    delete process.env.DSH_HOME
+    await rm(workspace, { recursive: true, force: true })
+    await rm(dshHome, { recursive: true, force: true })
+  }
+})
+
+/** T19 — multiple active tasks in one session. */
+test('T19 two active tasks keep separate state, teammates and addressing', async () => {
+  const workspace = await tempRoot()
+  const dshHome = await tempRoot()
+  process.env.DSH_HOME = dshHome
+  try {
+    const settingsPath = join(dshHome, 'agent-squad', 'settings.json')
+    await mkdir(join(dshHome, 'agent-squad'), { recursive: true })
+    await writeFile(
+      settingsPath,
+      JSON.stringify(
+        {
+          version: 3,
+          revision: 1,
+          agents: [
+            { id: 'codex', displayName: 'codex', role: 'brain', executor: 'team', model: '', description: 'b' },
+            { id: 'gpt', displayName: 'gpt', role: 'architect', executor: 'team', model: '', description: 'a' },
+            { id: 'zcode', displayName: 'zcode', role: 'worker', executor: 'team', model: '', description: 'w' },
+            { id: 'qoder', displayName: 'qoder', role: 'worker', executor: 'team', model: '', description: 'w2' },
+            { id: 'opencode', displayName: 'opencode', role: 'worker', executor: 'team', model: '', description: 'w3' },
+          ],
+          worktree: { directory: '.agents/worktrees' },
+        },
+        null,
+        2,
+      ),
+      'utf8',
+    )
+    const host = mockHost(workspace, dshHome)
+    const { apply } = await import('../index.js')
+    apply(host.ctx, { workerProbe: false, agents: BUNDLE_AGENTS })
+    const tool = (name) => host.registered.find((entry) => entry.definition.name === name).definition
+    const lead = { id: 'lead-1', session: { id: 'session-1' }, __membership: { role: 'lead', name: 'lead' } }
+    const exec = { agent: lead, signal: undefined }
+    await tool('squad_enable').execute({}, exec)
+    const dispatch = (args) => tool('squad_dispatch').execute(args, exec)
+    const startTask = async (goal) => {
+      const out = await tool('squad_start').execute({ goal, acceptance: 'ok', agents: ['codex', 'zcode'] }, exec)
+      return /任务 (t-\S+) 已创建/.exec(out)[1]
+    }
+    const readState = async (task) =>
+      JSON.parse(await readFile(join(workspace, '.agent-squad', task, 'STATE.json'), 'utf8'))
+
+    // Two tasks start back-to-back; the second no longer has to wait.
+    const taskA = await startTask('A')
+    const taskB = await startTask('B')
+    assert.notEqual(taskA, taskB)
+    assert.equal((await readState(taskA)).taskId, taskA)
+    assert.equal((await readState(taskB)).taskId, taskB)
+
+    // Each task keeps its own zcode teammate with a task-scoped spawn name.
+    await writeFile(join(workspace, '.agent-squad', taskA, 'PLAN.md'), '# A\n', 'utf8')
+    await writeFile(join(workspace, '.agent-squad', taskB, 'PLAN.md'), '# B\n', 'utf8')
+    await tool('squad_approve_plan').execute({ task_id: taskA }, exec)
+    await tool('squad_approve_plan').execute({ task_id: taskB }, exec)
+    const aOut = await dispatch({ agent: 'zcode', message: 'impl A', phase: 'implement', task_id: taskA })
+    assert.match(aOut, new RegExp(`task=${taskA}`))
+    assert.equal(host.spawned.at(-1).name, `${taskA}/zcode`)
+    const bOut = await dispatch({ agent: 'zcode', message: 'impl B', phase: 'implement', task_id: taskB })
+    assert.match(bOut, new RegExp(`task=${taskB}`))
+    assert.equal(host.spawned.at(-1).name, `${taskB}/zcode`)
+    // Same roster member, two distinct children.
+    const childrenA = (await readState(taskA)).members
+    const childrenB = (await readState(taskB)).members
+    assert.ok(childrenA.zcode?.id && childrenB.zcode?.id)
+    assert.notEqual(childrenA.zcode.id, childrenB.zcode.id)
+    // Re-dispatching a task resumes ITS child (not the other task's).
+    const resumeA = await dispatch({ agent: 'zcode', message: 'again A', phase: 'implement', task_id: taskA })
+    assert.match(resumeA, /已续跑 zcode/)
+    assert.equal(host.sent.at(-1).targetId, childrenA.zcode.id)
+
+    // Addressability by id works even though current.json points at B.
+    const status = await tool('squad_status').execute({}, exec)
+    assert.match(status, /其他活动任务（用 task_id 寻址）：/)
+    assert.match(status, new RegExp(`- ${taskA}  phase=`))
+    // Unknown ids are refused with guidance.
+    await assert.rejects(
+      dispatch({ agent: 'zcode', message: 'x', phase: 'implement', task_id: 't-nope' }),
+      /未知小队任务 "t-nope"：先 squad_start 创建，或核对任务 id。/,
+    )
+
+    // Finishing one task leaves the other active and addressable.
+    await writeFile(join(workspace, '.agent-squad', taskA, 'REVIEW.md'), '# R\n\nVERDICT: APPROVED\n', 'utf8')
+    await dispatch({ agent: 'codex', message: 'review A', phase: 'review', task_id: taskA })
+    assert.match(await tool('squad_finish').execute({ summary: 'A done', task_id: taskA }, exec), /收尾/)
+    assert.equal((await readState(taskA)).phase, 'done')
+    assert.notEqual((await readState(taskB)).phase, 'done')
+    const statusB = await tool('squad_status').execute({}, exec)
+    assert.ok(!new RegExp(`- ${taskA}  phase=`).test(statusB), 'finished task leaves the active list')
+    // B still dispatches normally after A closed.
+    assert.match(
+      await dispatch({ agent: 'zcode', message: 'again B', phase: 'implement', task_id: taskB }),
+      /已(续跑|创建) zcode/,
+    )
   } finally {
     delete process.env.DSH_HOME
     await rm(workspace, { recursive: true, force: true })
