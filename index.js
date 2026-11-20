@@ -204,6 +204,7 @@ const LEAD_POLICY = `Agent Squad 已启用：你是 Lead，小队里有按角色
 - worker 不可用时可直接指定 gpt 接手实现（phase="implement"/"rework"）；${MAX_TECH_REWORK_ROUNDS} 轮技术返工仍未通过时先问用户是否继续，获准继续后直接派 gpt 接手，不需要再次确认选人。gpt 接手写代码后不能自签技术验收：tech-review 改派 codex 对照 SPEC.md 独立代签技术验收，业务验收仍由 codex 按业务方案单独签署，两份验收独立记录。
 - 一个角色一个 agent。按能力选 worker：zcode 负责后端实现，qoder 负责前端产品实现与自测。
 - 每次派单后结束当前回合，等队友的 squad_report 唤醒你；查看状态用 squad_status，只有必须在本回合阻塞时才用 squad_wait。
+- 信息同步：插件在每个派单、squad_approve_plan、squad_parallel_start、squad_deliver、squad_finish 以及收到 squad_report 时自动刷新 PROGRESS.md；squad_status 顶部即分层进度（任务总览→阶段进度→队员进度→并行特性）。每个阶段完成、收到关键报告、交付与收尾时，用最新分层进度向用户简报一次（不要只报"进行中"）。
 - 队友在跑时不得声称完成；没有双验收不得接受结果。
 - 技术返工与业务返工各自默认最多 3 轮、独立计数、互不重置。任一到上限就暂停派单，先向用户说明阻塞点与已完成部分并等待决策；仅用户明确同意后调用 squad_extend(kind="tech"/"business", rounds=3, reason="用户批准的追加理由", confirmed=true) 追加轮次再派单，每次扩展都要重新确认，可重复扩展，不自动续跑；用户拒绝或未回复时保持暂停。
 - 外部 provider（agent 配置里 provider 非空且不是 spawn/fork）走一次性派发：squad_dispatch 阻塞到它返回并把结果直接给你；它不会 squad_report，也不能续跑。返工=再派一次，必须重发 BRIEF 与编号缺陷。
@@ -700,7 +701,7 @@ function formatMembers(members) {
 }
 
 async function fileSummary(taskDir) {
-  const names = ['TASK.md', 'PLAN.md', 'SPEC.md', 'TECH-REVIEW.md', 'REVIEW.md', 'REPORT.md', 'JOURNAL.md']
+  const names = ['TASK.md', 'PROGRESS.md', 'PLAN.md', 'SPEC.md', 'TECH-REVIEW.md', 'REVIEW.md', 'REPORT.md', 'JOURNAL.md']
   const parts = []
   for (const fileName of names) {
     try {
@@ -870,6 +871,90 @@ async function mergeIntoBase({ repo, branch, baseBranch, message }) {
   return (await git(repo, ['rev-parse', '--short', 'HEAD'])).trim()
 }
 
+
+/** One-line stage summary used in reports and status. */
+function progressSummaryOf(state) {
+  const features = Array.isArray(state.features) ? state.features : []
+  if (state.phase === 'done') return '任务已完成'
+  if (state.baseDelivered) {
+    const merged = features.filter((item) => item.merged).length
+    return `并行阶段：Base 已交付，特性 ${merged}/${features.length} 已合并${features.length ? `（${features.map((item) => `${item.name}${item.merged ? '✓' : '…'}`).join(' ')}）` : ''}`
+  }
+  return `串行阶段（基础层）：phase=${state.phase} round=${state.round}`
+}
+
+/**
+ * Layered progress view: task overview → phase checklist → teammate progress →
+ * parallel features. Used by squad_status and the auto-synced PROGRESS.md.
+ */
+async function renderProgress({ taskDir, state, rows = [] }) {
+  const flow = flowOf(state)
+  const features = Array.isArray(state.features) ? state.features : []
+  const dispatches = Array.isArray(state.dispatches) ? state.dispatches : []
+  const plan = planGateOf(state)
+  const running = new Set(
+    rows.filter((row) => row.activity === 'running' && row.name).map((row) => row.name),
+  )
+  const lastOf = (name) => [...dispatches].reverse().find((item) => item.agent === name)
+  const techVerdict = flow.specRequired ? await readVerdict(taskDir, 'TECH-REVIEW.md') : undefined
+  const businessVerdict = await readVerdict(taskDir, 'REVIEW.md')
+  const techFresh = flow.specRequired && bindingFresh(state.techReview, state) && techVerdict === 'APPROVED'
+  const businessFresh = bindingFresh(state.businessReview, state) && businessVerdict === 'APPROVED'
+  const done = state.phase === 'done'
+  const lines = ['## 进度总览', `- 阶段：${progressSummaryOf(state)}`, `- 当前：phase=${state.phase ?? '?'} round=${state.round ?? '?'}${done ? '（已收尾）' : ''}`]
+  const gates = [`方案 ${plan.planApproved ? '已批准' : plan.planRequired ? '待批准' : '豁免'}`]
+  if (flow.specRequired) {
+    gates.push(`技术验收 ${techFresh ? '新鲜 APPROVED' : techVerdict ?? '未验收'}`)
+    gates.push(`业务验收 ${businessFresh ? '新鲜 APPROVED' : businessVerdict ?? '未验收'}`)
+  } else if (state.gate?.reviewRequired !== false) {
+    gates.push(`业务验收 ${businessVerdict ?? '未验收'}`)
+  }
+  lines.push(`- 门禁：${gates.join(' · ')}`)
+
+  lines.push('## 分阶段进度')
+  const check = (ok) => (ok ? '✓' : '…')
+  lines.push(
+    `- ${check(plan.planApproved)} 业务方案：${plan.planApproved ? `已批准（第 ${plan.planRounds}/${budgetOf(state).designLimit} 次设计，${plan.planApprovedAt ?? '?'}）` : plan.planRequired ? `待 Lead 批准（第 ${plan.planRounds}/${budgetOf(state).designLimit} 次设计）` : '豁免'}`,
+  )
+  if (flow.specRequired) {
+    lines.push(`- ${check(state.specPublished)} 技术规格：${state.specPublished ? `v${state.specVersion ?? 0}（SPEC.md）` : '未交付'}`)
+  }
+  const baseImpl = dispatches.filter((item) => !item.feature && (item.phase === 'implement' || item.phase === 'rework')).length
+  lines.push(`- ${check(baseImpl > 0)} 基础层实现：${baseImpl} 轮${state.baseDelivered ? '（已交付）' : ''}`)
+  if (state.baseDelivered) {
+    lines.push(`- ✓ 基础层交付：${state.baseDelivered.summary ?? ''} @ ${state.baseDelivered.at}（Base：${(state.baseDelivered.commits ?? []).map((row) => row.baseBranch).join(',') || '?'}）`)
+  }
+  if (features.length > 0) {
+    lines.push('## 并行特性')
+    for (const feature of features) {
+      const latest = [...dispatches].reverse().find((item) => item.feature === feature.name)
+      const who = latest ? `${latest.agent} ${latest.phase} r${latest.round}` : '未派单'
+      lines.push(`- ${feature.merged ? '✓' : '…'} ${feature.name}${feature.focus ? `（${feature.focus}）` : ''}：${feature.merged ? `已合并 ${feature.mergedAt ?? ''} 提交 ${feature.commit ?? ''}` : who}`)
+    }
+  }
+  const members = [...new Set(Array.isArray(state.participants) ? state.participants : [])]
+  if (members.length > 0) {
+    lines.push('## 队员进度')
+    for (const name of members) {
+      const latest = lastOf(name)
+      const role = state.participantRoles?.[name] ?? latest?.role ?? '—'
+      const status = running.has(name) ? '运行中' : '空闲'
+      lines.push(
+        `- ${name} [${role}] ${status}${latest ? ` · 最近 ${latest.phase} r${latest.round} @ ${latest.at}` : ' · 尚未派单'}`,
+      )
+    }
+  }
+  return lines.join('\n')
+}
+
+/** Best-effort auto-sync of PROGRESS.md at meaningful moments. */
+async function writeProgress({ ctx, lead, taskDir, state, signal }) {
+  try {
+    const rows = lead ? await treeRowsOf(ctx, lead, signal) : []
+    const progress = await renderProgress({ taskDir, state, rows })
+    await writeFile(join(taskDir, 'PROGRESS.md'), `# 任务进度 · ${state.taskId}\n\n自动同步：${new Date().toISOString()}\n\n${progress}\n`, 'utf8')
+  } catch {}
+}
 /** Build the six model-facing tools. */
 function createTools(ctx, config, runtime, store) {
   const start = defineTool({
@@ -1063,6 +1148,7 @@ function createTools(ctx, config, runtime, store) {
             businessReworkRounds: 0,
             businessReworkLimit: MAX_BUSINESS_REWORK_ROUNDS,
             participants: participants.map((agent) => agent.name),
+            participantRoles: Object.fromEntries(participants.map((agent) => [agent.name, agent.role])),
             gate: {
               reviewRequired: participants.some((agent) => agent.role === 'brain'),
               brainIds: participants.filter((agent) => agent.role === 'brain').map((agent) => agent.name),
@@ -1244,6 +1330,7 @@ function createTools(ctx, config, runtime, store) {
         businessReworkRounds: 0,
         businessReworkLimit: MAX_BUSINESS_REWORK_ROUNDS,
         participants: participants.map((agent) => agent.name),
+        participantRoles: Object.fromEntries(participants.map((agent) => [agent.name, agent.role])),
         // Acceptance gate snapshotted at task creation: later role edits cannot
         // relax the review requirement for this task (R09).
         gate: {
@@ -1314,6 +1401,7 @@ function createTools(ctx, config, runtime, store) {
           ? '下一步：squad_dispatch({ agent: "codex", phase: "design" }) 写业务方案；Lead 审核后 squad_approve_plan 批准，再派 gpt phase="spec" 发布技术规格，之后才允许 implement。'
           : '下一步：squad_dispatch({ agent: "<name>", phase: "design", message: "<派单内容>" })；Lead 审核 PLAN.md 后用 squad_approve_plan 批准，再进入 implement。',
       )
+      await writeProgress({ ctx, lead, taskDir, state: await readJson(join(taskDir, 'STATE.json')), signal: exec.signal })
       return lines.join('\n')
     },
   })
@@ -2117,6 +2205,7 @@ function createTools(ctx, config, runtime, store) {
         `- ${new Date().toISOString()} lead → ${target.name} (${target.role}) phase=${phase} round=${round} mode=${mode}${reworkKind ? ` kind=${reworkKind}` : ''}${substitutions.length > 0 ? ` substituted_from=${substitutions.map((item) => item.from).join(',')}` : ''}\n`,
         'utf8',
       ).catch(() => {})
+      await writeProgress({ ctx, lead, taskDir, state, signal: exec.signal })
 
       const reworkLine = flow.specRequired
         ? `rework: tech=${state.techReworkRounds ?? 0}/${budget.techLimit} business=${state.businessReworkRounds ?? 0}/${budget.businessLimit}`
@@ -2297,8 +2386,10 @@ function createTools(ctx, config, runtime, store) {
           : state.worktree
             ? [`工作区：worktree ${state.worktree.branch} @ ${state.worktree.path}（源仓库 ${state.worktree.repositoryRoot}）`]
             : ['工作区：原地开发']
+      const progressBlock = await renderProgress({ taskDir, state, rows: treeRows })
       const lines = [
         `${PLUGIN_MARKER}  task=${taskId}  phase=${state.phase ?? 'unknown'}  round=${state.round ?? '?'}  flow=${flow.flow}  created=${state.createdAt ?? '?'}`,
+        ...progressBlock.split('\n'),
         (() => {
           const features = Array.isArray(state.features) ? state.features : []
           if (state.baseDelivered) {
@@ -2508,20 +2599,27 @@ function createTools(ctx, config, runtime, store) {
           await runtime.suspendAgent(name, `队友报告额度耗尽：${firstLine(args.summary)}`, true, role)
         } catch {}
       }
+      let reportProgress = null
       if (current?.taskId) {
-        const journal = join(directory, String(current.taskId), 'JOURNAL.md')
+        const reportTaskDir = join(directory, String(current.taskId))
+        const journal = join(reportTaskDir, 'JOURNAL.md')
         await appendFile(
           journal,
           `- ${new Date().toISOString()} ${name} (${role}) report=${args.status} — ${firstLine(args.summary)}\n`,
           'utf8',
         ).catch(() => {})
+        const reportState = await readJson(join(reportTaskDir, 'STATE.json'))
+        if (reportState) {
+          reportProgress = progressSummaryOf(reportState)
+          await writeProgress({ ctx, lead: rootId ? { id: rootId } : undefined, taskDir: reportTaskDir, state: reportState, signal: exec.signal })
+        }
       }
       const files = Array.isArray(args.files) && args.files.length > 0 ? args.files.join(', ') : '—'
       const text = `[squad-report] task=${taskId} agent=${name} role=${role} status=${args.status}
 总结：
 ${String(args.summary).trim()}
 文件：${files}
-下一步：${String(args.next ?? '—').trim()}`
+下一步：${String(args.next ?? '—').trim()}${reportProgress ? `\n进度同步：${reportProgress}` : ''}`
       if (!subagents || (!rootId && !me.__membership)) {
         throw new Error('squad_report 需要 subagents 服务把报告发给 Lead。')
       }
@@ -2633,6 +2731,7 @@ ${String(args.summary).trim()}
           `- ${new Date().toISOString()} lead: squad_finish（并行交付收尾，Base=${state.baseDelivered.commits?.[0]?.baseBranch ?? '?'}，features=${features.map((item) => item.name).join(',') || '无'}）\n`,
           'utf8',
         ).catch(() => {})
+        await writeProgress({ ctx, lead, taskDir, state, signal: exec.signal })
         return lines.join('\n')
       }
 
@@ -2819,6 +2918,7 @@ ${String(args.summary).trim()}
         `- ${new Date().toISOString()} lead: squad_finish（commit=${commit ?? 'none'}）\n`,
         'utf8',
       ).catch(() => {})
+      await writeProgress({ ctx, lead, taskDir, state, signal: exec.signal })
       return lines.join('\n')
     },
   })
@@ -2896,6 +2996,7 @@ ${String(args.summary).trim()}
         `- ${approvedAt} lead: 审核 PLAN 通过（设计轮次 ${plan.planRounds}/${designLimit}），归档 PLAN-APPROVED.md\n`,
         'utf8',
       ).catch(() => {})
+      await writeProgress({ ctx, lead, taskDir, state, signal: exec.signal })
       return [
         `任务 ${taskId} 的 PLAN 已批准（第 ${plan.planRounds}/${designLimit} 次设计）。`,
         `批准时间：${approvedAt}`,
@@ -3193,6 +3294,7 @@ ${String(args.summary).trim()}
         `- ${new Date().toISOString()} lead: 开启并行阶段 features=${created.map((item) => item.name).join(',')}（Base=${baseBranch}）\n`,
         'utf8',
       ).catch(() => {})
+      await writeProgress({ ctx, lead, taskDir, state, signal: exec.signal })
       const lines = [
         `并行阶段已开启（Base 分支 ${baseBranch}）。`,
         ...created.map(
@@ -3277,6 +3379,7 @@ ${String(args.summary).trim()}
           `- ${new Date().toISOString()} lead: squad_deliver feature=${feature.name} base=${baseBranch} commit=${commit}\n`,
           'utf8',
         ).catch(() => {})
+        await writeProgress({ ctx, lead, taskDir, state, signal: exec.signal })
         return [
           `特性 ${feature.name} 已交付并合入 Base 分支 ${baseBranch}（合并提交 ${commit}）。`,
           `worktree：${feature.path}  分支：${feature.branch}（保留，可手动清理）`,
@@ -3322,6 +3425,7 @@ ${String(args.summary).trim()}
         `- ${new Date().toISOString()} lead: squad_deliver base commits=${commits.map((row) => `${row.repo}@${row.commit}`).join(',')}\n`,
         'utf8',
       ).catch(() => {})
+      await writeProgress({ ctx, lead, taskDir, state, signal: exec.signal })
       return [
         `通用功能已交付并合入 Base 分支。`,
         ...commits.map((row) => `- ${row.repo} → ${row.baseBranch}（合并提交 ${row.commit}）`),

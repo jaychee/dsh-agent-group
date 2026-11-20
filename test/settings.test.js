@@ -5100,6 +5100,17 @@ test('T16 parallel features branch from the Base branch and merge back after del
       /未知 feature "nope"/,
     )
 
+    // --- progress sync: features appear in the layered PROGRESS.md ----------
+    {
+      const progress = await readFile(join(dir, 'PROGRESS.md'), 'utf8')
+      assert.match(progress, /## 进度总览/)
+      assert.match(progress, /## 分阶段进度/)
+      assert.match(progress, /## 并行特性/)
+      assert.match(progress, /feat-a.*zcode implement r1/s)
+      assert.match(progress, /feat-b.*qoder implement r1/s)
+      assert.match(progress, /## 队员进度/)
+    }
+
     // --- feature delivery merges into Base ---------------------------------
     const featureA = state.features.find((item) => item.name === 'feat-a')
     const featureB = state.features.find((item) => item.name === 'feat-b')
@@ -5146,6 +5157,101 @@ test('T16 parallel features branch from the Base branch and merge back after del
     delete process.env.DSH_HOME
     await cleanupSquadArtifacts([repo]).catch(() => {})
     await rm(root, { recursive: true, force: true })
+    await rm(dshHome, { recursive: true, force: true })
+  }
+})
+
+/** T17 — layered progress with auto-sync at meaningful moments. */
+test('T17 status and PROGRESS.md show layered task and teammate progress', async () => {
+  const workspace = await tempRoot()
+  const dshHome = await tempRoot()
+  process.env.DSH_HOME = dshHome
+  try {
+    const settingsPath = join(dshHome, 'agent-squad', 'settings.json')
+    await mkdir(join(dshHome, 'agent-squad'), { recursive: true })
+    await writeFile(
+      settingsPath,
+      JSON.stringify(
+        {
+          version: 2,
+          revision: 1,
+          agents: [
+            { id: 'codex', displayName: 'codex', role: 'brain', executor: 'team', model: '', description: 'b' },
+            { id: 'gpt', displayName: 'gpt', role: 'architect', executor: 'team', model: '', description: 'a' },
+            { id: 'zcode', displayName: 'zcode', role: 'worker', executor: 'team', model: '', description: 'w' },
+            { id: 'qoder', displayName: 'qoder', role: 'worker', executor: 'team', model: '', description: 'w2' },
+          ],
+          worktree: { directory: '.agents/worktrees' },
+        },
+        null,
+        2,
+      ),
+      'utf8',
+    )
+    // Non-git workspace: the task falls back to in-place development.
+    const host = mockHost(workspace, dshHome)
+    const { apply } = await import('../index.js')
+    apply(host.ctx, { workerProbe: false, agents: BUNDLE_AGENTS })
+    const tool = (name) => host.registered.find((entry) => entry.definition.name === name).definition
+    const lead = { id: 'lead-1', session: { id: 'session-1' }, __membership: { role: 'lead', name: 'lead' } }
+    const exec = { agent: lead, signal: undefined }
+    await tool('squad_enable').execute({}, exec)
+    const dispatch = (args) => tool('squad_dispatch').execute(args, exec)
+
+    const startOut = await tool('squad_start').execute({ goal: 'P', acceptance: 'ok' }, exec)
+    const task = /任务 (t-\S+) 已创建/.exec(startOut)[1]
+    const dir = join(workspace, '.agent-squad', task)
+    const progressPath = join(dir, 'PROGRESS.md')
+    const readProgress = () => readFile(progressPath, 'utf8')
+
+    // Created at start: overview + phases + teammates.
+    const initial = await readProgress()
+    assert.match(initial, /# 任务进度 · t-/)
+    assert.match(initial, /自动同步：/)
+    assert.match(initial, /## 进度总览/)
+    assert.match(initial, /- 阶段：串行阶段（基础层）：phase=design round=1/)
+    assert.match(initial, /- 门禁：方案 待批准/)
+    assert.match(initial, /## 分阶段进度/)
+    assert.match(initial, /业务方案：待 Lead 批准/)
+    assert.match(initial, /## 队员进度/)
+    assert.match(initial, /codex \[brain\] 空闲 · 尚未派单/)
+    assert.match(initial, /zcode \[worker\] 空闲 · 尚未派单/)
+
+    // Design dispatch + approval refresh the progress.
+    await dispatch({ agent: 'codex', message: 'plan', phase: 'design' })
+    await writeFile(join(dir, 'PLAN.md'), '# PLAN\n', 'utf8')
+    await tool('squad_approve_plan').execute({ task_id: task }, exec)
+    const afterApprove = await readProgress()
+    assert.match(afterApprove, /✓ 业务方案：已批准/)
+    assert.match(afterApprove, /codex \[brain\] 空闲 · 最近 design r1 @ /)
+    // Status carries the same layered block.
+    const status = await tool('squad_status').execute({}, exec)
+    assert.match(status, /## 进度总览/)
+    assert.match(status, /## 分阶段进度/)
+    assert.match(status, /## 队员进度/)
+
+    // Spec + implement advance the phase checklist.
+    await dispatch({ agent: 'gpt', message: 'spec', phase: 'spec' })
+    assert.match(await readProgress(), /✓ 技术规格：v1（SPEC\.md）/)
+    await dispatch({ agent: 'zcode', message: 'impl', phase: 'implement' })
+    assert.match(await readProgress(), /✓ 基础层实现：1 轮/)
+
+    // A teammate report syncs progress and carries a compact progress line.
+    const zcodeAgent = [...host.agentsById.values()].find((agent) => agent.__membership?.name === 'zcode')
+    assert.ok(zcodeAgent)
+    const reportOut = await tool('squad_report').execute(
+      { status: 'done', summary: 'impl done', next: 'review' },
+      { agent: zcodeAgent, signal: undefined },
+    )
+    assert.match(reportOut, /status=done/)
+    const forwarded = host.sent.filter((item) => item.targetId === 'lead-1').at(-1).content[0].text
+    assert.match(forwarded, /进度同步：串行阶段（基础层）：phase=implement round=1/)
+    const afterReport = await readProgress()
+    assert.match(afterReport, /zcode \[worker\] 空闲 · 最近 implement r1 @ /)
+    assert.match(afterReport, /自动同步：/)
+  } finally {
+    delete process.env.DSH_HOME
+    await rm(workspace, { recursive: true, force: true })
     await rm(dshHome, { recursive: true, force: true })
   }
 })
