@@ -100,6 +100,17 @@ gpt（架构师）因**额度耗尽**等原因不可用时，插件把 gpt **挂
 - **小队级并行（默认）**：external 执行者的 `implement`/`rework` 派单**默认后台派发**（`delivery: 'parent'`）——工具调用立即返回、结果完成时以后台消息送达 Lead，因此 Lead **默认可以连续并发派多个 worker**（如 zcode 后端 + qoder 前端同时跑）。需要在本回合同步拿到结果时传 `background: false` 恢复阻塞式；`design/spec/review/tech-review` 始终同步（需读取交付物）；local/team 执行者本就不阻塞。
 - `squad_status` 显示"后台执行器运行中：N 个"；`squad_finish` 会等所有后台执行器结束。同一队友运行中的重复派单仍受 R07 守卫限制。
 
+### worker 可用性门禁（额度耗尽自动替代）
+
+每次 `implement`/`rework` 派单前，插件先对目标 worker 做一轮**轻量可用性探测**（同一任务同一 worker 探测成功即缓存；`probe: true` 强制重探、`probe: false` 跳过；`config.workerProbe: false` 全局关闭）。若探测返回**额度类错误**（limit/quota/429/余额/欠费/限流…）：
+
+- 立即把该 worker 记为不可用（`failover.json`，跨重载持久），并在派单反馈里明示：`[可用性门禁] zcode 不可用（可用性探测失败：HTTP 429 …）→ 已上报，并自动改由 qoder 执行本轮任务。`；
+- **自动改派**另一个可用 worker 执行本轮（优先 worker 角色；架构师不参与 worker 替代，其容错走架构师交接）；STATE 的派单记录带 `substitutedFrom` / `substitutionReason`，JOURNAL 留痕；
+- 此后对该 worker 的派单也会被自动绕开；`squad_status` 显示"挂起：zcode（…自动…）→ 派单将自动改由其他 worker 执行"；
+- 用户确认额度恢复后 `squad_failover({ agent: "zcode", recover: true })` 解除；
+- 非额度类探测异常只提示（`[可用性门禁] … 探测异常（非额度类）…继续按计划派发`），不改变执行者；
+- 没有可用替代者时派单被拒绝并说明原因（不会静默失败）。
+
 ### 预算与上限
 
 - **设计预算（默认 4 次）**：初始设计 + 最多 3 轮返工；未扩展时第 5 次暂停。
@@ -157,7 +168,7 @@ node --test dsh-agent-squad/test/settings.test.js
 ASQ_LIVE_QODER=1 node --test --test-name-pattern='^T09 ' dsh-agent-squad/test/settings.test.js
 ```
 
-测试保持十四个顶层用例（T01–T14；T11 完整流程与双验收，T12 架构师容错交接，T13 后台并行派发，T14 角色 worker 能力与 leaderWorker）；实机模式由 qoder 一次派单修改两个临时仓库，各新增一次提交，并输出 `AC7 task=... cwd=... repo=... commit=... repo=... commit=...`。普通单测不能代替该证据。
+测试保持十五个顶层用例（T01–T15；T11 完整流程与双验收，T12 架构师容错交接，T13 后台并行派发，T14 角色 worker 能力与 leaderWorker，T15 worker 可用性门禁与自动替代）；实机模式由 qoder 一次派单修改两个临时仓库，各新增一次提交，并输出 `AC7 task=... cwd=... repo=... commit=... repo=... commit=...`。普通单测不能代替该证据。
 
 ## B 模式：外部 provider（一次性）
 

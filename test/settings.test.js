@@ -447,7 +447,7 @@ test('T03 dispatch reads fresh settings and routes external/local/team executors
         if (dir) await writeFile(join(dir, 'PLAN.md'), '# PLAN (mock)\n', 'utf8')
       },
     })
-    apply(host.ctx, {
+    apply(host.ctx, { workerProbe: false,
       agents: BUNDLE_AGENTS,
       qoderCommand: stubPath,
       qoderPermissionMode: 'custom',
@@ -874,7 +874,7 @@ test('T03 dispatch reads fresh settings and routes external/local/team executors
     {
       const bareRoot = await tempRoot()
       const bare = mockHost(bareRoot, dshHome, {}, { noSubagents: true })
-      apply(bare.ctx, {}) // must not throw
+      apply(bare.ctx, { workerProbe: false,}) // must not throw
       assert.equal(bare.providers.size, 0)
       await rm(bareRoot, { recursive: true, force: true })
 
@@ -1547,7 +1547,7 @@ test('T07 plan gate: lead review, design budget, squad_approve_plan, archives an
         await writeFile(join(pointer.memoryRoot ?? memory, pointer.taskId, 'PLAN.md'), `# PLAN W${writes}\n`, 'utf8')
       },
     })
-    apply(host.ctx, { agents: BUNDLE_AGENTS })
+    apply(host.ctx, { workerProbe: false, agents: BUNDLE_AGENTS })
     const tool = (name) => host.registered.find((entry) => entry.definition.name === name).definition
     const lead = { id: 'lead-1', session: { id: 'session-1' }, __membership: { role: 'lead', name: 'lead' } }
     const teammate = { id: 'te-1', __membership: { role: 'teammate', name: 'zcode' } }
@@ -2416,7 +2416,7 @@ test('T09 multi-repository lifecycle, validation, rollback and compatibility', a
       const cwdService = { get: () => currentDir, set: async (_a, d) => { currentDir = d } }
       const host = mockHost(caller, dshHome, {}, { workingDirectory: cwdService })
       const { apply } = await import('../index.js')
-      apply(host.ctx, { agents: BUNDLE_AGENTS })
+      apply(host.ctx, { workerProbe: false, agents: BUNDLE_AGENTS })
       const tool = (name) =>
         host.registered.find((entry) => entry.definition.name === name).definition
       const lead = { id: 'lead-1', session: { id: 'session-1' } }
@@ -2531,7 +2531,7 @@ test('T09 multi-repository lifecycle, validation, rollback and compatibility', a
         await chmod(stubPath, 0o755)
         try {
           const host2 = mockHost(caller, dshHome, {}, { workingDirectory: cwdService })
-          apply(host2.ctx, { agents: BUNDLE_AGENTS, qoderCommand: stubPath })
+          apply(host2.ctx, { workerProbe: false, agents: BUNDLE_AGENTS, qoderCommand: stubPath })
           const tool2 = (name) =>
             host2.registered.find((entry) => entry.definition.name === name).definition
           await writeSquadSettings(dshHome, 'external')
@@ -2581,7 +2581,7 @@ test('T09 multi-repository lifecycle, validation, rollback and compatibility', a
         workingDirectory: { get: () => currentDir, set: async (_a, d) => { currentDir = d } },
       })
       const { apply, createSquadWorktrees } = { ...(await import('../index.js')), ...(await import('../worktree.js')) }
-      apply(host.ctx, { agents: BUNDLE_AGENTS })
+      apply(host.ctx, { workerProbe: false, agents: BUNDLE_AGENTS })
       const tool = (name) =>
         host.registered.find((entry) => entry.definition.name === name).definition
       const lead = { id: 'lead-1', session: { id: 'session-1' } }
@@ -2739,7 +2739,7 @@ test('T09 multi-repository lifecycle, validation, rollback and compatibility', a
       const hostM = mockHost(caller, dshHome, {}, {
         workingDirectory: { get: () => currentDir, set: async (_a, d) => { currentDir = d } },
       })
-      apply(hostM.ctx, { agents: BUNDLE_AGENTS, memoryDir: '../outside' })
+      apply(hostM.ctx, { workerProbe: false, agents: BUNDLE_AGENTS, memoryDir: '../outside' })
       const toolM = (name) =>
         hostM.registered.find((entry) => entry.definition.name === name).definition
       await assert.rejects(
@@ -2814,7 +2814,7 @@ test('T09 multi-repository lifecycle, validation, rollback and compatibility', a
         }
         let host = mkHost((_get, set) => set)
         const { apply } = await import('../index.js')
-        apply(host.ctx, { agents: BUNDLE_AGENTS })
+        apply(host.ctx, { workerProbe: false, agents: BUNDLE_AGENTS })
         const tool = (name) =>
           host.registered.find((entry) => entry.definition.name === name).definition
         const lead = { id: 'lead-1', session: { id: 'session-1' } }
@@ -2838,7 +2838,7 @@ test('T09 multi-repository lifecycle, validation, rollback and compatibility', a
             set(_agent, directory)
           }
         })
-        apply(host.ctx, { agents: BUNDLE_AGENTS })
+        apply(host.ctx, { workerProbe: false, agents: BUNDLE_AGENTS })
         const toolR2 = (name) =>
           host.registered.find((entry) => entry.definition.name === name).definition
         await assert.rejects(
@@ -2858,7 +2858,7 @@ test('T09 multi-repository lifecycle, validation, rollback and compatibility', a
             await mkdir(join(directory, '.agent-squad', 'current.json'), { recursive: true })
           }
         })
-        apply(host.ctx, { agents: BUNDLE_AGENTS })
+        apply(host.ctx, { workerProbe: false, agents: BUNDLE_AGENTS })
         const toolR3 = (name) =>
           host.registered.find((entry) => entry.definition.name === name).definition
         await assert.rejects(
@@ -2875,7 +2875,7 @@ test('T09 multi-repository lifecycle, validation, rollback and compatibility', a
         host = mkHost(() => async () => {
           throw new Error('unavailable')
         })
-        apply(host.ctx, { agents: BUNDLE_AGENTS })
+        apply(host.ctx, { workerProbe: false, agents: BUNDLE_AGENTS })
         const toolR4 = (name) =>
           host.registered.find((entry) => entry.definition.name === name).definition
         await assert.rejects(
@@ -2908,7 +2908,7 @@ test('T09 multi-repository lifecycle, validation, rollback and compatibility', a
               await mkdir(join(directory, '.agent-squad', 'current.json'), { recursive: true })
             }
           })
-          apply(host.ctx, { agents: BUNDLE_AGENTS })
+          apply(host.ctx, { workerProbe: false, agents: BUNDLE_AGENTS })
           await assert.rejects(tool('squad_start').execute({ goal: 'D01', acceptance: 'ok', repos: [repoI, repoJ] }, exec),
             /multi-repository creation failed:.*EISDIR/, `D01: ${variant}`)
           assert.deepEqual(await gitSnapshot(repoI), snapshotI)
@@ -2947,7 +2947,7 @@ test('T09 multi-repository lifecycle, validation, rollback and compatibility', a
             set(_agent, directory)
             if (directory !== caller) failedRoot = directory
           })
-          apply(host.ctx, { agents: BUNDLE_AGENTS })
+          apply(host.ctx, { workerProbe: false, agents: BUNDLE_AGENTS })
           fsp.writeFile = async (path, ...args) => {
             if (String(path).endsWith('/STATE.json') && mode !== 'publish-order') {
               restoring = true
@@ -3046,7 +3046,7 @@ test('T09 multi-repository lifecycle, validation, rollback and compatibility', a
       const cwdService = { get: () => currentDir, set: async (_a, d) => { currentDir = d } }
       const host = mockHost(caller, dshHome, {}, { workingDirectory: cwdService })
       const { apply } = await import('../index.js')
-      apply(host.ctx, {
+      apply(host.ctx, { workerProbe: false,
         agents: BUNDLE_AGENTS,
         qoderCommand: live ? (process.env.ASQ_QODER_COMMAND || 'qoderclicn') : stubPath,
       })
@@ -3133,7 +3133,7 @@ test('T09 multi-repository lifecycle, validation, rollback and compatibility', a
 
         // autoCommit=false → both rows skipped, no new commits.
         const hostAC = mockHost(caller, dshHome, {}, { workingDirectory: cwdService })
-        apply(hostAC.ctx, { agents: BUNDLE_AGENTS, qoderCommand: stubPath, worktreeAutoCommit: false })
+        apply(hostAC.ctx, { workerProbe: false, agents: BUNDLE_AGENTS, qoderCommand: stubPath, worktreeAutoCommit: false })
         const toolAC = (name) =>
           hostAC.registered.find((entry) => entry.definition.name === name).definition
         const startAC = await toolAC('squad_start').execute(
@@ -3200,7 +3200,7 @@ test('T09 multi-repository lifecycle, validation, rollback and compatibility', a
           currentDir = caller
           const service = { get: () => currentDir, set: async (_a, directory) => { currentDir = directory } }
           const failureHost = mockHost(caller, dshHome, {}, { workingDirectory: service })
-          apply(failureHost.ctx, { agents: BUNDLE_AGENTS, worktreeAutoCommit: mode !== 'status' })
+          apply(failureHost.ctx, { workerProbe: false, agents: BUNDLE_AGENTS, worktreeAutoCommit: mode !== 'status' })
           const failureTool = (name) => failureHost.registered.find((entry) => entry.definition.name === name).definition
           const started = await failureTool('squad_start').execute(
             { goal: mode, acceptance: 'ok', agents: ['qoder'], repos: [repoK, repoL] },
@@ -3297,7 +3297,7 @@ test('T09 multi-repository lifecycle, validation, rollback and compatibility', a
       const cwdService = { get: () => currentDir, set: async (_a, d) => { currentDir = d } }
       const host = mockHost(caller, dshHome, {}, { workingDirectory: cwdService })
       const { apply } = await import('../index.js')
-      apply(host.ctx, { agents: BUNDLE_AGENTS })
+      apply(host.ctx, { workerProbe: false, agents: BUNDLE_AGENTS })
       const tool = (name) =>
         host.registered.find((entry) => entry.definition.name === name).definition
       const lead = { id: 'lead-1', session: { id: 'session-1' } }
@@ -3439,7 +3439,7 @@ test('T10 budget extension requires user confirmation and resumes exhausted budg
         )
       },
     })
-    apply(host.ctx, { agents: BUNDLE_AGENTS })
+    apply(host.ctx, { workerProbe: false, agents: BUNDLE_AGENTS })
     const tool = (name) => host.registered.find((entry) => entry.definition.name === name).definition
     const lead = { id: 'lead-1', session: { id: 'session-1' }, __membership: { role: 'lead', name: 'lead' } }
     const teammate = { id: 'te-1', __membership: { role: 'teammate', name: 'zcode' } }
@@ -4168,7 +4168,7 @@ test('T11 full flow: opt-in gate, spec/tech-review pipeline, dual acceptance, ta
         }
       },
     })
-    apply(host.ctx, { agents: BUNDLE_AGENTS })
+    apply(host.ctx, { workerProbe: false, agents: BUNDLE_AGENTS })
     const tool = (name) => host.registered.find((entry) => entry.definition.name === name).definition
     const lead = { id: 'lead-1', session: { id: 'session-1' }, __membership: { role: 'lead', name: 'lead' } }
     const exec = { agent: lead, signal: undefined }
@@ -4453,7 +4453,7 @@ test('T12 failover suspends a quota-exhausted architect and hands its duties to 
     const failoverPath = join(dshHome, 'agent-squad', 'failover.json')
     const { apply } = await import('../index.js')
     const host = mockHost(workspace, dshHome)
-    apply(host.ctx, { agents: BUNDLE_AGENTS })
+    apply(host.ctx, { workerProbe: false, agents: BUNDLE_AGENTS })
     const tool = (name) => host.registered.find((entry) => entry.definition.name === name).definition
     const lead = { id: 'lead-1', session: { id: 'session-1' }, __membership: { role: 'lead', name: 'lead' } }
     const exec = { agent: lead, signal: undefined }
@@ -4585,7 +4585,7 @@ test('T12 failover suspends a quota-exhausted architect and hands its duties to 
       await tool('squad_failover').execute({ agent: 'gpt', recover: true }, exec)
       await writeFile(failoverPath, JSON.stringify({ suspended: { gpt: { at: '2026-11-20T00:00:00.000Z', reason: '重启前挂起', auto: true } } }, null, 2), 'utf8')
       const host2 = mockHost(workspace, dshHome)
-      apply(host2.ctx, { agents: BUNDLE_AGENTS })
+      apply(host2.ctx, { workerProbe: false, agents: BUNDLE_AGENTS })
       const tool2 = (name) => host2.registered.find((entry) => entry.definition.name === name).definition
       const exec2 = { agent: { id: 'lead-2', session: { id: 'session-2' }, __membership: { role: 'lead', name: 'lead' } }, signal: undefined }
       await tool2('squad_enable').execute({}, exec2)
@@ -4642,7 +4642,7 @@ test('T13 background dispatch is the default for external implement and unblocks
     )
     const { apply } = await import('../index.js')
     const host = mockHost(workspace, dshHome)
-    apply(host.ctx, { agents: BUNDLE_AGENTS })
+    apply(host.ctx, { workerProbe: false, agents: BUNDLE_AGENTS })
     const tool = (name) => host.registered.find((entry) => entry.definition.name === name).definition
     const lead = { id: 'lead-1', session: { id: 'session-1' }, __membership: { role: 'lead', name: 'lead' } }
     const exec = { agent: lead, signal: undefined }
@@ -4749,7 +4749,7 @@ test('T14 any role can act as a worker and the Lead has its own worker switch', 
     )
     const { apply } = await import('../index.js')
     const host = mockHost(workspace, dshHome)
-    apply(host.ctx, { agents: BUNDLE_AGENTS })
+    apply(host.ctx, { workerProbe: false, agents: BUNDLE_AGENTS })
     const tool = (name) => host.registered.find((entry) => entry.definition.name === name).definition
     const lead = { id: 'lead-1', session: { id: 'session-1' }, __membership: { role: 'lead', name: 'lead' } }
     const exec = { agent: lead, signal: undefined }
@@ -4840,6 +4840,130 @@ test('T14 any role can act as a worker and the Lead has its own worker switch', 
     assert.match(indexSource, /任何开启了 worker 能力的角色（含 codex\/gpt/)
     assert.match(clientSource, /leaderWorker/)
     assert.match(clientSource, /fieldWorker/)
+  } finally {
+    delete process.env.DSH_HOME
+    await rm(workspace, { recursive: true, force: true })
+    await rm(dshHome, { recursive: true, force: true })
+  }
+})
+
+/** T15 — worker availability gate: probe, quota report, auto substitution. */
+test('T15 worker availability probe suspends a quota-limited worker and substitutes', async () => {
+  const workspace = await tempRoot()
+  const dshHome = await tempRoot()
+  process.env.DSH_HOME = dshHome
+  try {
+    const settingsPath = join(dshHome, 'agent-squad', 'settings.json')
+    await mkdir(join(dshHome, 'agent-squad'), { recursive: true })
+    await writeFile(
+      settingsPath,
+      JSON.stringify(
+        {
+          version: 2,
+          revision: 1,
+          agents: [
+            { id: 'codex', displayName: 'codex', role: 'brain', executor: 'team', model: '', description: 'b' },
+            { id: 'gpt', displayName: 'gpt', role: 'architect', executor: 'team', model: '', description: 'a' },
+            { id: 'zcode', displayName: 'zcode', role: 'worker', executor: 'external', model: 'mock-ext', description: 'w' },
+            { id: 'qoder', displayName: 'qoder', role: 'worker', executor: 'external', model: 'mock-ext', description: 'w2' },
+          ],
+          worktree: { directory: '.agents/worktrees' },
+        },
+        null,
+        2,
+      ),
+      'utf8',
+    )
+    let failProbeFor = 'zcode'
+    let failProbeMessage = 'HTTP 429 quota exceeded：额度耗尽'
+    const host = mockHost(workspace, dshHome, {
+      onExternal: async (_provider, request) => {
+        const label = String(request.label ?? '')
+        if (label === `probe/${failProbeFor}`) throw new Error(failProbeMessage)
+      },
+    })
+    const { apply } = await import('../index.js')
+    apply(host.ctx, { workerProbe: true, agents: BUNDLE_AGENTS })
+    const tool = (name) => host.registered.find((entry) => entry.definition.name === name).definition
+    const lead = { id: 'lead-1', session: { id: 'session-1' }, __membership: { role: 'lead', name: 'lead' } }
+    const exec = { agent: lead, signal: undefined }
+    await tool('squad_enable').execute({}, exec)
+    const dispatch = (args) => tool('squad_dispatch').execute(args, exec)
+    const failoverPath = join(dshHome, 'agent-squad', 'failover.json')
+    const probes = () => host.activations.filter((row) => String(row.label ?? '').startsWith('probe/'))
+
+    const startOut = await tool('squad_start').execute({ goal: 'G', acceptance: 'ok' }, exec)
+    const task = /任务 (t-\S+) 已创建/.exec(startOut)[1]
+    const dir = join(workspace, '.agent-squad', task)
+    await dispatch({ agent: 'codex', message: 'plan', phase: 'design' })
+    await writeFile(join(dir, 'PLAN.md'), '# PLAN G\n', 'utf8')
+    await tool('squad_approve_plan').execute({ task_id: task }, exec)
+    await dispatch({ agent: 'gpt', message: 'spec', phase: 'spec' })
+
+    // --- zcode probe hits the quota: report, suspend, substitute qoder ------
+    const out = await dispatch({ agent: 'zcode', message: 'impl', phase: 'implement', background: false })
+    assert.match(
+      out,
+      /\[可用性门禁\] zcode 不可用（可用性探测失败：HTTP 429 quota exceeded：额度耗尽）→ 已上报，并自动改由 qoder 执行本轮任务。/,
+    )
+    assert.match(out, /已记录为不可用（其他轮次也会自动绕开）/)
+    assert.match(out, /已外部派发 qoder/)
+    const suspended = JSON.parse(await readFile(failoverPath, 'utf8')).suspended
+    assert.equal(suspended.zcode.auto, true)
+    assert.equal(suspended.zcode.role, 'worker')
+    assert.match(suspended.zcode.reason, /可用性探测失败/)
+    let state = JSON.parse(await readFile(join(dir, 'STATE.json'), 'utf8'))
+    assert.deepEqual(state.dispatches.at(-1).substitutedFrom, ['zcode'])
+    assert.match(state.dispatches.at(-1).substitutionReason, /可用性探测失败/)
+    assert.equal(state.probes.qoder.ok, true)
+    assert.equal(probes().filter((row) => row.label === 'probe/qoder').length, 1)
+
+    // Status surfaces the worker's substitution handover.
+    const statusOut = await tool('squad_status').execute({}, exec)
+    assert.match(statusOut, /zcode（自 .+；自动；原因：可用性探测失败：.+）→ 派单将自动改由其他 worker 执行/)
+
+    // A later dispatch addressed to the suspended worker auto-routes too.
+    const routed = await dispatch({ agent: 'zcode', message: 'impl 2', phase: 'implement', background: false })
+    assert.match(routed, /\[可用性门禁\] zcode 不可用（已挂起（自 .+；原因：可用性探测失败：.+））\s*→ 已上报，并自动改由 qoder 执行本轮任务。/)
+    // Probe cache: qoder is not re-probed on the second dispatch.
+    assert.equal(probes().filter((row) => row.label === 'probe/qoder').length, 1)
+
+    // --- recovery: the worker is usable again after squad_failover ----------
+    failProbeFor = 'none'
+    const recoverOut = await tool('squad_failover').execute({ agent: 'zcode', recover: true }, exec)
+    assert.match(recoverOut, /已解除挂起，恢复正常职责/)
+    assert.match(recoverOut, /下次派单恢复由它执行/)
+    const back = await dispatch({ agent: 'zcode', message: 'impl 3', phase: 'implement', background: false, probe: true })
+    assert.match(back, /已外部派发 zcode/)
+    assert.ok(!/\[可用性门禁\]/.test(back))
+
+    // --- non-quota probe failure: note and continue -------------------------
+    failProbeFor = 'qoder'
+    failProbeMessage = 'network unreachable'
+    const warned = await dispatch({ agent: 'qoder', message: 'impl 4', phase: 'implement', background: false, probe: true })
+    assert.match(warned, /\[可用性门禁\] qoder 探测异常（非额度类）：network unreachable；继续按计划派发/)
+    assert.match(warned, /已外部派发 qoder/)
+
+    // --- probe:false skips the gate -----------------------------------------
+    {
+      const before = probes().length
+      await dispatch({ agent: 'qoder', message: 'impl 5', phase: 'implement', background: false, probe: false })
+      assert.equal(probes().length, before)
+    }
+
+    // --- no substitute left: the dispatch is refused with a report ----------
+    {
+      // Suspend both workers through their own probes.
+      failProbeFor = 'zcode'
+      failProbeMessage = 'HTTP 429 quota exceeded：额度耗尽'
+      const subOut = await dispatch({ agent: 'zcode', message: 'x', phase: 'implement', background: false, probe: true })
+      assert.match(subOut, /自动改由 qoder 执行本轮任务/)
+      failProbeFor = 'qoder'
+      await assert.rejects(
+        dispatch({ agent: 'qoder', message: 'x', phase: 'implement', background: false, probe: true }),
+        /且没有其他可用 worker 可以替代，本轮派单被拒绝/,
+      )
+    }
   } finally {
     delete process.env.DSH_HOME
     await rm(workspace, { recursive: true, force: true })
