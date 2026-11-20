@@ -13,20 +13,69 @@
 
 import { spawn } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
+import { existsSync } from 'node:fs'
+import { homedir } from 'node:os'
+import { join } from 'node:path'
+
+/**
+ * Directories a headless qoder run must be able to read for a real build:
+ * toolchain prefixes, the JDK, and the local dependency caches. Reading
+ * anything outside the worktree otherwise triggers an interactive approval
+ * that a `-p` run cannot answer (it fails with "Allow reading <path>?").
+ */
+export const DEFAULT_QODER_ADD_DIRS = [
+  '/opt/homebrew',
+  '/usr/local',
+  '/Library/Java/JavaVirtualMachines',
+  process.env.JAVA_HOME,
+  join(homedir(), '.m2'),
+  join(homedir(), '.gradle'),
+  join(homedir(), '.npm'),
+  join(homedir(), '.pnpm-store'),
+].filter((dir) => typeof dir === 'string' && dir !== '')
+
+/**
+ * Commands a headless run may execute without an approval prompt. Edits stay
+ * gated by `accept_edits`; this list only covers build/test/read tooling.
+ */
+export const DEFAULT_QODER_ALLOWED_TOOLS = [
+  'Bash(mvn:*)',
+  'Bash(./mvnw:*)',
+  'Bash(gradle:*)',
+  'Bash(./gradlew:*)',
+  'Bash(java:*)',
+  'Bash(javac:*)',
+  'Bash(node:*)',
+  'Bash(npm:*)',
+  'Bash(pnpm:*)',
+  'Bash(npx:*)',
+  'Bash(git:*)',
+  'Bash(ls:*)',
+  'Bash(cat:*)',
+  'Bash(head:*)',
+  'Bash(tail:*)',
+]
 
 /**
  * Build the qoder CLI argument vector for one invocation.
  *
  * @param {string} prompt prompt text (joined blocks), passed through as-is.
  * @param {string} cwd working directory, passed through as-is.
- * @param {{permissionMode?: string, model?: string}} [config] optional
- *   overrides; defaults are `accept_edits` and no `-m` flag.
+ * @param {{permissionMode?: string, model?: string, addDirs?: string[],
+ *   allowedTools?: string[]}} [config] optional overrides; defaults are
+ *   `accept_edits`, no `-m` flag, and the toolchain allow-lists below.
  * @returns {string[]} exact argument vector (without the command itself).
  */
 export function buildQoderArgs(prompt, cwd, config = {}) {
   const permissionMode = config.permissionMode ?? 'accept_edits'
   const model = config.model ?? ''
   const args = ['-p', prompt, '-w', cwd, '--permission-mode', permissionMode]
+  for (const dir of config.addDirs ?? DEFAULT_QODER_ADD_DIRS) {
+    if (typeof dir === 'string' && dir !== '' && existsSync(dir)) args.push('--add-dir', dir)
+  }
+  for (const tool of config.allowedTools ?? DEFAULT_QODER_ALLOWED_TOOLS) {
+    if (typeof tool === 'string' && tool !== '') args.push('--allowed-tools', tool)
+  }
   if (model !== '') args.push('-m', model)
   return args
 }
@@ -51,6 +100,8 @@ export function createQoderProvider({
   command = 'qoderclicn',
   permissionMode = 'accept_edits',
   model = '',
+  addDirs = DEFAULT_QODER_ADD_DIRS,
+  allowedTools = DEFAULT_QODER_ALLOWED_TOOLS,
   spawnImpl = spawn,
 } = {}) {
   return {
@@ -194,7 +245,7 @@ export function createQoderProvider({
       try {
         child = spawnImpl(
           command,
-          buildQoderArgs(prompt, cwd, { permissionMode, model }),
+          buildQoderArgs(prompt, cwd, { permissionMode, model, addDirs, allowedTools }),
           { cwd, stdio: ['ignore', 'pipe', 'pipe'], shell: false },
         )
         child.stdout.setEncoding('utf8')

@@ -288,6 +288,14 @@ function resolveSettings(input) {
     worktreeAutoCommit: config.worktreeAutoCommit !== false,
     qoderCommand: text(config.qoderCommand, 'qoderclicn'),
     qoderPermissionMode: text(config.qoderPermissionMode, 'accept_edits'),
+    /** Extra dirs a headless qoder run may read (toolchain + dependency caches). */
+    qoderAddDirs: Array.isArray(config.qoderAddDirs)
+      ? config.qoderAddDirs.map(String).filter((dir) => dir !== '')
+      : undefined,
+    /** Command patterns auto-approved for a headless qoder run. */
+    qoderAllowedTools: Array.isArray(config.qoderAllowedTools)
+      ? config.qoderAllowedTools.map(String).filter((tool) => tool !== '')
+      : undefined,
     qoderModel: text(config.qoderModel, ''),
     codexCommand: text(config.codexCommand, 'codex'),
     codexModel: text(config.codexModel, 'gpt-6.2-astra'),
@@ -3614,6 +3622,8 @@ export function apply(ctx, input) {
           command: config.qoderCommand,
           permissionMode: config.qoderPermissionMode,
           model: config.qoderModel,
+          ...(config.qoderAddDirs === undefined ? {} : { addDirs: config.qoderAddDirs }),
+          ...(config.qoderAllowedTools === undefined ? {} : { allowedTools: config.qoderAllowedTools }),
         }),
       ),
     'agent-squad: qoder-cli provider',

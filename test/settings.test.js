@@ -869,12 +869,16 @@ test('T03 dispatch reads fresh settings and routes external/local/team executors
       .prompt.map((block) => block.text)
       .join('')
     const stubArgs = JSON.parse(qoderOut.split('输出：\n')[1])
-    assert.deepEqual(stubArgs, [
+    assert.deepEqual(stubArgs.slice(0, 6), [
       '-p', qoderPrompt,
       '-w', workspace,
       '--permission-mode', 'custom',
-      '-m', 'm1',
     ])
+    // Headless runs pre-approve toolchain reads/commands (no TTY to prompt).
+    assert.ok(stubArgs.includes('--add-dir'))
+    assert.ok(stubArgs.includes('--allowed-tools'))
+    assert.equal(stubArgs.at(-2), '-m')
+    assert.equal(stubArgs.at(-1), 'm1')
     assert.equal(await readFile(join(workspace, 'qoder-test-output.txt'), 'utf8'), 'ok\n')
     // Second one-shot dispatch: fresh run id, still no sendMessage/spawnTeammate.
     await tool('squad_dispatch').execute(
@@ -944,12 +948,16 @@ test('T03 dispatch reads fresh settings and routes external/local/team executors
           const captured = JSON.parse(await readFile(join(root, 'qoder-default-output.txt'), 'utf8'))
           // The provider spawned the DEFAULT command, resolved to the PATH stub.
           assert.ok(captured.script.endsWith('/qoderclicn'), label)
-          // Default permission mode, and no -m flag for the empty default model.
+          // Default permission mode, plus the headless toolchain pre-approvals
+          // and no -m flag for the empty default model.
           assert.deepEqual(
-            captured.argv,
-            ['-p', 'defaults probe', '-w', root, '--permission-mode', 'accept_edits'],
+            captured.argv.slice(0, 5),
+            ['-p', 'defaults probe', '-w', root, '--permission-mode'],
             label,
           )
+          assert.equal(captured.argv[5], 'accept_edits', label)
+          assert.ok(captured.argv.includes('--allowed-tools'), label)
+          assert.ok(!captured.argv.includes('-m'), label)
           assert.equal(await run.dispose(), undefined, label)
           if (label === 'omitted') {
             const dispose = host.disposers[0]
@@ -1962,16 +1970,40 @@ test('T08 qoder provider builds args and handles process lifecycle', async () =>
   const { EventEmitter, getEventListeners } = await import('node:events')
 
   // --- arg builder: defaults, empty strings, frozen config -----------------
-  assert.deepEqual(buildQoderArgs('hi', '/tmp/a b'), [
+  // Base vector with the permission flags disabled.
+  assert.deepEqual(buildQoderArgs('hi', '/tmp/a b', { addDirs: [], allowedTools: [] }), [
     '-p', 'hi', '-w', '/tmp/a b', '--permission-mode', 'accept_edits',
   ])
-  assert.deepEqual(buildQoderArgs('', '', { model: '' }), [
+  assert.deepEqual(buildQoderArgs('', '', { model: '', addDirs: [], allowedTools: [] }), [
     '-p', '', '-w', '', '--permission-mode', 'accept_edits',
   ])
   assert.deepEqual(
-    buildQoderArgs('a\nb;$(x)', '/tmp/a b', Object.freeze({ permissionMode: 'custom', model: 'm1' })),
+    buildQoderArgs(
+      'a\nb;$(x)',
+      '/tmp/a b',
+      Object.freeze({ permissionMode: 'custom', model: 'm1', addDirs: [], allowedTools: [] }),
+    ),
     ['-p', 'a\nb;$(x)', '-w', '/tmp/a b', '--permission-mode', 'custom', '-m', 'm1'],
   )
+  // Headless runs pre-approve toolchain reads and build commands, otherwise the
+  // CLI blocks on "Allow reading …?" / "Allow Bash to run …?" (no TTY to ask).
+  {
+    const tmpDir = await mkdtemp(join(tmpdir(), 'asq-qargs-'))
+    const args = buildQoderArgs('go', tmpDir, {
+      addDirs: [tmpDir, join(tmpDir, 'missing-dir')],
+      allowedTools: ['Bash(mvn:*)', 'Bash(java:*)'],
+    })
+    assert.deepEqual(args, [
+      '-p', 'go', '-w', tmpDir, '--permission-mode', 'accept_edits',
+      '--add-dir', tmpDir,
+      '--allowed-tools', 'Bash(mvn:*)', '--allowed-tools', 'Bash(java:*)',
+    ])
+    await rm(tmpDir, { recursive: true, force: true })
+    // Defaults always carry the build allow-list.
+    const defaults = buildQoderArgs('go', '/tmp')
+    assert.ok(defaults.includes('--allowed-tools'))
+    assert.ok(defaults.join(' ').includes('Bash(mvn:*)'))
+  }
 
   // --- codex-cli provider: arg builder + answer extraction -----------------
   const { buildCodexArgs, extractCodexAnswer, createCodexProvider } = await import('../codex.js')
@@ -2072,7 +2104,7 @@ test('T08 qoder provider builds args and handles process lifecycle', async () =>
   }
   const flush = () => new Promise((resolve) => setImmediate(resolve))
 
-  const defaultProvider = createQoderProvider({ spawnImpl })
+  const defaultProvider = createQoderProvider({ spawnImpl, addDirs: [], allowedTools: [] })
   const run1 = await startRun(defaultProvider)
   assert.deepEqual(spawnCalls.at(-1), {
     command: 'qoderclicn',
@@ -2085,6 +2117,8 @@ test('T08 qoder provider builds args and handles process lifecycle', async () =>
     command: '/tmp/qoder',
     permissionMode: 'custom',
     model: 'm1',
+    addDirs: [],
+    allowedTools: [],
     spawnImpl,
   })
   const run2 = await startRun(customProvider)
@@ -2554,7 +2588,13 @@ test('T09 multi-repository lifecycle, validation, rollback and compatibility', a
         // qoder-cli external dispatch: -w is the task root, never --add-dir.
         const stubDir = await mkdtemp(join(tmpdir(), 'asq-qoder-t9-'))
         const stubPath = join(stubDir, 'qoder-argv.cjs')
-        await writeFile(stubPath, '#!/usr/bin/env node\nprocess.stdout.write(JSON.stringify(process.argv.slice(2)))\n', 'utf8')
+        await writeFile(
+          stubPath,
+          '#!/usr/bin/env node\n' +
+            "require('node:fs').writeFileSync('qoder-argv.json', JSON.stringify(process.argv.slice(2)))\n" +
+            "process.stdout.write('ARGV-WRITTEN')\n",
+          'utf8',
+        )
         await chmod(stubPath, 0o755)
         try {
           const host2 = mockHost(caller, dshHome, {}, { workingDirectory: cwdService })
@@ -2566,10 +2606,15 @@ test('T09 multi-repository lifecycle, validation, rollback and compatibility', a
             { agent: 'qoder', message: 'argv probe', phase: 'review', task_id: taskId, background: false },
             exec,
           )
-          const argv = JSON.parse(qoderOut.split('输出：\n')[1])
+          const argv = JSON.parse(await readFile(join(taskRoot, 'qoder-argv.json'), 'utf8'))
           const wIndex = argv.indexOf('-w')
           assert.equal(argv[wIndex + 1], taskRoot)
-          assert.ok(!argv.includes('--add-dir'))
+          // Toolchain dirs may be pre-approved, but never the sibling worktrees:
+          // the task root itself is the working directory.
+          for (let i = 0; i < argv.length; i += 1) {
+            if (argv[i] !== '--add-dir') continue
+            assert.ok(!argv[i + 1].includes('.agents/worktrees'), `unexpected add-dir ${argv[i + 1]}`)
+          }
           assert.equal(host2.activations.at(-1).cwd, taskRoot)
         } finally {
           await rm(stubDir, { recursive: true, force: true })

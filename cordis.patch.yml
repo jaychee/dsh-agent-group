@@ -42,6 +42,10 @@
     - id: agent-squad
       name: 'dsh-agent-squad'
       config:
+        # Headless qoder runs cannot answer the CLI's own permission prompts,
+        # so the adapter pre-approves the build toolchain (see README); set
+        # qoderPermissionMode: bypass_permissions to skip approvals entirely.
+        qoderPermissionMode: accept_edits
         # Repo-relative directory for plugin-created squad worktrees; the
         # settings page stores the live value in ~/.dsh/agent-squad/settings.json.
         worktreeDir: .agents/worktrees
