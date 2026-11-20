@@ -15,7 +15,7 @@ window.__ModuleLoader__.load({
 
     const zh = {
       title: '智能体小队',
-      subtitle: '配置四个小队成员与 worktree 目录。保存后立即对下一次派单生效。小队默认不启用，仅用户明确要求时进入。',
+      subtitle: '配置五个小队成员与 worktree 目录。保存后立即对下一次派单生效。小队默认不启用，仅用户明确要求时进入。',
       flowTitle: '执行流程',
       flowLead: 'Lead（当前会话）',
       flowLeadSub: 'design → 审核 PLAN → spec → implement → tech-review → review',
@@ -92,7 +92,7 @@ window.__ModuleLoader__.load({
           DIRECTORY_INVALID: '目录非法',
           ID_READONLY: 'ID 只读',
           UNKNOWN_FIELD: '存在未知字段',
-          AGENT_COUNT: '成员数必须为 4',
+          AGENT_COUNT: '成员数必须为 5',
           DESCRIPTION_INVALID: '描述必须是字符串',
           INVALID_TYPE: '字段类型非法',
         })[code] || '无效的值',
@@ -100,7 +100,7 @@ window.__ModuleLoader__.load({
 
     const en = {
       title: 'Agent Squad',
-      subtitle: 'Configure the four squad members and the worktree directory. Saves apply to the next dispatch. The squad stays opt-in: it activates only on an explicit user request.',
+      subtitle: 'Configure the five squad members and the worktree directory. Saves apply to the next dispatch. The squad stays opt-in: it activates only on an explicit user request.',
       flowTitle: 'Pipeline',
       flowLead: 'Lead (this session)',
       flowLeadSub: 'design → review plan → spec → implement → tech-review → review',
@@ -177,7 +177,7 @@ window.__ModuleLoader__.load({
           DIRECTORY_INVALID: 'Invalid directory',
           ID_READONLY: 'ID is read-only',
           UNKNOWN_FIELD: 'Unknown field',
-          AGENT_COUNT: 'Exactly 4 members are required',
+          AGENT_COUNT: 'Exactly 5 members are required',
           DESCRIPTION_INVALID: 'Description must be a string',
           INVALID_TYPE: 'Invalid field type',
         })[code] || 'Invalid value',

@@ -19,6 +19,7 @@ const BUNDLE_AGENTS = [
   { name: 'gpt', role: 'architect', provider: '', model: '', context: 'fresh', description: 'architect' },
   { name: 'zcode', role: 'worker', provider: '', model: 'zai-coding-cn/glm-5.3', context: 'fresh', description: 'worker' },
   { name: 'qoder', role: 'worker', provider: '', model: 'zai-coding-cn/glm-5.3', context: 'fresh', description: 'worker2' },
+  { name: 'opencode', role: 'worker', provider: '', model: 'dsh-opencode-go/deepseek-v4.1-flash', context: 'fresh', description: 'worker3' },
 ]
 
 /** Shared S/E/M contract lines and charter items, asserted verbatim (PLAN §2/§3). */
@@ -75,9 +76,9 @@ test('T01 settings store seeds, persists, recovers corruption, keeps old file on
   const store = createSettingsStore({ filePath, seed: seedFromBundle(BUNDLE_AGENTS, '.agents/worktrees') })
 
   const first = await store.read()
-  assert.equal(first.version, 2)
+  assert.equal(first.version, 3)
   assert.equal(first.revision, 1)
-  assert.equal(first.agents.length, 4)
+  assert.equal(first.agents.length, 5)
   assert.deepEqual(
     first.agents.map((agent) => [agent.id, agent.role, agent.executor, agent.model]),
     [
@@ -85,6 +86,7 @@ test('T01 settings store seeds, persists, recovers corruption, keeps old file on
       ['gpt', 'architect', 'team', ''],
       ['zcode', 'worker', 'local', 'zai-coding-cn/glm-5.3'],
       ['qoder', 'worker', 'local', 'zai-coding-cn/glm-5.3'],
+      ['opencode', 'worker', 'local', 'dsh-opencode-go/deepseek-v4.1-flash'],
     ],
   )
   assert.equal(first.worktree.directory, '.agents/worktrees')
@@ -124,19 +126,45 @@ test('T01 settings store seeds, persists, recovers corruption, keeps old file on
     )
     const migratedStore = createSettingsStore({ filePath: v1Path })
     const migrated = await migratedStore.read()
-    assert.equal(migrated.version, 2)
+    assert.equal(migrated.version, 3)
     assert.equal(migrated.revision, 7)
     assert.deepEqual(
       migrated.agents.map((agent) => agent.id),
-      ['codex', 'gpt', 'zcode', 'qoder'],
+      ['codex', 'gpt', 'zcode', 'qoder', 'opencode'],
     )
     assert.equal(migrated.agents[0].displayName, '老codex')
     assert.equal(migrated.agents[1].role, 'architect')
     assert.equal(migrated.agents[2].displayName, '实现者')
     assert.equal(migrated.worktree.directory, 'kept-worktrees')
     const onDisk = JSON.parse(await readFile(v1Path, 'utf8'))
-    assert.equal(onDisk.version, 2)
-    assert.equal(onDisk.agents.length, 4)
+    assert.equal(onDisk.version, 3)
+    assert.equal(onDisk.agents.length, 5)
+    // A v2 file (four rows) likewise gains opencode and keeps its edits.
+    {
+      const v2Path = join(root, 'v2', 'settings.json')
+      await mkdir(join(root, 'v2'), { recursive: true })
+      await writeFile(
+        v2Path,
+        JSON.stringify({
+          version: 2,
+          revision: 4,
+          agents: [
+            { id: 'codex', displayName: 'codex', role: 'brain', executor: 'team', model: '', description: 'b' },
+            { id: 'gpt', displayName: 'architect', role: 'architect', executor: 'team', model: '', description: 'a' },
+            { id: 'zcode', displayName: '后端', role: 'worker', executor: 'team', model: '', description: 'w' },
+            { id: 'qoder', displayName: 'qoder', role: 'worker', executor: 'team', model: '', description: 'w2' },
+          ],
+          worktree: { directory: 'kept-v2' },
+        }),
+        'utf8',
+      )
+      const v2 = await createSettingsStore({ filePath: v2Path }).read()
+      assert.equal(v2.version, 3)
+      assert.equal(v2.revision, 4)
+      assert.deepEqual(v2.agents.map((agent) => agent.id), ['codex', 'gpt', 'zcode', 'qoder', 'opencode'])
+      assert.equal(v2.agents[2].displayName, '后端')
+      assert.equal(v2.agents[4].reasoning, 'max')
+    }
   }
 
   // Corrupt file → backed up, effective seed (not static defaults) restored (R05).
@@ -994,13 +1022,14 @@ test('T04 validation rejects invalid rosters with field paths and HTTP refuses n
     ...patch,
   })
   const architect = validAgent('gpt', { role: 'architect' })
-  const four = (codex, zcode, qoder) => [codex, architect, zcode, qoder]
+  const opencode = validAgent('opencode')
+  const four = (codex, zcode, qoder) => [codex, architect, zcode, qoder, opencode]
   const valid = (agents, worktree = { directory: '.agents/worktrees' }) =>
     validateAgentsAndWorktree(agents, worktree)
 
   assert.equal(valid(four(validAgent('codex', { role: 'brain' }), validAgent('zcode'), validAgent('qoder'))).ok, true)
   assert.equal(valid(four(validAgent('codex', { role: 'brain' }), validAgent('zcode'), validAgent('qoder'))).ok, true)
-  assert.equal(valid([validAgent('codex', { role: 'brain' }), validAgent('gpt', { role: 'architect', executor: 'local', model: 'openai/gpt-6.2-sol', reasoning: 'xhigh' }), validAgent('zcode'), validAgent('qoder')]).ok, true)
+  assert.equal(valid([validAgent('codex', { role: 'brain' }), validAgent('gpt', { role: 'architect', executor: 'local', model: 'openai/gpt-6.2-sol', reasoning: 'xhigh' }), validAgent('zcode'), validAgent('qoder'), opencode]).ok, true)
   assert.equal(valid(four(validAgent('codex', { role: 'brain' }), validAgent('zcode'), validAgent('qoder', { role: 'architect' }))).ok, true)
 
   const cases = [
@@ -4950,6 +4979,7 @@ test('T15 worker availability probe suspends a quota-limited worker and substitu
             { id: 'gpt', displayName: 'gpt', role: 'architect', executor: 'team', model: '', description: 'a' },
             { id: 'zcode', displayName: 'zcode', role: 'worker', executor: 'external', model: 'mock-ext', description: 'w' },
             { id: 'qoder', displayName: 'qoder', role: 'worker', executor: 'external', model: 'mock-ext', description: 'w2' },
+            { id: 'opencode', displayName: 'opencode', role: 'worker', executor: 'team', model: '', worker: false, description: 'w3' },
           ],
           worktree: { directory: '.agents/worktrees' },
         },

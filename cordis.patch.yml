@@ -70,6 +70,13 @@
             provider: zcode-bm
             context: fresh
             description: 后端 worker：实现后端代码并自测（BigModel ACP 桥接本地 ZCode，GLM-5.3）。
+          - name: opencode
+            role: worker
+            provider: ''
+            model: dsh-opencode-go/deepseek-v4.1-flash
+            reasoning: max
+            context: fresh
+            description: 后端 worker：实现后端代码并自测（OpenCode Go DeepSeek V4.1 Flash，max，可续跑）。
           - name: qoder
             role: worker
             provider: ''

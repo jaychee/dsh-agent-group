@@ -9,12 +9,13 @@
              ├─ codex  [brain]      业务方案 / 验收标准 / 业务验收
              ├─ gpt    [architect]  技术规格 / 技术验收 / 必要时接手实现
              ├─ zcode  [worker]     后端开发 / 后端自测
+             ├─ opencode[worker]    后端开发 / 后端自测（DeepSeek V4.1 Flash, max）
              └─ qoder  [worker]     前端产品开发 / 前端自测
 ```
 
 插件本身很薄：它挂在 DSH 0.2.x 内置的标准 **subagent 运行时**（`ctx.subagents`：`startActivation`/`sendMessage`/`listDescendants`/`rootOf`）上，补上 DSH 缺的几件事：
 
-1. **命名 + 角色**：四个固定 teammate（codex / gpt / zcode / qoder），角色决定系统提示里的职责章程与可见工具；
+1. **命名 + 角色**：五个固定 teammate（codex / gpt / zcode / qoder / opencode），角色决定系统提示里的职责章程与可见工具；
 2. **共享记忆**：每个任务一个 `.agent-squad/<task>/` 目录，TASK / PLAN / SPEC / TECH-REVIEW / REVIEW / REPORT / JOURNAL 承载任务、业务方案、技术规格、技术验收、业务验收、交付证据与历史，所有成员读写同一份；
 3. **会话复用**：队友是 Lead 的持久、可续跑子会话；重复 `squad_dispatch` 同一个队友 = 往同一会话追加消息，返工天然复用上一轮上下文。
 
@@ -25,7 +26,7 @@
 | `lead` | 当前 DSH 会话（启用后） | 拆解流程、审核并批准业务方案、决定派单顺序、汇总交付；不写业务代码 | `squad_enable` / `squad_start` / `squad_dispatch` / `squad_approve_plan` / `squad_extend` / `squad_status` / `squad_wait` / `squad_finish` |
 | `brain` | codex | 业务方案（PLAN.md）与业务验收（REVIEW.md）；可澄清方案，改业务行为必须先请用户决策 | `squad_report` |
 | `architect` | gpt（本地固定模型 `openai/gpt-6.2-sol`） | 技术规格（SPEC.md）与技术验收（TECH-REVIEW.md）；worker 不可用或技术返工到限时接手实现，但不能自签自己改动的技术验收 | `squad_report` |
-| `worker` | zcode / qoder | zcode 后端实现自测；qoder **主责前端产品开发与自测，兼做后端代码开发** | `squad_report` |
+| `worker` | zcode / qoder / opencode | zcode 与 opencode 后端实现自测（opencode = OpenCode Go 的 DeepSeek V4.1 Flash，max 思考强度，本地可续跑）；qoder **主责前端产品开发与自测，兼做后端代码开发** | `squad_report` |
 
 任何角色（含 brain、architect 与 Lead）都可以通过设置里的 **worker 能力开关**以 worker 身份并行实现代码：`agents[].worker`（brain 默认关、architect/worker 默认开）与顶层 `leaderWorker`（Lead 默认关）。开启后该角色可接 implement/rework 派单；实现过代码的角色不能签署自己实现的技术验收。
 
@@ -284,7 +285,7 @@ token：GLM implement 26,295 / rework 26,459（cache 主导）；Codex 设计 + 
 
 ```text
 ~/.dsh/agent-squad/settings.json     # $DSH_HOME 可覆盖
-{ "version": 2, "revision": 3,
+{ "version": 3, "revision": 3,
   "agents": [
     { "id": "codex", "displayName": "codex", "role": "brain",
       "executor": "external", "model": "codex", "description": "…" },
@@ -293,14 +294,17 @@ token：GLM implement 26,295 / rework 26,459（cache 主导）；Codex 设计 + 
     { "id": "zcode", "displayName": "zcode", "role": "worker",
       "executor": "local", "model": "zai-coding-cn/glm-5.3", "description": "…" },
     { "id": "qoder", "displayName": "qoder", "role": "worker",
-      "executor": "team", "model": "", "description": "…" } ],
+      "executor": "team", "model": "", "description": "…" },
+    { "id": "opencode", "displayName": "opencode", "role": "worker",
+      "executor": "local", "model": "dsh-opencode-go/deepseek-v4.1-flash",
+      "reasoning": "max", "description": "…" } ],
   "worktree": { "directory": ".agents/worktrees" } }
 ```
 
-- **字段**：四个成员固定 id（codex/gpt/zcode/qoder，只读），可编辑 `displayName/role/executor/model/reasoning/worker/description`，以及顶层 `leaderWorker`（Lead 的 worker 能力）；worktree 只有 `directory`（仓库相对路径，拒绝绝对路径与 `..`）。`reasoning`（思考强度，''/low/high/xhigh/max）仅对固定模型执行者生效（local，或 `provider/model` 形式的外部一次性），派发时作为 `reasoningEffort` 传给子代理；纯外部 provider（codex-cli 等）不显示该控件。
+- **字段**：五个成员固定 id（codex/gpt/zcode/qoder/opencode，只读），可编辑 `displayName/role/executor/model/reasoning/worker/description`，以及顶层 `leaderWorker`（Lead 的 worker 能力）；worktree 只有 `directory`（仓库相对路径，拒绝绝对路径与 `..`）。`reasoning`（思考强度，''/low/high/xhigh/max）仅对固定模型执行者生效（local，或 `provider/model` 形式的外部一次性），派发时作为 `reasoningEffort` 传给子代理；纯外部 provider（codex-cli 等）不显示该控件。
 - **role 三态**：`brain`（业务设计与验收）| `architect`（系统架构师）| `worker`（实现与自测）。
 - **executor 三态**：`external`（外部 provider，一次性派发）、`local`（`provider/model` 固定模型本地子代理，可续跑）、`team`（进程内队友，可续跑）。校验：名称唯一、至少一个 brain、local 模型必须在模型目录内、external provider 必须已注册。
-- **迁移**：v1（三成员）文件读取时自动插入 gpt 架构师行并升为 v2，用户既有编辑与 revision 全部保留。
+- **迁移**：v1（三成员）自动补 gpt，v2（四成员）自动补 opencode，均升为 v3，用户既有编辑与 revision 全部保留。
 - **读写**：页面经 Host 的 loopback 同源 HTTP（`GET/PUT /agent-squad/settings`、`GET /agent-squad/models`）读写；非 loopback socket、非本地 Host（如 `127.attacker.example`）或跨源/异协议 Origin 一律 403。保存走 revision 乐观锁：并发写第二笔返回 **409 REVISION_CONFLICT** 并附服务器当前 settings；页面显示冲突横幅并保留草稿，点"改用服务器版本"经确认才替换。恢复出厂默认只写入草稿，保存才落盘。未保存的草稿在切换设置页后保留（工厂级会话），保存期间编辑冻结，无字段错误的服务器故障（IO/模型目录 503）显示整体错误提示。
 - **生效时机**：`squad_start`/`squad_dispatch` 每次都重读设置，保存立即影响下一次派单；运行中的 child 不追溯（local 改绑模型须等其空闲）。
 - **持久化**：原子写（同目录临时文件 + rename）；损坏文件先备份 `settings.json.corrupt-<ts>`，备份成功才恢复默认（出厂默认 = 有效 bundle seed），备份失败返回 IO 错误并保留原文件。首次从 bundle 配置 seed，已有合法文件不会被 bundle 覆盖。
@@ -340,6 +344,11 @@ token：GLM implement 26,295 / rework 26,459（cache 主导）；Codex 设计 + 
         role: worker
         provider: ''
         model: zai-coding-cn/glm-5.3   # provider/model → 本地固定模型（可续跑）
+      - name: opencode
+        role: worker
+        provider: ''
+        model: dsh-opencode-go/deepseek-v4.1-flash   # 本地固定模型（可续跑）
+        reasoning: max
       - name: qoder
         role: worker
         provider: ''         # 空 = team 队友（可续跑）

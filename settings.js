@@ -14,11 +14,11 @@ import { copyFile, mkdir, readFile, rename, rm, stat, writeFile } from 'node:fs/
 import { homedir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 
-/** On-disk schema version. v1 held three agents; v2 adds the gpt architect. */
-export const SETTINGS_VERSION = 2
+/** On-disk schema version. v1: three agents; v2: +gpt architect; v3: +opencode worker. */
+export const SETTINGS_VERSION = 3
 
 /** Fixed, read-only agent ids in display order. */
-export const FIXED_IDS = ['codex', 'gpt', 'zcode', 'qoder']
+export const FIXED_IDS = ['codex', 'gpt', 'zcode', 'qoder', 'opencode']
 
 export const EXECUTORS = ['external', 'local', 'team']
 
@@ -63,6 +63,16 @@ export const DEFAULT_AGENTS = [
     model: '',
     worker: true,
     description: '前端 worker：主责前端产品代码开发与自测，兼做后端代码开发。',
+  },
+  {
+    id: 'opencode',
+    displayName: 'opencode',
+    role: 'worker',
+    executor: 'local',
+    model: 'dsh-opencode-go/deepseek-v4.1-flash',
+    reasoning: 'max',
+    worker: true,
+    description: '后端 worker：实现后端代码并自测（OpenCode Go 的 DeepSeek V4.1 Flash，可续跑）。',
   },
 ]
 
@@ -138,8 +148,8 @@ export function validateAgentsAndWorktree(agents, worktree, leaderWorker) {
       message: `agents must be exactly ${FIXED_IDS.length} entries`,
     }
   }
-  // v1 rosters (three agents, no gpt slot) are structurally invalid as v2;
-  // migrateSettings inserts the architect row before validation runs.
+  // Older rosters are structurally invalid for the current version (missing
+  // fixed ids); migrateSettings pads every missing id before validation runs.
   const names = []
   for (let index = 0; index < agents.length; index += 1) {
     const entry = agents[index]
@@ -236,6 +246,9 @@ export function seedFromBundle(bundleAgents, worktreeDir) {
         description: typeof entry.description === 'string' ? entry.description : '',
         provider: String(entry?.provider ?? ''),
         model: String(entry?.model ?? ''),
+        reasoning: ['low', 'high', 'xhigh', 'max'].includes(entry?.reasoning)
+          ? entry.reasoning
+          : undefined,
       })
     }
   }
@@ -252,6 +265,7 @@ export function seedFromBundle(bundleAgents, worktreeDir) {
       executor: pinned ? 'local' : external ? 'external' : 'team',
       model: pinned ? row.model : external ? row.provider : '',
       worker: row.worker === undefined ? row.role !== 'brain' : row.worker,
+      ...(row.reasoning === undefined ? {} : { reasoning: row.reasoning }),
       description: row.description,
     }
   })
@@ -276,9 +290,6 @@ export function seedFromBundle(bundleAgents, worktreeDir) {
  * preserved byte-for-byte in meaning.
  */
 export function migrateSettings(parsed, defaults) {
-  const fallback = DEFAULT_AGENTS.find((agent) => agent.id === 'gpt')
-  const architect =
-    defaults?.agents?.find((agent) => agent?.id === 'gpt') ?? { ...fallback }
   const byId = new Map(
     (Array.isArray(parsed.agents) ? parsed.agents : [])
       .filter((entry) => isPlainObject(entry))
@@ -442,9 +453,10 @@ export function createSettingsStore(options = {}) {
       )
     }
     if (parsed.version !== SETTINGS_VERSION) {
-      // v1 (three agents) migrates in place: insert the gpt architect row,
-      // keep every user edit and the revision, then converge the file to v2.
-      if (parsed.version !== 1) {
+      // Older files migrate in place: insert any missing fixed rows (gpt in
+      // v2, opencode in v3), keep every user edit and the revision, then
+      // converge the file to the current version.
+      if (![1, 2].includes(parsed.version)) {
         throw new SettingsError(
           'UNKNOWN_VERSION',
           `settings version ${String(parsed?.version)} is not supported; file left untouched`,
@@ -463,7 +475,7 @@ export function createSettingsStore(options = {}) {
         leaderWorker: effectiveDefaults.leaderWorker,
       }
       await writeAtomic(saved)
-      warn('settings v1 migrated to v2: inserted the gpt architect row')
+      warn(`settings v${parsed.version} migrated to v${SETTINGS_VERSION}: inserted the missing fixed rows`)
       return saved
     }
     const checked = validateAgentsAndWorktree(parsed.agents, parsed.worktree, parsed.leaderWorker)
