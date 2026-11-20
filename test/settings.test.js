@@ -12,6 +12,7 @@ import { dirname, join } from 'node:path'
 import { promisify } from 'node:util'
 
 const run = promisify(execFile)
+const delayMs = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 
 const BUNDLE_AGENTS = [
   { name: 'codex', role: 'brain', provider: 'mock-ext', context: 'fresh', description: 'brain' },
@@ -321,12 +322,38 @@ function mockHost(workspace, dshHome, hooks = {}, options = {}) {
         runIds.push(run.id)
         return { childId: id, result: run.result, dispose: run.dispose }
       }
+      const done = {
+        stopReason: 'completed',
+        output: [{ type: 'text', text: 'done' }],
+      }
+      const delayMs = options.externalDelayMs
+      const settle = () => done
+      if (delayMs) {
+        // Mirror the runtime: a parent-delivered (background) external run is
+        // cataloged as a running child until its result settles.
+        if (delivery === 'parent') {
+          members.push({ id, status: 'running' })
+          return {
+            childId: id,
+            result: new Promise((resolve) =>
+              setTimeout(() => {
+                const member = members.find((entry) => entry.id === id)
+                if (member) member.status = 'inactive'
+                resolve(settle())
+              }, delayMs),
+            ),
+            dispose: async () => {},
+          }
+        }
+        return {
+          childId: id,
+          result: new Promise((resolve) => setTimeout(() => resolve(settle()), delayMs)),
+          dispose: async () => {},
+        }
+      }
       return {
         childId: id,
-        result: Promise.resolve({
-          stopReason: 'completed',
-          output: [{ type: 'text', text: 'done' }],
-        }),
+        result: Promise.resolve(settle()),
         dispose: async () => {},
       }
     },
@@ -2491,7 +2518,7 @@ test('T09 multi-repository lifecycle, validation, rollback and compatibility', a
 
         // external dispatch: request cwd is the task root; prompt lists repos.
         await tool('squad_dispatch').execute(
-          { agent: 'codex', message: 'review it', phase: 'review' },
+          { agent: 'codex', message: 'review it', phase: 'review', background: false },
           exec,
         )
         assert.equal(host.activations.at(-1).cwd, taskRoot)
@@ -2536,7 +2563,7 @@ test('T09 multi-repository lifecycle, validation, rollback and compatibility', a
             host2.registered.find((entry) => entry.definition.name === name).definition
           await writeSquadSettings(dshHome, 'external')
           const qoderOut = await tool2('squad_dispatch').execute(
-            { agent: 'qoder', message: 'argv probe', phase: 'review', task_id: taskId },
+            { agent: 'qoder', message: 'argv probe', phase: 'review', task_id: taskId, background: false },
             exec,
           )
           const argv = JSON.parse(qoderOut.split('输出：\n')[1])
@@ -4641,7 +4668,8 @@ test('T13 background dispatch is the default for external implement and unblocks
       'utf8',
     )
     const { apply } = await import('../index.js')
-    const host = mockHost(workspace, dshHome)
+    // A slow external provider so the non-blocking path is observable.
+    const host = mockHost(workspace, dshHome, {}, { externalDelayMs: 40 })
     apply(host.ctx, { workerProbe: false, agents: BUNDLE_AGENTS })
     const tool = (name) => host.registered.find((entry) => entry.definition.name === name).definition
     const lead = { id: 'lead-1', session: { id: 'session-1' }, __membership: { role: 'lead', name: 'lead' } }
@@ -4662,10 +4690,21 @@ test('T13 background dispatch is the default for external implement and unblocks
       dispatch({ agent: 'qoder', message: 'x', phase: 'implement', background: true }),
       /background 仅支持 external 执行者（一次性外部 provider）；local\/team 执行者本就不阻塞。/,
     )
-    await assert.rejects(
-      dispatch({ agent: 'zcode', message: 'x', phase: 'design', background: true }),
-      /background 仅支持 implement\/rework 阶段；design\/spec\/review\/tech-review 需要同步读取交付物，不能后台派发。/,
-    )
+    // design/review may also run in the background now (the old phase
+    // restriction is gone) — prove it with the design phase on the slow provider.
+    await writeFile(join(workspace, '.agent-squad', task, 'PLAN.md'), '# PLAN\n', 'utf8')
+    const designBg = await dispatch({ agent: 'zcode', message: 'design probe', phase: 'design' })
+    assert.match(designBg, /已后台派发 zcode/)
+    let designState = JSON.parse(await readFile(join(workspace, '.agent-squad', task, 'STATE.json'), 'utf8'))
+    assert.equal(designState.pendingRuns.length, 1)
+    assert.equal(designState.pendingRuns[0].phase, 'design')
+    await delayMs(80)
+    // The next tool call flushes the settled run and archives the round.
+    const flushed = await tool('squad_status').execute({}, exec)
+    assert.match(flushed, /phase=design/)
+    assert.ok(await stat(join(workspace, '.agent-squad', task, 'PLAN-R1.md')))
+    designState = JSON.parse(await readFile(join(workspace, '.agent-squad', task, 'STATE.json'), 'utf8'))
+    assert.deepEqual(designState.pendingRuns, [])
 
     // Parallel-by-default: an external implement dispatch WITHOUT any flag
     // runs in the background — no output section, delivery 'parent'.
@@ -5249,6 +5288,122 @@ test('T17 status and PROGRESS.md show layered task and teammate progress', async
     const afterReport = await readProgress()
     assert.match(afterReport, /zcode \[worker\] 空闲 · 最近 implement r1 @ /)
     assert.match(afterReport, /自动同步：/)
+  } finally {
+    delete process.env.DSH_HOME
+    await rm(workspace, { recursive: true, force: true })
+    await rm(dshHome, { recursive: true, force: true })
+  }
+})
+
+/** T18 — non-blocking external phases: pending runs, gates, flush. */
+test('T18 slow external phases return immediately, stay pending, then flush', async () => {
+  const workspace = await tempRoot()
+  const dshHome = await tempRoot()
+  process.env.DSH_HOME = dshHome
+  try {
+    const settingsPath = join(dshHome, 'agent-squad', 'settings.json')
+    await mkdir(join(dshHome, 'agent-squad'), { recursive: true })
+    await writeFile(
+      settingsPath,
+      JSON.stringify(
+        {
+          version: 2,
+          revision: 1,
+          agents: [
+            { id: 'codex', displayName: 'codex', role: 'brain', executor: 'external', model: 'mock-ext', description: 'b' },
+            { id: 'gpt', displayName: 'gpt', role: 'architect', executor: 'external', model: 'mock-ext', description: 'a' },
+            { id: 'zcode', displayName: 'zcode', role: 'worker', executor: 'external', model: 'mock-ext', description: 'w' },
+            { id: 'qoder', displayName: 'qoder', role: 'worker', executor: 'external', model: 'mock-ext', description: 'w2' },
+          ],
+          worktree: { directory: '.agents/worktrees' },
+        },
+        null,
+        2,
+      ),
+      'utf8',
+    )
+    const host = mockHost(workspace, dshHome, {}, { externalDelayMs: 60 })
+    const { apply } = await import('../index.js')
+    apply(host.ctx, { workerProbe: false, agents: BUNDLE_AGENTS })
+    const tool = (name) => host.registered.find((entry) => entry.definition.name === name).definition
+    const lead = { id: 'lead-1', session: { id: 'session-1' }, __membership: { role: 'lead', name: 'lead' } }
+    const exec = { agent: lead, signal: undefined }
+    await tool('squad_enable').execute({}, exec)
+    const dispatch = (args) => tool('squad_dispatch').execute(args, exec)
+    const readState = async (task) =>
+      JSON.parse(await readFile(join(workspace, '.agent-squad', task, 'STATE.json'), 'utf8'))
+
+    const startOut = await tool('squad_start').execute({ goal: 'P', acceptance: 'ok' }, exec)
+    const task = /任务 (t-\S+) 已创建/.exec(startOut)[1]
+    const dir = join(workspace, '.agent-squad', task)
+
+    // --- design returns at once and is recorded as pending -----------------
+    const started = Date.now()
+    const designOut = await dispatch({ agent: 'codex', message: 'plan', phase: 'design' })
+    assert.ok(Date.now() - started < 50, 'dispatch must not wait for the run')
+    assert.match(designOut, /已后台派发 codex/)
+    assert.match(designOut, /结果完成时会以后台消息送达/)
+    let state = await readState(task)
+    assert.equal(state.pendingRuns.length, 1)
+    assert.equal(state.pendingRuns[0].phase, 'design')
+    // Gates refuse while the deliverable is still being produced.
+    await assert.rejects(
+      tool('squad_approve_plan').execute({ task_id: task }, exec),
+      /后台任务仍在运行：codex design r1；结果以后台消息送达，等它到达（squad_status 可查看进度）后再批准方案。/,
+    )
+    // The progress view names the background run.
+    const statusPending = await tool('squad_status').execute({}, exec)
+    assert.match(statusPending, /后台运行中：codex design r1/)
+
+    // Once it settles, the next tool call flushes: PLAN-R1 archived, pending [].
+    await delayMs(120)
+    await writeFile(join(dir, 'PLAN.md'), '# PLAN\n', 'utf8')
+    state = await readState(task)
+    state.phase = 'design'
+    state.planRounds = 1
+    await writeFile(join(dir, 'STATE.json'), `${JSON.stringify(state, null, 2)}\n`, 'utf8')
+    await tool('squad_status').execute({}, exec)
+    state = await readState(task)
+    assert.deepEqual(state.pendingRuns, [])
+    assert.ok(await stat(join(dir, 'PLAN-R1.md')))
+    // Approval works again once nothing is pending.
+    assert.match(await tool('squad_approve_plan').execute({ task_id: task }, exec), /已批准/)
+
+    // --- spec pending → deferred SPEC-V archive -----------------------------
+    assert.match(await dispatch({ agent: 'gpt', message: 'spec', phase: 'spec' }), /已后台派发 gpt/)
+    await delayMs(120)
+    await writeFile(join(dir, 'SPEC.md'), '# SPEC\n', 'utf8')
+    await tool('squad_status').execute({}, exec)
+    assert.ok(await stat(join(dir, 'SPEC-V1.md')))
+
+    // --- review pending → deferred verdict capture + round archive ---------
+    await dispatch({ agent: 'zcode', message: 'impl', phase: 'implement' })
+    await delayMs(120)
+    await tool('squad_status').execute({}, exec)
+    await writeFile(join(dir, 'TECH-REVIEW.md'), '# TECH\n\nVERDICT: APPROVED\n', 'utf8')
+    assert.match(await dispatch({ agent: 'gpt', message: 'tech', phase: 'tech-review' }), /已后台派发 gpt/)
+    // finish is blocked while the review is still in flight (the generic
+    // running-child guard fires first, the pending gate covers the rest).
+    await assert.rejects(
+      tool('squad_finish').execute({ summary: 'x' }, exec),
+      /仍有队友在运行|后台任务仍在运行/,
+    )
+    await delayMs(120)
+    await tool('squad_status').execute({}, exec)
+    state = await readState(task)
+    assert.equal(state.lastTechVerdict, 'APPROVED')
+    assert.ok(await stat(join(dir, 'TECH-REVIEW-R1.md')))
+
+    await writeFile(join(dir, 'REVIEW.md'), '# REVIEW\n\nVERDICT: APPROVED\n', 'utf8')
+    assert.match(await dispatch({ agent: 'codex', message: 'review', phase: 'review' }), /已后台派发 codex/)
+    await delayMs(120)
+    await tool('squad_status').execute({}, exec)
+    state = await readState(task)
+    assert.equal(state.lastVerdict, 'APPROVED')
+    assert.ok(await stat(join(dir, 'REVIEW-R1.md')))
+    assert.deepEqual(state.pendingRuns, [])
+    // Every acceptance is satisfied → finishing is allowed.
+    assert.match(await tool('squad_finish').execute({ summary: 'done' }, exec), /收尾/)
   } finally {
     delete process.env.DSH_HOME
     await rm(workspace, { recursive: true, force: true })

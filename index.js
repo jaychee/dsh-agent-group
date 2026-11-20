@@ -205,6 +205,7 @@ const LEAD_POLICY = `Agent Squad 已启用：你是 Lead，小队里有按角色
 - 一个角色一个 agent。按能力选 worker：zcode 负责后端实现，qoder 负责前端产品实现与自测。
 - 每次派单后结束当前回合，等队友的 squad_report 唤醒你；查看状态用 squad_status，只有必须在本回合阻塞时才用 squad_wait。
 - 信息同步：插件在每个派单、squad_approve_plan、squad_parallel_start、squad_deliver、squad_finish 以及收到 squad_report 时自动刷新 PROGRESS.md；squad_status 顶部即分层进度（任务总览→阶段进度→队员进度→并行特性）。每个阶段完成、收到关键报告、交付与收尾时，用最新分层进度向用户简报一次（不要只报"进行中"）。
+- 不阻塞主会话：所有 external 派单（含 codex 的 design/review、gpt 的 spec/tech-review）默认**后台派发**，工具立即返回、结束本回合，结果以后台消息送达后再继续；不要用 squad_wait 干等。需要在本回合同步拿结果时才传 background: false。后台任务仍在跑时 squad_approve_plan / squad_deliver / squad_finish 会拒绝并提示等待，这是正常的。
 - 队友在跑时不得声称完成；没有双验收不得接受结果。
 - 技术返工与业务返工各自默认最多 3 轮、独立计数、互不重置。任一到上限就暂停派单，先向用户说明阻塞点与已完成部分并等待决策；仅用户明确同意后调用 squad_extend(kind="tech"/"business", rounds=3, reason="用户批准的追加理由", confirmed=true) 追加轮次再派单，每次扩展都要重新确认，可重复扩展，不自动续跑；用户拒绝或未回复时保持暂停。
 - 外部 provider（agent 配置里 provider 非空且不是 spawn/fork）走一次性派发：squad_dispatch 阻塞到它返回并把结果直接给你；它不会 squad_report，也不能续跑。返工=再派一次，必须重发 BRIEF 与编号缺陷。
@@ -900,6 +901,7 @@ async function renderProgress({ taskDir, state, rows = [] }) {
   const businessVerdict = await readVerdict(taskDir, 'REVIEW.md')
   const techFresh = flow.specRequired && bindingFresh(state.techReview, state) && techVerdict === 'APPROVED'
   const businessFresh = bindingFresh(state.businessReview, state) && businessVerdict === 'APPROVED'
+  const pendingRuns = Array.isArray(state.pendingRuns) ? state.pendingRuns : []
   const done = state.phase === 'done'
   const lines = ['## 进度总览', `- 阶段：${progressSummaryOf(state)}`, `- 当前：phase=${state.phase ?? '?'} round=${state.round ?? '?'}${done ? '（已收尾）' : ''}`]
   const gates = [`方案 ${plan.planApproved ? '已批准' : plan.planRequired ? '待批准' : '豁免'}`]
@@ -910,6 +912,11 @@ async function renderProgress({ taskDir, state, rows = [] }) {
     gates.push(`业务验收 ${businessVerdict ?? '未验收'}`)
   }
   lines.push(`- 门禁：${gates.join(' · ')}`)
+  if (pendingRuns.length > 0) {
+    lines.push(
+      `- 后台运行中：${pendingRuns.map((item) => `${item.agent} ${item.phase} r${item.round}（自 ${item.at}）`).join('、')}——结果以后台消息送达，主会话不被占用`,
+    )
+  }
 
   lines.push('## 分阶段进度')
   const check = (ok) => (ok ? '✓' : '…')
@@ -954,6 +961,74 @@ async function writeProgress({ ctx, lead, taskDir, state, signal }) {
     const progress = await renderProgress({ taskDir, state, rows })
     await writeFile(join(taskDir, 'PROGRESS.md'), `# 任务进度 · ${state.taskId}\n\n自动同步：${new Date().toISOString()}\n\n${progress}\n`, 'utf8')
   } catch {}
+}
+
+/**
+ * Flush the bookkeeping of background (parent-delivered) external runs whose
+ * result has already arrived: design → PLAN-R archive, review/tech-review →
+ * verdict capture + round archive. Runs still in flight stay pending.
+ */
+async function flushPendingRuns({ ctx, lead, taskDir, state, signal }) {
+  const pending = Array.isArray(state.pendingRuns) ? state.pendingRuns : []
+  if (pending.length === 0) return { changed: false, running: [] }
+  let rows = []
+  try {
+    rows = lead ? await treeRowsOf(ctx, lead, signal) : []
+  } catch {
+    rows = []
+  }
+  const running = pending.filter((item) => {
+    const row = rows.find((entry) => entry.id === item.childId)
+    return row !== undefined && row.activity === 'running'
+  })
+  const finished = pending.filter((item) => !running.includes(item))
+  for (const item of finished) {
+    if (item.phase === 'design') {
+      const round = Number(state.planRounds ?? 0)
+      if (round > 0) {
+        const archive = join(taskDir, `PLAN-R${round}.md`)
+        const exists = await stat(archive).then(() => true, () => false)
+        if (!exists) {
+          const text = await readFile(join(taskDir, 'PLAN.md'), 'utf8').catch(() => '')
+          if (text) await writeFile(archive, text, 'utf8').catch(() => {})
+        }
+      }
+    }
+    if (item.phase === 'spec') {
+      const version = Number(state.specVersion ?? 0)
+      if (version > 0) {
+        const archive = join(taskDir, `SPEC-V${version}.md`)
+        const exists = await stat(archive).then(() => true, () => false)
+        if (!exists) {
+          const text = await readFile(join(taskDir, 'SPEC.md'), 'utf8').catch(() => '')
+          if (text) await writeFile(archive, text, 'utf8').catch(() => {})
+        }
+      }
+    }
+    if (item.phase === 'review' || item.phase === 'tech-review') {
+      const file = item.phase === 'review' ? 'REVIEW.md' : 'TECH-REVIEW.md'
+      const text = await readFile(join(taskDir, file), 'utf8').catch(() => '')
+      const verdicts = [...text.matchAll(/VERDICT:\s*(APPROVED|CHANGES_REQUESTED)/gi)]
+      const verdict = verdicts.at(-1)?.[1]?.toUpperCase() ?? null
+      if (item.phase === 'review') state.lastVerdict = verdict
+      else state.lastTechVerdict = verdict
+      if (text) {
+        const name = item.phase === 'review' ? `REVIEW-R${item.round}.md` : `TECH-REVIEW-R${item.round}.md`
+        await writeFile(join(taskDir, name), text, 'utf8').catch(() => {})
+      }
+    }
+  }
+  state.pendingRuns = running
+  await writeJson(join(taskDir, 'STATE.json'), state)
+  return { changed: finished.length > 0, running }
+}
+
+/** Gate message when a background run is still in flight, else null. */
+function pendingRunGate(state, action) {
+  const pending = Array.isArray(state.pendingRuns) ? state.pendingRuns : []
+  if (pending.length === 0) return null
+  const list = pending.map((item) => `${item.agent} ${item.phase} r${item.round}`).join('、')
+  return `后台任务仍在运行：${list}；结果以后台消息送达，等它到达（squad_status 可查看进度）后再${action}。`
 }
 /** Build the six model-facing tools. */
 function createTools(ctx, config, runtime, store) {
@@ -1562,6 +1637,9 @@ function createTools(ctx, config, runtime, store) {
       const state = await readJson(join(taskDir, 'STATE.json'))
       if (!state) throw new Error(`未知小队任务 "${taskId}"。先调用 squad_start。`)
 
+      // Flush any settled background run before the gates read STATE, but do
+      // not write progress here: a refused dispatch must leave files untouched.
+      await flushPendingRuns({ ctx, lead, taskDir, state, signal: exec.signal }).catch(() => {})
       const phase = args.phase ?? 'design'
       const flow = flowOf(state)
       const treeRows = await treeRowsOf(ctx, lead, exec.signal)
@@ -1715,6 +1793,8 @@ function createTools(ctx, config, runtime, store) {
       // has published SPEC.md. Tasks without a brain participant are exempt
       // from the plan gate (planRequired snapshot).
       const plan = planGateOf(state)
+      /** True when this round's result is still running in the background. */
+      let asyncPending = false
       // Parallel-by-default (squad layer): external one-shot executors would
       // block the tool call until they return, serializing the workers.
       // implement/rework dispatches therefore default to background delivery
@@ -1722,14 +1802,15 @@ function createTools(ctx, config, runtime, store) {
       // workers can run concurrently; background:false forces the old
       // blocking call. The review-family phases still read the deliverable
       // right after the result and stay synchronous either way.
-      const background =
-        external && (phase === 'implement' || phase === 'rework') && args.background !== false
-      if (args.background === true && (!external || (phase !== 'implement' && phase !== 'rework'))) {
-        throw new Error(
-          !external
-            ? 'background 仅支持 external 执行者（一次性外部 provider）；local/team 执行者本就不阻塞。'
-            : 'background 仅支持 implement/rework 阶段；design/spec/review/tech-review 需要同步读取交付物，不能后台派发。',
-        )
+      // Every external dispatch is non-blocking by default: the runtime
+      // delivers the result as a message and the plugin records the run as
+      // pending, so the Lead's turn ends instead of hanging for minutes on a
+      // codex design/review. Fast runs (tests, instant providers) settle within
+      // a tick and are handled inline exactly like a blocking dispatch.
+      // background:false restores the old synchronous call.
+      const background = external && args.background !== false
+      if (args.background === true && !external) {
+        throw new Error('background 仅支持 external 执行者（一次性外部 provider）；local/team 执行者本就不阻塞。')
       }
       if (phase === 'design') {
         if (plan.planApproved) {
@@ -1973,11 +2054,36 @@ function createTools(ctx, config, runtime, store) {
           delivery: background ? 'parent' : 'caller',
         })
         sessionId = activation.childId
-        if (background) {
-          // Fire-and-report: the runtime delivers the result to the Lead as a
-          // message when the run finishes; the plugin does not await it, so
-          // the Lead can keep dispatching (parallel workers).
+        // Let already-settled runs take the inline path so fast providers keep
+        // the old synchronous semantics (archives, token capture, errors).
+        let settled = null
+        let settledError = null
+        activation.result.then(
+          (value) => {
+            settled = value
+          },
+          (error) => {
+            settledError = error
+          },
+        )
+        if (background) await new Promise((resolve) => setImmediate(resolve))
+        if (background && settled === null && settledError === null) {
+          // Still running: record the pending run and return immediately; the
+          // result arrives as a message and the bookkeeping (PLAN-R archive,
+          // verdict capture) is flushed by the next tool call.
           mode = 'external-background'
+          asyncPending = true
+          state.pendingRuns = [
+            ...(Array.isArray(state.pendingRuns) ? state.pendingRuns : []),
+            {
+              phase,
+              round,
+              agent: target.name,
+              role: target.role,
+              childId: sessionId,
+              at: new Date().toISOString(),
+            },
+          ]
           await appendFile(
             join(taskDir, 'RUNS.md'),
             `\n## ${new Date().toISOString()} ${target.name} (${target.role}) phase=${phase} round=${round} provider=${target.model} mode=background（结果将以后台消息送达 Lead）\n`,
@@ -1986,7 +2092,8 @@ function createTools(ctx, config, runtime, store) {
         } else {
           let result
           try {
-            result = await activation.result
+            if (settledError !== null) throw settledError
+            result = settled ?? (await activation.result)
           } finally {
             try {
               await activation.dispose()
@@ -2078,16 +2185,9 @@ function createTools(ctx, config, runtime, store) {
       }
 
       if (phase === 'review') {
-        const reviewText = await readFile(join(taskDir, 'REVIEW.md'), 'utf8').catch(() => '')
-        const verdicts = [
-          ...reviewText.matchAll(/VERDICT:\s*(APPROVED|CHANGES_REQUESTED)/gi),
-        ]
-        state.lastVerdict = verdicts.at(-1)?.[1]?.toUpperCase() ?? null
-        if (reviewText) {
-          await writeFile(join(taskDir, `REVIEW-R${round}.md`), reviewText, 'utf8').catch(() => {})
-        }
         // Full flow: bind the business acceptance to the code/spec version it
-        // examined; a later implement/rework/spec dispatch makes it stale.
+        // examined (recorded at dispatch, also for background rounds); a later
+        // implement/rework/spec dispatch makes it stale.
         if (flow.specRequired) {
           state.businessReview = {
             codeEpoch: Number(state.codeEpoch ?? 0),
@@ -2096,21 +2196,33 @@ function createTools(ctx, config, runtime, store) {
             at: new Date().toISOString(),
           }
         }
+        if (!asyncPending) {
+          const reviewText = await readFile(join(taskDir, 'REVIEW.md'), 'utf8').catch(() => '')
+          const verdicts = [
+            ...reviewText.matchAll(/VERDICT:\s*(APPROVED|CHANGES_REQUESTED)/gi),
+          ]
+          state.lastVerdict = verdicts.at(-1)?.[1]?.toUpperCase() ?? null
+          if (reviewText) {
+            await writeFile(join(taskDir, `REVIEW-R${round}.md`), reviewText, 'utf8').catch(() => {})
+          }
+        }
       }
       if (phase === 'tech-review') {
-        const techText = await readFile(join(taskDir, 'TECH-REVIEW.md'), 'utf8').catch(() => '')
-        const techVerdicts = [
-          ...techText.matchAll(/VERDICT:\s*(APPROVED|CHANGES_REQUESTED)/gi),
-        ]
-        state.lastTechVerdict = techVerdicts.at(-1)?.[1]?.toUpperCase() ?? null
-        if (techText) {
-          await writeFile(join(taskDir, `TECH-REVIEW-R${round}.md`), techText, 'utf8').catch(() => {})
-        }
         state.techReview = {
           codeEpoch: Number(state.codeEpoch ?? 0),
           specVersion: Number(state.specVersion ?? 0),
           reviewer: target.name,
           at: new Date().toISOString(),
+        }
+        if (!asyncPending) {
+          const techText = await readFile(join(taskDir, 'TECH-REVIEW.md'), 'utf8').catch(() => '')
+          const techVerdicts = [
+            ...techText.matchAll(/VERDICT:\s*(APPROVED|CHANGES_REQUESTED)/gi),
+          ]
+          state.lastTechVerdict = techVerdicts.at(-1)?.[1]?.toUpperCase() ?? null
+          if (techText) {
+            await writeFile(join(taskDir, `TECH-REVIEW-R${round}.md`), techText, 'utf8').catch(() => {})
+          }
         }
       }
       state.phase = phase
@@ -2123,7 +2235,7 @@ function createTools(ctx, config, runtime, store) {
       let planRound
       if (phase === 'design') {
         planRound = plan.planRounds + 1
-        if (external) {
+        if (external && !asyncPending) {
           try {
             const planText = await readFile(join(taskDir, 'PLAN.md'), 'utf8')
             await writeFile(join(taskDir, `PLAN-R${planRound}.md`), planText, 'utf8')
@@ -2142,7 +2254,7 @@ function createTools(ctx, config, runtime, store) {
       let specVersion
       if (phase === 'spec') {
         specVersion = Number(state.specVersion ?? 0) + 1
-        if (external) {
+        if (external && !asyncPending) {
           try {
             const specText = await readFile(join(taskDir, 'SPEC.md'), 'utf8')
             await writeFile(join(taskDir, `SPEC-V${specVersion}.md`), specText, 'utf8')
@@ -2359,6 +2471,7 @@ function createTools(ctx, config, runtime, store) {
       const taskDir = join(directory, taskId)
       const state = (await readJson(join(taskDir, 'STATE.json'))) ?? {}
       const plan = planGateOf(state)
+      /** True when this round's result is still running in the background. */
       const budget = budgetOf(state)
       const flow = flowOf(state)
       const techVerdict = flow.specRequired ? await readVerdict(taskDir, 'TECH-REVIEW.md') : undefined
@@ -2386,6 +2499,7 @@ function createTools(ctx, config, runtime, store) {
           : state.worktree
             ? [`工作区：worktree ${state.worktree.branch} @ ${state.worktree.path}（源仓库 ${state.worktree.repositoryRoot}）`]
             : ['工作区：原地开发']
+      await flushPendingRuns({ ctx, lead, taskDir, state, signal: undefined }).catch(() => {})
       const progressBlock = await renderProgress({ taskDir, state, rows: treeRows })
       const lines = [
         `${PLUGIN_MARKER}  task=${taskId}  phase=${state.phase ?? 'unknown'}  round=${state.round ?? '?'}  flow=${flow.flow}  created=${state.createdAt ?? '?'}`,
@@ -2610,6 +2724,7 @@ function createTools(ctx, config, runtime, store) {
         ).catch(() => {})
         const reportState = await readJson(join(reportTaskDir, 'STATE.json'))
         if (reportState) {
+          await flushPendingRuns({ ctx, lead: rootId ? { id: rootId } : undefined, taskDir: reportTaskDir, state: reportState, signal: exec.signal }).catch(() => {})
           reportProgress = progressSummaryOf(reportState)
           await writeProgress({ ctx, lead: rootId ? { id: rootId } : undefined, taskDir: reportTaskDir, state: reportState, signal: exec.signal })
         }
@@ -2687,6 +2802,9 @@ ${String(args.summary).trim()}
           `仍有未交付合并的并行特性：${unmerged.map((item) => item.name).join(', ')}。先对每个特性执行 squad_deliver({ feature: "<name>" }) 合入 Base 再收尾。`,
         )
       }
+      await flushPendingRuns({ ctx, lead, taskDir, state, signal: exec.signal })
+      const pendingGate = pendingRunGate(state, '收尾')
+      if (pendingGate) throw new Error(pendingGate)
       const gateError = await acceptanceGateError(taskDir, state)
       if (gateError) throw new Error(gateError)
 
@@ -2951,6 +3069,10 @@ ${String(args.summary).trim()}
       if (state.planApproved === true) {
         throw new Error(`任务 ${taskId} 的 PLAN 已批准（${state.planApprovedAt ?? '?'}），不能重复批准。`)
       }
+      // A background design round must land before the plan can be reviewed.
+      await flushPendingRuns({ ctx, lead, taskDir, state, signal: exec.signal }).catch(() => {})
+      const awaitingGate = pendingRunGate(state, '批准方案')
+      if (awaitingGate) throw new Error(awaitingGate)
       let planText
       try {
         planText = await readFile(join(taskDir, 'PLAN.md'), 'utf8')
@@ -2960,6 +3082,7 @@ ${String(args.summary).trim()}
         )
       }
       const plan = planGateOf(state)
+      /** True when this round's result is still running in the background. */
       const designLimit = budgetOf(state).designLimit
       // Local/team designs are archived only here; a historical archive from
       // the external path is never rewritten. An existing path must be a
@@ -3219,6 +3342,7 @@ ${String(args.summary).trim()}
       const state = await readJson(join(taskDir, 'STATE.json'))
       if (!state) throw new Error(`未知小队任务 "${taskId}"。先调用 squad_start。`)
       if (state.phase === 'done') throw new Error(`任务 ${taskId} 已经收尾，不能开启并行阶段。`)
+      await flushPendingRuns({ ctx, lead, taskDir, state, signal: exec.signal })
       if (!state.baseDelivered) {
         throw new Error(
           '并行阶段前必须先交付通用功能：squad_deliver({ summary }) 通过验收并把基础层合并到 Base 分支后，再 squad_parallel_start。',
@@ -3338,6 +3462,9 @@ ${String(args.summary).trim()}
       if (rows.some((row) => row.activity === 'running')) {
         throw new Error('仍有队友在运行，等它们结束后再交付。')
       }
+      await flushPendingRuns({ ctx, lead, taskDir, state, signal: exec.signal })
+      const pendingGate = pendingRunGate(state, '交付')
+      if (pendingGate) throw new Error(pendingGate)
       const summary = String(args.summary ?? '').trim()
       const featureName = args.feature === undefined ? null : String(args.feature).trim()
       const repoRow = worktreesOf(state)[0]

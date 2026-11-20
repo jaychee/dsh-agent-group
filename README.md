@@ -100,6 +100,14 @@ gpt（架构师）因**额度耗尽**等原因不可用时，插件把 gpt **挂
 - **小队级并行（默认）**：external 执行者的 `implement`/`rework` 派单**默认后台派发**（`delivery: 'parent'`）——工具调用立即返回、结果完成时以后台消息送达 Lead，因此 Lead **默认可以连续并发派多个 worker**（如 zcode 后端 + qoder 前端同时跑）。需要在本回合同步拿到结果时传 `background: false` 恢复阻塞式；`design/spec/review/tech-review` 始终同步（需读取交付物）；local/team 执行者本就不阻塞。
 - `squad_status` 显示"后台执行器运行中：N 个"；`squad_finish` 会等所有后台执行器结束。同一队友运行中的重复派单仍受 R07 守卫限制。
 
+### 不阻塞主会话（所有 external 阶段默认后台）
+
+所有 external 派单——包括 codex 的 `design`/`review`、gpt 的 `spec`/`tech-review`、worker 的 `implement`/`rework`——**默认后台派发**（`delivery: 'parent'`）：工具调用立即返回，Lead 结束本回合，用户可继续操作；结果完成时以后台消息送达，下一次工具调用会把待记账结果落盘（design → `PLAN-R<n>.md`；spec → `SPEC-V<n>.md`；review/tech-review → verdict + `REVIEW-R<n>.md`）。验收绑定（codeEpoch/specVersion）在派单时即记录，保证"验收对应哪版代码"不错位。
+
+- 后台任务在跑时，`squad_approve_plan` / `squad_deliver` / `squad_finish` 会拒绝并提示"后台任务仍在运行：…"，`squad_status` 进度里显示"后台运行中：…"；
+- 需要在本回合同步拿结果（脚本化、必须立刻读交付物）时传 `background: false` 恢复阻塞式；
+- local/team 执行者本就不阻塞。
+
 ### 进度同步与分层展示
 
 - **自动同步**：派单、方案批准、开启并行、交付、收尾以及收到队友 `squad_report` 时，插件自动把最新进度写入共享记忆的 `PROGRESS.md`（任务总览 → 分阶段进度 → 队员进度 → 并行特性，含门禁/验收状态、各队员最近一轮与运行状态）。
@@ -187,7 +195,7 @@ node --test dsh-agent-squad/test/settings.test.js
 ASQ_LIVE_QODER=1 node --test --test-name-pattern='^T09 ' dsh-agent-squad/test/settings.test.js
 ```
 
-测试保持十七个顶层用例（T01–T17；T11 完整流程与双验收，T12 架构师容错交接，T13 后台并行派发，T14 角色 worker 能力与 leaderWorker，T15 worker 可用性门禁与自动替代，T16 阶段化并行与 Base 分支合并，T17 分层进度与自动同步）；实机模式由 qoder 一次派单修改两个临时仓库，各新增一次提交，并输出 `AC7 task=... cwd=... repo=... commit=... repo=... commit=...`。普通单测不能代替该证据。
+测试保持十八个顶层用例（T01–T18；T11 完整流程与双验收，T12 架构师容错交接，T13 后台并行派发，T14 角色 worker 能力与 leaderWorker，T15 worker 可用性门禁与自动替代，T16 阶段化并行与 Base 分支合并，T17 分层进度与自动同步，T18 外部阶段非阻塞与延迟记账）；实机模式由 qoder 一次派单修改两个临时仓库，各新增一次提交，并输出 `AC7 task=... cwd=... repo=... commit=... repo=... commit=...`。普通单测不能代替该证据。
 
 ## B 模式：外部 provider（一次性）
 
