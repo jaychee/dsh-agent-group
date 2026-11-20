@@ -4632,9 +4632,9 @@ test('T12 failover suspends a quota-exhausted architect and hands its duties to 
     const originalStart = host.subagents.startActivation
     const originalSend = host.subagents.sendMessage
     const gptMemberId = host.members.find(
-      (member) => member.name === 'gpt' || String(member.name ?? '').endsWith('/gpt'),
+      (member) => member.name === 'gpt' || String(member.name ?? '').endsWith('-gpt'),
     )?.id
-    const isGptName = (name) => name === 'gpt' || String(name ?? '').endsWith('/gpt')
+    const isGptName = (name) => name === 'gpt' || String(name ?? '').endsWith('-gpt')
     const installQuotaThrow = (message) => {
       host.subagents.startActivation = async (spec) => {
         if (isGptName(spec.name)) throw new Error(message)
@@ -5567,10 +5567,10 @@ test('T19 two active tasks keep separate state, teammates and addressing', async
     await tool('squad_approve_plan').execute({ task_id: taskB }, exec)
     const aOut = await dispatch({ agent: 'zcode', message: 'impl A', phase: 'implement', task_id: taskA })
     assert.match(aOut, new RegExp(`task=${taskA}`))
-    assert.equal(host.spawned.at(-1).name, `${taskA}/zcode`)
+    assert.equal(host.spawned.at(-1).name, `${taskA}-zcode`)
     const bOut = await dispatch({ agent: 'zcode', message: 'impl B', phase: 'implement', task_id: taskB })
     assert.match(bOut, new RegExp(`task=${taskB}`))
-    assert.equal(host.spawned.at(-1).name, `${taskB}/zcode`)
+    assert.equal(host.spawned.at(-1).name, `${taskB}-zcode`)
     // Same roster member, two distinct children.
     const childrenA = (await readState(taskA)).members
     const childrenB = (await readState(taskB)).members
@@ -5607,6 +5607,104 @@ test('T19 two active tasks keep separate state, teammates and addressing', async
   } finally {
     delete process.env.DSH_HOME
     await rm(workspace, { recursive: true, force: true })
+    await rm(dshHome, { recursive: true, force: true })
+  }
+})
+
+/** T20 — multi-task worktree isolation and runtime-safe teammate names. */
+test('T20 a second task gets its own worktree and a runtime-safe child name', async () => {
+  const root = await tempRoot()
+  const dshHome = await tempRoot()
+  process.env.DSH_HOME = dshHome
+  let repo
+  try {
+    repo = await makeGitRepo(root, 'mt-repo', 'base', { 'README.md': 'seed\n' })
+    const settingsPath = join(dshHome, 'agent-squad', 'settings.json')
+    await mkdir(join(dshHome, 'agent-squad'), { recursive: true })
+    await writeFile(
+      settingsPath,
+      JSON.stringify(
+        {
+          version: 3,
+          revision: 1,
+          agents: [
+            { id: 'codex', displayName: 'codex', role: 'brain', executor: 'team', model: '', description: 'b' },
+            { id: 'gpt', displayName: 'gpt', role: 'architect', executor: 'team', model: '', description: 'a' },
+            { id: 'zcode', displayName: 'zcode', role: 'worker', executor: 'team', model: '', description: 'w' },
+            { id: 'qoder', displayName: 'qoder', role: 'worker', executor: 'team', model: '', description: 'w2' },
+            { id: 'opencode', displayName: 'opencode', role: 'worker', executor: 'team', model: '', description: 'w3' },
+          ],
+          worktree: { directory: '.agents/worktrees' },
+        },
+        null,
+        2,
+      ),
+      'utf8',
+    )
+    let currentDir = repo
+    const cwdService = { get: () => currentDir, set: async (_a, d) => { currentDir = d } }
+    const host = mockHost(repo, dshHome, {}, { workingDirectory: cwdService })
+    const { apply } = await import('../index.js')
+    apply(host.ctx, { workerProbe: false, agents: BUNDLE_AGENTS })
+    const tool = (name) => host.registered.find((entry) => entry.definition.name === name).definition
+    const lead = { id: 'lead-1', session: { id: 'session-1' }, __membership: { role: 'lead', name: 'lead' } }
+    const exec = { agent: lead, signal: undefined }
+    await tool('squad_enable').execute({}, exec)
+    const startTask = async (goal) => {
+      const out = await tool('squad_start').execute(
+        { goal, acceptance: 'ok', agents: ['zcode'] },
+        exec,
+      )
+      return /任务 (t-\S+) 已创建/.exec(out)[1]
+    }
+    const readState = async (task) =>
+      JSON.parse(
+        await readFile(join(repo, '.agents', 'worktrees', `squad-${task}`, '.agent-squad', task, 'STATE.json'), 'utf8'),
+      )
+
+    // Task A creates a worktree; the session moves into it.
+    const taskA = await startTask('A')
+    const stateA = await readState(taskA)
+    assert.equal(stateA.worktree.branch, `squad-${taskA}`)
+    assert.equal(currentDir, stateA.worktree.path)
+
+    // Task B is started from inside A's checkout: it must NOT reuse it.
+    const taskB = await startTask('B')
+    const stateB = await readState(taskB)
+    assert.notEqual(stateB.worktree.path, stateA.worktree.path, 'tasks must not share a worktree')
+    assert.equal(stateB.worktree.branch, `squad-${taskB}`)
+    assert.equal(
+      await gitOut(repo, ['rev-parse', '--abbrev-ref', `squad-${taskB}`]),
+      `squad-${taskB}`,
+    )
+    assert.equal(currentDir, stateB.worktree.path)
+
+    // Teammate names stay inside the runtime's accepted charset (<=32 chars).
+    await writeFile(join(repo, '.agents', 'worktrees', `squad-${taskA}`, '.agent-squad', taskA, 'PLAN.md'), '# A\n', 'utf8')
+    await writeFile(join(repo, '.agents', 'worktrees', `squad-${taskB}`, '.agent-squad', taskB, 'PLAN.md'), '# B\n', 'utf8')
+    await tool('squad_approve_plan').execute({ task_id: taskA }, exec)
+    await tool('squad_approve_plan').execute({ task_id: taskB }, exec)
+    await tool('squad_dispatch').execute(
+      { agent: 'zcode', message: 'impl A', phase: 'implement', task_id: taskA },
+      exec,
+    )
+    const nameA = host.spawned.at(-1).name
+    await tool('squad_dispatch').execute(
+      { agent: 'zcode', message: 'impl B', phase: 'implement', task_id: taskB },
+      exec,
+    )
+    const nameB = host.spawned.at(-1).name
+    for (const name of [nameA, nameB]) {
+      assert.match(name, /^[a-z][a-z0-9-]{0,31}$/, `invalid runtime name: ${name}`)
+      assert.notEqual(name, 'lead')
+      assert.ok(!name.includes('/'), 'slashes are rejected by the runtime')
+    }
+    assert.notEqual(nameA, nameB)
+    assert.ok(nameA.includes(taskA.slice(2, 8)) || nameA.includes(taskA), nameA)
+  } finally {
+    delete process.env.DSH_HOME
+    if (repo) await cleanupSquadArtifacts([repo]).catch(() => {})
+    await rm(root, { recursive: true, force: true })
     await rm(dshHome, { recursive: true, force: true })
   }
 })

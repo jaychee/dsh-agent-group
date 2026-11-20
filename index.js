@@ -1089,6 +1089,23 @@ async function activeTaskCount(store) {
   return Object.values(registry.tasks).filter((row) => row.active === true).length
 }
 
+/** True when `directory` sits inside a worktree owned by another active task. */
+async function insideOtherTaskWorktree(store, directory) {
+  try {
+    const registry = await readTaskRegistry(store)
+    const real = resolve(directory)
+    return Object.values(registry.tasks).some(
+      (row) =>
+        row.active === true &&
+        typeof row.worktree === 'string' &&
+        row.worktree !== '' &&
+        (real === resolve(row.worktree) || real.startsWith(`${resolve(row.worktree)}/`)),
+    )
+  } catch {
+    return false
+  }
+}
+
 /**
  * Resolve the task a tool call targets.
  * @param {string} [explicitTaskId] `args.task_id`; when absent the workspace
@@ -1127,7 +1144,20 @@ async function resolveTask({ ctx, agent, config, store, explicitTaskId }) {
  * subagent tree; a single active task keeps the plain roster name.
  */
 function childNameFor(taskId, name, activeTasks) {
-  return activeTasks > 1 ? `${taskId}/${name}` : name
+  if (activeTasks <= 1) return name
+  // The subagent runtime only accepts 1-32 lower-case letters, digits or
+  // hyphens starting with a letter ("<task>/<agent>" is rejected).
+  const safeTask = String(taskId)
+    .toLowerCase()
+    .replace(/[^a-z0-9-]/g, '-')
+    .replace(/^[^a-z]+/, '')
+  const safeName = String(name)
+    .toLowerCase()
+    .replace(/[^a-z0-9-]/g, '-')
+  if (safeTask === '') return safeName
+  const room = 32 - safeName.length - 1
+  if (room < 1) return safeName.slice(0, 32)
+  return `${safeTask.slice(0, room)}-${safeName}`
 }
 /** Build the six model-facing tools. */
 function createTools(ctx, config, runtime, store) {
@@ -1453,6 +1483,7 @@ function createTools(ctx, config, runtime, store) {
           taskId,
           directory: settings.worktree.directory,
           base: config.worktreeFrom,
+          reuseLinked: !(await insideOtherTaskWorktree(store, sourceDirectory)),
           signal: exec.signal,
         })
         worktree = { ...created }

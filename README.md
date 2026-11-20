@@ -117,10 +117,11 @@ gpt（架构师）因**额度耗尽**等原因不可用时，插件把 gpt **挂
 
 - `squad_start` 可以连续创建多个任务；除"原地开发"任务外，不再因为上一个任务还有队友在跑而被拒绝；
 - 所有任务工具（`squad_dispatch` / `squad_status` / `squad_approve_plan` / `squad_deliver` / `squad_finish` / `squad_extend` / `squad_parallel_start`）都接受 `task_id`，按注册表直接定位，与当前 cwd 无关；未知 id 会明确报错；
-- **队友按任务隔离**：同时存在多个活动任务时，子代理以 `<taskId>/<name>` 命名（如 `t-mw.../zcode`），每个任务各自拥有 `zcode` 会话；重新派单只续跑本任务的子代理；单活动任务时仍用裸名 `zcode`（保持既有行为）；
+- **队友按任务隔离**：同时存在多个活动任务时，子代理以 `<taskId>-<name>` 命名（如 `t-mw...-zcode`，符合运行时 1–32 位小写字母/数字/连字符的限制），每个任务各自拥有 `zcode` 会话；重新派单只续跑本任务的子代理；单活动任务时仍用裸名 `zcode`（保持既有行为）；
 - 队友 `squad_report` 通过派单时记录的 `taskId` 绑定回到自己的任务，不会串到别的任务；
 - `squad_status` 增加"其他活动任务（用 task_id 寻址）"清单；收尾的任务自动从活动列表移除；
-- 限制：任务之间的 worktree 由各自 `squad_start` 创建，Lead 的 cwd 只会停在最近创建/切换的那个；跨任务操作请显式带 `task_id`。
+- **每个任务独立 worktree**：即使会话已经停在某个任务的 worktree 里，新任务的 `squad_start` 也会从**主仓库**重新拉一个 `squad-<taskId>` checkout（不会复用、也不会嵌套创建），任务之间文件互不可见；
+- 限制：Lead 的 cwd 只会停在最近创建/切换的那个 worktree；跨任务操作请显式带 `task_id`。
 
 ### 进度同步与分层展示
 
@@ -209,7 +210,7 @@ node --test dsh-agent-squad/test/settings.test.js
 ASQ_LIVE_QODER=1 node --test --test-name-pattern='^T09 ' dsh-agent-squad/test/settings.test.js
 ```
 
-测试保持十九个顶层用例（T01–T19；T11 完整流程与双验收，T12 架构师容错交接，T13 后台并行派发，T14 角色 worker 能力与 leaderWorker，T15 worker 可用性门禁与自动替代，T16 阶段化并行与 Base 分支合并，T17 分层进度与自动同步，T18 外部阶段非阻塞与延迟记账，T19 同会话多任务隔离与寻址）；实机模式由 qoder 一次派单修改两个临时仓库，各新增一次提交，并输出 `AC7 task=... cwd=... repo=... commit=... repo=... commit=...`。普通单测不能代替该证据。
+测试保持二十个顶层用例（T01–T20；T11 完整流程与双验收，T12 架构师容错交接，T13 后台并行派发，T14 角色 worker 能力与 leaderWorker，T15 worker 可用性门禁与自动替代，T16 阶段化并行与 Base 分支合并，T17 分层进度与自动同步，T18 外部阶段非阻塞与延迟记账，T19 同会话多任务隔离与寻址，T20 多任务独立 worktree 与运行时合法子代理名）；实机模式由 qoder 一次派单修改两个临时仓库，各新增一次提交，并输出 `AC7 task=... cwd=... repo=... commit=... repo=... commit=...`。普通单测不能代替该证据。
 
 ## B 模式：外部 provider（一次性）
 

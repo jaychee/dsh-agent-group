@@ -75,6 +75,7 @@ export async function createSquadWorktree({
   taskId,
   directory,
   base = 'HEAD',
+  reuseLinked = true,
   signal,
 }) {
   if (signal?.aborted) throw new Error('worktree creation aborted')
@@ -85,6 +86,7 @@ export async function createSquadWorktree({
 
   let toplevel
   let commonDir
+  let linkedCheckout = false
   try {
     toplevel = clean(await git(sourceDirectory, ['rev-parse', '--show-toplevel']))
     const gitDir = clean(
@@ -99,7 +101,8 @@ export async function createSquadWorktree({
     }
     commonDir = common
     const alreadyLinked = gitDir !== common
-    if (alreadyLinked) {
+    linkedCheckout = alreadyLinked
+    if (alreadyLinked && reuseLinked) {
       const branch = clean(await git(sourceDirectory, ['rev-parse', '--abbrev-ref', 'HEAD']))
       const commit = clean(await git(sourceDirectory, ['rev-parse', 'HEAD']))
       return {
@@ -115,7 +118,9 @@ export async function createSquadWorktree({
     throw new Error(`not a usable Git repository (${sourceDirectory}): ${error.message}`)
   }
 
-  const repositoryRoot = toplevel
+  // Inside a linked checkout without reuse we must branch from the MAIN
+  // repository, not from the linked worktree (that would nest worktrees).
+  const repositoryRoot = linkedCheckout ? dirname(commonDir) : toplevel
   const realRoot = await realpath(repositoryRoot)
   const destination = join(repositoryRoot, relativeDirectory, `squad-${taskId}`)
   const destinationRoot = dirname(destination)
@@ -325,6 +330,7 @@ export async function createSquadWorktrees({
   taskId,
   directory,
   base = 'HEAD',
+  reuseLinked = true,
   signal,
 }) {
   const entries = await resolveRepositories(sourceDirectory, repos)
