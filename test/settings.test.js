@@ -280,10 +280,10 @@ function mockHost(workspace, dshHome, hooks = {}, options = {}) {
     },
     list: () => ['spawn', 'fork', 'mock-ext', ...providers.keys()],
     // 0.2.x flat SubagentActivationSpec (no nested request object).
-    startActivation: async ({ provider, childId, name, prompt, parent, agentOptions, cwd, signal, label }) => {
+    startActivation: async ({ provider, childId, name, prompt, parent, agentOptions, cwd, signal, label, delivery }) => {
       childSeq += 1
       const id = childId ?? `child-${childSeq}`
-      activations.push({ provider, childId: id, name, prompt, agentOptions, cwd, label })
+      activations.push({ provider, childId: id, name, prompt, agentOptions, cwd, label, delivery })
       const isTeamSpawn = (provider === 'spawn' || provider === 'fork') && agentOptions === undefined
       if (isTeamSpawn && name) {
         spawned.push({ name, prompt, description: label })
@@ -4604,6 +4604,115 @@ test('T12 failover suspends a quota-exhausted architect and hands its duties to 
         /已(创建|续跑) codex \[brain\]/,
       )
     }
+  } finally {
+    delete process.env.DSH_HOME
+    await rm(workspace, { recursive: true, force: true })
+    await rm(dshHome, { recursive: true, force: true })
+  }
+})
+
+/** T13 — parallel development: background external dispatch + subagent guidance. */
+test('T13 background dispatch unblocks the Lead for parallel workers', async () => {
+  const workspace = await tempRoot()
+  const dshHome = await tempRoot()
+  process.env.DSH_HOME = dshHome
+  try {
+    // zcode external mock provider (blocking by default), qoder local.
+    const settingsPath = join(dshHome, 'agent-squad', 'settings.json')
+    await mkdir(join(dshHome, 'agent-squad'), { recursive: true })
+    await writeFile(
+      settingsPath,
+      JSON.stringify(
+        {
+          version: 2,
+          revision: 1,
+          agents: [
+            { id: 'codex', displayName: 'codex', role: 'brain', executor: 'team', model: '', description: 'b' },
+            { id: 'gpt', displayName: 'gpt', role: 'architect', executor: 'team', model: '', description: 'a' },
+            { id: 'zcode', displayName: 'zcode', role: 'worker', executor: 'external', model: 'mock-ext', description: 'w' },
+            { id: 'qoder', displayName: 'qoder', role: 'worker', executor: 'local', model: 'p/fe', description: 'w2' },
+          ],
+          worktree: { directory: '.agents/worktrees' },
+        },
+        null,
+        2,
+      ),
+      'utf8',
+    )
+    const { apply } = await import('../index.js')
+    const host = mockHost(workspace, dshHome)
+    apply(host.ctx, { agents: BUNDLE_AGENTS })
+    const tool = (name) => host.registered.find((entry) => entry.definition.name === name).definition
+    const lead = { id: 'lead-1', session: { id: 'session-1' }, __membership: { role: 'lead', name: 'lead' } }
+    const exec = { agent: lead, signal: undefined }
+    await tool('squad_enable').execute({}, exec)
+    const dispatch = (args) => tool('squad_dispatch').execute(args, exec)
+
+    // No-brain task: exempt from plan/review gates so implement runs directly.
+    const startOut = await tool('squad_start').execute(
+      { goal: 'P', acceptance: 'ok', agents: ['zcode', 'qoder'] },
+      exec,
+    )
+    const task = /任务 (t-\S+) 已创建/.exec(startOut)[1]
+
+    // Validation: background is external-only and implement/rework-only.
+    await assert.rejects(
+      dispatch({ agent: 'qoder', message: 'x', phase: 'implement', background: true }),
+      /background 仅支持 external 执行者（一次性外部 provider）；local\/team 执行者本就不阻塞。/,
+    )
+    await assert.rejects(
+      dispatch({ agent: 'zcode', message: 'x', phase: 'implement', background: false }),
+      /background 只能是 true（后台派发）或省略。/,
+    )
+
+    // Blocking dispatch stays the default (output included).
+    const blocking = await dispatch({ agent: 'zcode', message: 'serial', phase: 'implement' })
+    assert.match(blocking, /已外部派发 zcode/)
+    assert.match(blocking, /输出：/)
+
+    // Background dispatch: returns immediately, no output section, recorded.
+    const bg = await dispatch({ agent: 'zcode', message: 'parallel part', phase: 'implement', background: true })
+    assert.match(bg, /已后台派发 zcode \(zcode\) \[worker\] provider=mock-ext（不阻塞，可继续派其他队友）/)
+    assert.ok(!/输出：/.test(bg), 'background dispatch must not include the run output')
+    assert.match(bg, /结果完成时会以后台消息送达/)
+    assert.equal(host.activations.at(-1).delivery, 'parent')
+    const state = JSON.parse(await readFile(join(workspace, '.agent-squad', task, 'STATE.json'), 'utf8'))
+    assert.equal(state.dispatches.at(-1).mode, 'external-background')
+    assert.equal(state.codeEpoch, 2) // both implement dispatches bumped the epoch
+    assert.deepEqual(state.implementers, ['zcode'])
+    assert.match(await readFile(join(workspace, '.agent-squad', task, 'RUNS.md'), 'utf8'), /mode=background/)
+
+    // The Lead can immediately issue another worker while the background run
+    // is in flight (qoder is local, non-blocking anyway) — the guard only
+    // blocks re-dispatch of the SAME binding.
+    assert.match(
+      await dispatch({ agent: 'qoder', message: 'frontend part', phase: 'implement' }),
+      /已创建本地子代理 qoder/,
+    )
+
+    // squad_status renders the running background executors.
+    const bgChild = host.activations.find((row) => row.provider === 'mock-ext' && row.childId)?.childId
+    host.markRunning(bgChild ?? 'bg-unknown')
+    const statusOut = await tool('squad_status').execute({}, exec)
+    assert.match(statusOut, /后台执行器运行中：[12] 个（background 派发，结果将以消息送达；squad_finish 会等待）/)
+    // finish waits for the background run.
+    await assert.rejects(
+      tool('squad_finish').execute({ summary: 'nope' }, exec),
+      /仍有队友在运行/,
+    )
+    host.unmarkRunning(bgChild ?? 'bg-unknown')
+
+    // Review/design-family phases refuse background (deliverable read
+    // synchronously); legacy rework without a pending acceptance is free-form
+    // and may background like implement.
+    await assert.rejects(
+      dispatch({ agent: 'zcode', message: 'x', phase: 'design', background: true }),
+      /background 仅支持 implement\/rework 阶段；design\/spec\/review\/tech-review 需要同步读取交付物，不能后台派发。/,
+    )
+
+    // Charter guidance: the worker prompt carries the subagent parallel hint.
+    const workerPrompt = host.activations.at(-1).prompt.map((block) => block.text).join('')
+    assert.match(workerPrompt, /可并行的独立文件\/模块/)
   } finally {
     delete process.env.DSH_HOME
     await rm(workspace, { recursive: true, force: true })

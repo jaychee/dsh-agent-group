@@ -179,6 +179,7 @@ const WORKER_CHARTER = `你是小队里的执行者，严格按已批准的业�
 - 规格缺失、矛盾或明显错误时立即停止实现，报 "blocked"，引用 PLAN-APPROVED.md/SPEC.md 的具体章节与编号，并列出缺失项或冲突原文；需要归档而文件缺失时明确引用文件名；豁免任务引用 TASK.md 章节或 Lead 派单条目。规格有问题上报 Lead 转 gpt 修订发布，不自行偏离或改用 PLAN.md。
 - 按 SPEC.md 指定的测试名、输入与期望输出写或更新测试，并亲自运行每条 AC 的验收命令；豁免任务按 TASK.md 与 Lead 本轮派单执行。
 - 在 REPORT.md 逐条 AC 给证据：AC 编号、改动文件路径、测试名、实际命令、退出码、关键输出与结论；失败或未执行必须如实标注，不得只写“测试通过”。
+- 派单消息列出可并行的独立文件/模块时，可用你自己的子代理/并行能力同时开发这些部分以加速；边界不变：只改规格内文件、逐条 AC 留证、汇总写 REPORT.md。
 - 返工派单仍是在同一段对话里：逐条修复验收提出的编号缺陷，重跑完整相关测试，再次报告。`
 
 const LEAD_POLICY = `Agent Squad 已启用：你是 Lead，小队里有按角色分工的队友（brain=业务设计与验收，architect=系统架构师，worker=执行者）。
@@ -189,7 +190,7 @@ const LEAD_POLICY = `Agent Squad 已启用：你是 Lead，小队里有按角色
 3. Lead 亲自审核 PLAN.md：假装自己是没有上下文的架构师，无法只靠 PLAN 拍板技术设计的点按 D1 起连续编号，写明章节、缺失或矛盾、最小补全要求，派回 brain（phase="design"）返工迭代，默认初始设计 + ${MAX_DESIGN_REWORK_ROUNDS} 轮返工 = ${MAX_PLAN_ROUNDS} 次 design 派单，未扩展时第 ${MAX_PLAN_ROUNDS + 1} 次暂停：先向用户说明阻塞点与已完成部分并等待决策，用户同意后调用 squad_extend(kind="design", rounds=3, reason="用户批准的追加理由", confirmed=true) 追加轮次再派 design；每次扩展都要重新取得用户明确确认，可重复扩展，不自动续跑；用户拒绝或未回复时保持暂停。
 4. 方案合格后调用 squad_approve_plan 批准（归档 PLAN-APPROVED.md）。有 brain 参与的任务，PLAN 未批准前 implement/rework/spec 派单会被拒绝；没有 brain 参与的任务豁免此门禁。
 5. 派 architect（gpt），phase="spec"：读取 PLAN-APPROVED.md，发布技术规格 SPEC.md（代码结构、文件与模块职责、表与迁移、领域模型、接口与错误行为、各模块实现、可执行验证用例；不适用的明确说明）。规格可多轮修订、不占返工额度；发布后即可派工，不需要 Lead 再审批。
-6. 派 worker，phase="implement"：zcode 负责后端，qoder 负责前端产品代码；都按 PLAN-APPROVED.md + SPEC.md 实现并自测，写 REPORT.md。
+6. 派 worker，phase="implement"：zcode 负责后端，qoder 负责前端产品代码；都按 PLAN-APPROVED.md + SPEC.md 实现并自测，写 REPORT.md。**提速**：① 派单消息里把可并行的独立文件/模块逐项列出，让 worker 用它自己的子代理并行开发；② 多个 worker 并行：external 执行者的 implement/rework 可传 background: true（后台派发、不阻塞，结果完成时以消息送达，可连续派多个），或先派不阻塞的 local/team 队友再派阻塞的外部队友。
 7. 派 gpt，phase="tech-review"：技术验收，附实际 diff 与测试证据，写 TECH-REVIEW.md。
 8. 技术验收 changes_requested → 把编号缺陷派回对应 worker，phase="rework"（技术返工额度 ${MAX_TECH_REWORK_ROUNDS} 轮，前后端共享、不因换人或规格修订重置；未扩展时第 4 轮暂停：先向用户说明阻塞点与已完成部分并等待决策，用户同意后调用 squad_extend(kind="tech", rounds=3, reason="用户批准的追加理由", confirmed=true) 追加轮次再派）。
 9. 技术验收 approved → 派 codex，phase="review"：业务验收，写 REVIEW.md。
@@ -1257,6 +1258,11 @@ function createTools(ctx, config, runtime, store) {
           description:
             'Full-flow rework quota to consume: "tech" (technical acceptance defects) or "business". Optional; defaults to the freshest failing acceptance.',
         },
+        background: {
+          type: 'boolean',
+          description:
+            'External executors only, implement/rework phases only: dispatch in the background so you can issue further dispatches concurrently. The result arrives as a message when it finishes; squad_finish still waits for it.',
+        },
         task_id: { type: 'string', description: 'Task id; defaults to the current task.' },
       },
       required: ['agent', 'message'],
@@ -1424,6 +1430,21 @@ function createTools(ctx, config, runtime, store) {
       // has published SPEC.md. Tasks without a brain participant are exempt
       // from the plan gate (planRequired snapshot).
       const plan = planGateOf(state)
+      // Background dispatch: external one-shot executors block the tool call
+      // until they return; background mode returns immediately (delivery
+      // 'parent') so the Lead can run several workers concurrently. Only the
+      // implement/rework phases qualify — the review/spec/design phases read
+      // the deliverable right after the result and must stay synchronous.
+      const background = args.background === true
+      if (args.background !== undefined && !background) {
+        throw new Error('background 只能是 true（后台派发）或省略。')
+      }
+      if (background && !external) {
+        throw new Error('background 仅支持 external 执行者（一次性外部 provider）；local/team 执行者本就不阻塞。')
+      }
+      if (background && phase !== 'implement' && phase !== 'rework') {
+        throw new Error('background 仅支持 implement/rework 阶段；design/spec/review/tech-review 需要同步读取交付物，不能后台派发。')
+      }
       if (phase === 'design') {
         if (plan.planApproved) {
           throw new Error(
@@ -1628,42 +1649,54 @@ function createTools(ctx, config, runtime, store) {
           parent: lead,
           ...(hasWorkspace ? { cwd: workspace } : {}),
           signal: exec.signal,
-          delivery: 'caller',
+          delivery: background ? 'parent' : 'caller',
         })
-        let result
-        try {
-          result = await activation.result
-        } finally {
-          try {
-            await activation.dispose()
-          } catch {}
-        }
         sessionId = activation.childId
-        if (result.stopReason !== 'completed') {
-          throw new Error(
-            `外部 agent ${target.name} 异常结束（${result.stopReason}）${result.diagnostic ? `：${result.diagnostic}` : ''}`,
-          )
+        if (background) {
+          // Fire-and-report: the runtime delivers the result to the Lead as a
+          // message when the run finishes; the plugin does not await it, so
+          // the Lead can keep dispatching (parallel workers).
+          mode = 'external-background'
+          await appendFile(
+            join(taskDir, 'RUNS.md'),
+            `\n## ${new Date().toISOString()} ${target.name} (${target.role}) phase=${phase} round=${round} provider=${target.model} mode=background（结果将以后台消息送达 Lead）\n`,
+            'utf8',
+          ).catch(() => {})
+        } else {
+          let result
+          try {
+            result = await activation.result
+          } finally {
+            try {
+              await activation.dispose()
+            } catch {}
+          }
+          if (result.stopReason !== 'completed') {
+            throw new Error(
+              `外部 agent ${target.name} 异常结束（${result.stopReason}）${result.diagnostic ? `：${result.diagnostic}` : ''}`,
+            )
+          }
+          externalText = result.output
+            .filter((block) => block?.type === 'text')
+            .map((block) => block.text)
+            .join('')
+          if (['codex', 'codex-cli'].includes(target.model)) {
+            const after = await captureCodexTokens(startedAt)
+            tokens =
+              after !== undefined
+                ? tokensBefore !== undefined && after > tokensBefore
+                  ? after - tokensBefore
+                  : after
+                : undefined
+          }
+          mode = 'external'
+          await appendFile(
+            join(taskDir, 'RUNS.md'),
+            `\n## ${new Date().toISOString()} ${target.name} (${target.role}) phase=${phase} round=${round} provider=${target.model} tokens=${tokens ?? 'unknown'}\n\n${externalText || '（无文本输出）'}\n`,
+            'utf8',
+          ).catch(() => {})
+          state.tokens = (state.tokens ?? 0) + (tokens ?? 0)
         }
-        externalText = result.output
-          .filter((block) => block?.type === 'text')
-          .map((block) => block.text)
-          .join('')
-        if (['codex', 'codex-cli'].includes(target.model)) {
-          const after = await captureCodexTokens(startedAt)
-          tokens =
-            after !== undefined
-              ? tokensBefore !== undefined && after > tokensBefore
-                ? after - tokensBefore
-                : after
-              : undefined
-        }
-        mode = 'external'
-        await appendFile(
-          join(taskDir, 'RUNS.md'),
-          `\n## ${new Date().toISOString()} ${target.name} (${target.role}) phase=${phase} round=${round} provider=${target.model} tokens=${tokens ?? 'unknown'}\n\n${externalText || '（无文本输出）'}\n`,
-          'utf8',
-        ).catch(() => {})
-        state.tokens = (state.tokens ?? 0) + (tokens ?? 0)
         // An external dispatch obsoletes any stale continuable binding for
         // this name — the activity guard above proved it idle before we got
         // here, so drop the record instead of resuming a dead child later.
@@ -1876,6 +1909,16 @@ function createTools(ctx, config, runtime, store) {
           '它完成后会以完成通知唤醒你；返工用同一 child id 续跑。',
         ].join('\n')
       }
+      if (mode === 'external-background') {
+        return [
+          `已后台派发 ${target.displayName} (${target.name}) [${target.role}] provider=${target.model}（不阻塞，可继续派其他队友）`,
+          `task=${taskId} phase=${phase} round=${round} ${reworkLine}`,
+          ...phaseLines,
+          ...actingLine,
+          `workspace=${workspace}`,
+          '结果完成时会以后台消息送达；期间可用 squad_status 查看，squad_finish 会等它结束。异常结束也会以消息告知。',
+        ].join('\n')
+      }
       if (external) {
         const clipped =
           externalText.length > 3000
@@ -1982,6 +2025,9 @@ function createTools(ctx, config, runtime, store) {
       const businessVerdict = await readVerdict(taskDir, 'REVIEW.md')
       const extensions = Array.isArray(state.extensions) ? state.extensions : []
       const treeRows = await treeRowsOf(ctx, lead)
+      const backgroundRunning = treeRows.filter(
+        (row) => row.activity === 'running' && row.name === undefined,
+      ).length
       const childIds = new Set(
         Object.values(state.children ?? {}).map((child) => child.id),
       )
@@ -2034,6 +2080,9 @@ function createTools(ctx, config, runtime, store) {
               ),
             ]),
         `当前目录：${sessionDirectory(ctx, lead)}`,
+        ...(backgroundRunning > 0
+          ? [`后台执行器运行中：${backgroundRunning} 个（background 派发，结果将以消息送达；squad_finish 会等待）`]
+          : []),
         ...workspaceBlock,
         `共享记忆：${taskDir}`,
         '成员：',

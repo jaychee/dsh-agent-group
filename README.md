@@ -91,6 +91,12 @@ gpt（架构师）因**额度耗尽**等原因不可用时，插件把 gpt **挂
 - **持久化**：挂起状态存 `~/.dsh/agent-squad/failover.json`，插件重载/DSH 重启后仍生效，直到显式恢复；`squad_status` 显示"挂起：gpt（自 …；自动/手动；原因 …）"。
 - 代行期间 codex 产出的 SPEC.md 与 TECH-REVIEW.md 是正式记录；验收新鲜度规则不变（代行产生的技术验收同样绑定 codeEpoch/specVersion）。
 
+### 并行开发（提速）
+
+- **worker 内部并行**：ZCode CLI 自带 subagent 体系（Task/Agent 工具），ACP 桥不过滤工具、权限自动放行——派单消息把可并行的独立文件/模块逐项列出时，zcode 会用自己的子代理并行开发这些部分（worker 章程已内置该引导；边界不变：只改规格内文件、逐条 AC 留证）。
+- **小队级并行**：external 执行者的 `implement`/`rework` 派单可传 `background: true`——后台派发（`delivery: 'parent'`），工具调用立即返回、结果完成时以后台消息送达 Lead，因此可以**连续并发派多个 worker**（如 zcode 后端 + qoder 前端同时跑）。`design/spec/review/tech-review` 需要同步读取交付物，不支持后台；local/team 执行者本就不阻塞。
+- `squad_status` 显示"后台执行器运行中：N 个"；`squad_finish` 会等所有后台执行器结束。同一 time 内对同一队友的重复派单仍受运行中守卫限制（R07）。
+
 ### 预算与上限
 
 - **设计预算（默认 4 次）**：初始设计 + 最多 3 轮返工；未扩展时第 5 次暂停。
@@ -148,7 +154,7 @@ node --test dsh-agent-squad/test/settings.test.js
 ASQ_LIVE_QODER=1 node --test --test-name-pattern='^T09 ' dsh-agent-squad/test/settings.test.js
 ```
 
-测试保持十二个顶层用例（T01–T12；T11 覆盖显式启用、完整流程门禁、双验收与接手代签，T12 覆盖架构师额度耗尽的自动挂起、brain 代行与恢复）；实机模式由 qoder 一次派单修改两个临时仓库，各新增一次提交，并输出 `AC7 task=... cwd=... repo=... commit=... repo=... commit=...`。普通单测不能代替该证据。
+测试保持十三个顶层用例（T01–T13；T11 完整流程与双验收，T12 架构师容错交接，T13 后台并行派发）；实机模式由 qoder 一次派单修改两个临时仓库，各新增一次提交，并输出 `AC7 task=... cwd=... repo=... commit=... repo=... commit=...`。普通单测不能代替该证据。
 
 ## B 模式：外部 provider（一次性）
 
