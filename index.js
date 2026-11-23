@@ -46,7 +46,7 @@ import { dirname, join, resolve } from 'node:path'
 import { setTimeout as delay } from 'node:timers/promises'
 import { promisify } from 'node:util'
 
-import { createSettingsStore, seedFromBundle } from './settings.js'
+import { createSettingsStore, seedFromBundle, REASONING_IDS } from './settings.js'
 import { registerRoutes } from './http.js'
 import { createSquadWorktree, createSquadWorktrees, rollbackSquadWorktrees } from './worktree.js'
 import { createCodexProvider } from './codex.js'
@@ -509,7 +509,7 @@ function runtimeAgent(settingsAgent, config) {
     description: settingsAgent.description ?? '',
     executor: settingsAgent.executor,
     model: settingsAgent.model ?? '',
-    reasoning: ['low', 'high', 'xhigh', 'max'].includes(settingsAgent.reasoning)
+    reasoning: REASONING_IDS.includes(settingsAgent.reasoning)
       ? settingsAgent.reasoning
       : '',
     // Worker capability: fixed to the worker-role members (zcode/opencode/

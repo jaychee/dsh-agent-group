@@ -245,7 +245,7 @@ node --test dsh-agent-squad/test/settings.test.js
 ASQ_LIVE_QODER=1 node --test --test-name-pattern='^T09 ' dsh-agent-squad/test/settings.test.js
 ```
 
-测试保持二十个顶层用例（T01–T20；T11 完整流程与双验收，T12 测试者容错交接，T13 后台并行派发，T14 角色 worker 能力与 leaderWorker，T15 worker 可用性门禁与自动替代，T16 阶段化并行与 Base 分支合并，T17 分层进度与自动同步，T18 外部阶段非阻塞与延迟记账，T19 同会话多任务隔离与寻址，T20 多任务独立 worktree 与运行时合法子代理名）；实机模式由 front1 一次派单修改两个临时仓库，各新增一次提交，并输出 `AC7 task=... cwd=... repo=... commit=... repo=... commit=...`。普通单测不能代替该证据。
+测试保持 28 个顶层用例（T01–T28；T11 完整流程与双验收，T12 测试者容错交接，T13 后台并行派发，T14 角色 worker 能力与 leaderWorker，T15 worker 可用性门禁与自动替代，T16 阶段化并行与 Base 分支合并，T17 分层进度与自动同步，T18 外部阶段非阻塞与延迟记账，T19 同会话多任务隔离与寻址，T20 多任务独立 worktree 与运行时合法子代理名；T22–T28 覆盖上下文管理、用量/压缩与模型推理档位）；实机模式由 front1 一次派单修改两个临时仓库，各新增一次提交，并输出 `AC7 task=... cwd=... repo=... commit=... repo=... commit=...`。普通单测不能代替该证据。
 
 ## B 模式：外部 provider（一次性）
 
@@ -349,7 +349,7 @@ token：GLM implement 26,295 / rework 26,459（cache 主导）；Codex 设计 + 
   "worktree": { "directory": ".agents/worktrees" } }
 ```
 
-- **字段**：五个成员固定 id（brain/tester/worker1/front1/worker2，只读），可编辑 `displayName/role/executor/model/reasoning/description`；worktree 只有 `directory`（仓库相对路径，拒绝绝对路径与 `..`）。`reasoning`（思考强度，''/low/high/xhigh/max）仅对固定模型执行者生效（local，或 `provider/model` 形式的外部一次性），派发时作为 `reasoningEffort` 传给子代理；纯外部 provider（codex-cli 等）不显示该控件。`agents[].worker` 与顶层 `leaderWorker` 不在页面暴露（见上）。
+- **字段**：五个成员固定 id（brain/tester/worker1/front1/worker2，只读），可编辑 `displayName/role/executor/model/reasoning/description`；worktree 只有 `directory`（仓库相对路径，拒绝绝对路径与 `..`）。`reasoning`（思考强度）仅对固定模型执行者生效（local，或 `provider/model` 形式的外部一次性），派发时作为 `reasoningEffort` 传给子代理；选项由 `/agent-squad/models` 返回的模型 metadata `reasoning.efforts` 动态生成，不再硬编码。纯外部 provider（codex-cli 等）不显示该控件。`glm-5.4` 需要在 profile 中声明 `reasoningEfforts` 才会出现档位。`agents[].worker` 与顶层 `leaderWorker` 不在页面暴露（见上）。
 - **role 三态**：`brain`（业务+技术设计与双验收）| `tester`（测试验收者）| `worker`（实现与自测）。
 - **executor 三态**：`external`（外部 provider，一次性派发）、`local`（`provider/model` 固定模型本地子代理，可续跑）、`team`（进程内队友，可续跑）。校验：名称唯一、至少一个 brain、local 模型必须在模型目录内、external provider 必须已注册。
 - **迁移**：v1（三成员）自动补 tester，v2（四成员）自动补 worker2；v3→v4 把固定 id 改为 brain/tester/worker1/front1/worker2 并使用新显示名，角色/执行方式/模型/思考强度/worker 能力/描述与 revision 全部保留。

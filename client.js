@@ -313,6 +313,14 @@ window.__ModuleLoader__.load({
       }
       const err = (field) => fieldErrors[`${prefix}.${field}`]
       const modelValue = agent.model ?? ''
+      const findModel = (value) => (models?.groups ?? [])
+        .flatMap((group) => group.models ?? [])
+        .find((model) => model.value === value)
+      const clearUnsupportedReasoning = (nextModel) => {
+        const next = findModel(nextModel)
+        if (next?.reasoning?.efforts?.some((effort) => effort.id === agent.reasoning)) return {}
+        return { reasoning: '' }
+      }
       return h(
         'div',
         { className: 'asq-card' },
@@ -358,7 +366,7 @@ window.__ModuleLoader__.load({
               ? h('select', {
                   id: `asq-${agent.id}-model`, className: 'asq-select', value: modelValue,
                   disabled,
-                  onChange: (event) => update({ model: event.target.value }),
+                  onChange: (event) => update({ model: event.target.value, ...clearUnsupportedReasoning(event.target.value) }),
                   'aria-invalid': err('model') ? 'true' : undefined,
                 },
                   h('option', { value: '' }, t.modelPlaceholderLocal),
@@ -373,7 +381,7 @@ window.__ModuleLoader__.load({
               : h('select', {
                   id: `asq-${agent.id}-model`, className: 'asq-select', value: modelValue,
                   disabled,
-                  onChange: (event) => update({ model: event.target.value }),
+                  onChange: (event) => update({ model: event.target.value, ...clearUnsupportedReasoning(event.target.value) }),
                   'aria-invalid': err('model') ? 'true' : undefined,
                 },
                   h('option', { value: '' }, t.modelPlaceholderExternal),
@@ -386,10 +394,14 @@ window.__ModuleLoader__.load({
             err('model') && h('span', { className: 'asq-error', role: 'alert' }, t.errorFor(err('model')))),
         // Reasoning effort applies to pinned provider/model children: the
         // continuable local executor and the one-shot external spawn both
-        // forward reasoningEffort in agentOptions; a bare external provider
-        // (codex-cli &co.) has its own policy, so the control stays hidden.
-        (agent.executor === 'local' || (agent.executor === 'external' && modelValue.includes('/'))) &&
-          h('div', { className: 'asq-field' },
+        // forward reasoningEffort in agentOptions. Options come from the exact
+        // model's reasoning metadata, so unsupported levels never appear.
+        (() => {
+          if (!(agent.executor === 'local' || (agent.executor === 'external' && modelValue.includes('/')))) return null
+          const efforts = findModel(modelValue)?.reasoning?.efforts ?? []
+          if (efforts.length === 0) return null
+          const known = new Set(efforts.map((effort) => effort.id))
+          return h('div', { className: 'asq-field' },
             h('label', { className: 'asq-label', htmlFor: `asq-${agent.id}-reasoning` }, t.fieldReasoning),
             h('select', {
               id: `asq-${agent.id}-reasoning`, className: 'asq-select', value: agent.reasoning ?? '',
@@ -397,12 +409,13 @@ window.__ModuleLoader__.load({
               onChange: (event) => update({ reasoning: event.target.value }),
             },
               h('option', { value: '' }, t.reasoningDefault),
-              h('option', { value: 'low' }, t.reasoningLow),
-              h('option', { value: 'high' }, t.reasoningHigh),
-              h('option', { value: 'xhigh' }, t.reasoningXhigh),
-              h('option', { value: 'max' }, t.reasoningMax),
+              ...efforts.map((effort) => h('option', { key: effort.id, value: effort.id }, effort.name || effort.id)),
+              agent.reasoning && !known.has(agent.reasoning)
+                ? h('option', { value: agent.reasoning }, agent.reasoning)
+                : null,
             ),
-            err('reasoning') && h('span', { className: 'asq-error', role: 'alert' }, t.errorFor(err('reasoning')))),
+            err('reasoning') && h('span', { className: 'asq-error', role: 'alert' }, t.errorFor(err('reasoning'))))
+        })(),
         h('div', { className: 'asq-field' },
           h('label', { className: 'asq-label', htmlFor: `asq-${agent.id}-description` }, t.fieldDescription),
           h('textarea', {

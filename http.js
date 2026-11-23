@@ -383,11 +383,29 @@ export async function collectModels(models) {
       const group = { provider: id, label: provider.name ?? id, models: [] }
       try {
         const listed = await llm.listModels(id)
-        group.models = listed.map((model) => ({
-          value: `${id}/${model.id}`,
-          id: model.id,
-          label: model.name ?? model.id,
-        }))
+        group.models = await Promise.all(
+          listed.map(async (model) => {
+            // Catalog metadata carries only identity; exact reasoning levels
+            // come from resolveModelInfo. A failed lookup stays unknown rather
+            // than pretending the model has no reasoning.
+            let reasoning
+            let reasoningKnown = false
+            try {
+              if (typeof llm.resolveModelInfo === 'function') {
+                const info = await llm.resolveModelInfo(id, model.id)
+                reasoningKnown = true
+                if (info?.reasoning?.efforts?.length) reasoning = info.reasoning
+              }
+            } catch {}
+            return {
+              value: `${id}/${model.id}`,
+              id: model.id,
+              label: model.name ?? model.id,
+              ...(reasoning === undefined ? {} : { reasoning }),
+              ...(reasoningKnown ? { reasoningKnown: true } : {}),
+            }
+          }),
+        )
       } catch (cause) {
         group.error = cause?.message ?? String(cause)
       }
@@ -425,6 +443,19 @@ export async function collectModels(models) {
   return { groups, externalProviders }
 }
 
+/** Reject an explicit reasoning effort the exact model metadata does not offer. */
+function validateReasoning(agent, modelEntry) {
+  const requested = agent.reasoning ?? ''
+  if (requested === '' || modelEntry?.reasoningKnown !== true) return
+  const efforts = modelEntry.reasoning?.efforts ?? []
+  if (efforts.some((effort) => effort.id === requested)) return
+  throw new SettingsError(
+    'VALIDATION_FAILED',
+    `reasoning "${requested}" is not supported by model "${agent.model}"`,
+    { fields: { [`agents.${agent.id}.reasoning`]: 'REASONING_UNSUPPORTED' } },
+  )
+}
+
 /** Server-side second-pass validation of dynamic catalog membership. */
 async function validateDynamic(agents, worktree, models) {
   const structural = validateStatic(agents, worktree)
@@ -441,11 +472,13 @@ async function validateDynamic(agents, worktree, models) {
         error.code = 'CATALOG_UNAVAILABLE'
         throw error
       }
-      if (!group || !group.models.some((model) => model.value === agent.model)) {
+      const modelEntry = group?.models.find((model) => model.value === agent.model)
+      if (!group || modelEntry === undefined) {
         throw new SettingsError('VALIDATION_FAILED', `model "${agent.model}" is not in the catalog`, {
           fields: { [field]: 'MODEL_NOT_FOUND' },
         })
       }
+      validateReasoning(agent, modelEntry)
     } else {
       const slash = agent.model.indexOf('/')
       if (slash > 0) {
@@ -459,11 +492,13 @@ async function validateDynamic(agents, worktree, models) {
           error.code = 'CATALOG_UNAVAILABLE'
           throw error
         }
-        if (!group || !group.models.some((model) => model.value === agent.model)) {
+        const modelEntry = group?.models.find((model) => model.value === agent.model)
+        if (!group || modelEntry === undefined) {
           throw new SettingsError('VALIDATION_FAILED', `model "${agent.model}" is not in the catalog`, {
             fields: { [field]: 'MODEL_NOT_FOUND' },
           })
         }
+        validateReasoning(agent, modelEntry)
         continue
       }
       const registered =

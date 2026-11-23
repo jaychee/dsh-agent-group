@@ -53,6 +53,9 @@ export const EXECUTORS = ['external', 'local', 'team']
  * 'tester' on load. */
 export const ROLES = ['brain', 'tester', 'worker']
 
+/** Reasoning levels exposed by DSH model metadata (pi-ai thinking levels). */
+export const REASONING_IDS = ['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max']
+
 /** Factory defaults: the squad the user pinned — brain/tester/worker1/front1 on
  * local models, worker2 on OpenCode Go; worker is fixed to worker1 (primary
  * backend), worker2 (backup backend) and front1 (frontend-only). */
@@ -212,7 +215,7 @@ export function validateAgentsAndWorktree(agents, worktree, leaderWorker) {
     }
     if (
       entry.reasoning !== undefined &&
-      !['', 'low', 'high', 'xhigh', 'max'].includes(entry.reasoning)
+      !['', ...REASONING_IDS].includes(entry.reasoning)
     ) {
       fields[`${prefix}.reasoning`] = 'REASONING_INVALID'
     }
@@ -279,7 +282,7 @@ export function seedFromBundle(bundleAgents, worktreeDir) {
         description: typeof entry.description === 'string' ? entry.description : '',
         provider: String(entry?.provider ?? ''),
         model: String(entry?.model ?? ''),
-        reasoning: ['low', 'high', 'xhigh', 'max'].includes(entry?.reasoning)
+        reasoning: REASONING_IDS.includes(entry?.reasoning)
           ? entry.reasoning
           : undefined,
       })

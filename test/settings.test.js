@@ -1,5 +1,5 @@
 /**
- * Settings-page test suite — exactly ten top-level tests (T01–T10).
+ * Settings-page + squad integration test suite — top-level tests T01–T28.
  * Run: node --test dsh-agent-squad/test/settings.test.js
  */
 
@@ -287,6 +287,14 @@ test('T02 collectModels groups providers and survives single-provider failure', 
           { provider, id: 'deepseek-reasoner', name: 'DeepSeek Reasoner' },
         ]
       },
+      resolveModelInfo: async (provider, model) => ({
+        provider,
+        id: model,
+        name: model,
+        ...(model === 'deepseek-reasoner'
+          ? { reasoning: { efforts: [{ id: 'low', name: 'Low' }, { id: 'high', name: 'High' }, { id: 'max', name: 'Max' }], defaultEffort: 'high' } }
+          : {}),
+      }),
     },
     subagents: { list: () => ['spawn', 'codex', 'zcode-cli', 'qoder-cli', 'fork'] },
   })
@@ -300,6 +308,10 @@ test('T02 collectModels groups providers and survives single-provider failure', 
     ['deepseek-account/deepseek-chat', 'deepseek-account/deepseek-reasoner'],
   )
   assert.equal(okGroup.models[0].label, 'DeepSeek Chat')
+  assert.equal(okGroup.models[0].reasoningKnown, true)
+  assert.equal(okGroup.models[0].reasoning, undefined)
+  assert.deepEqual(okGroup.models[1].reasoning.efforts.map((effort) => effort.id), ['low', 'high', 'max'])
+  assert.equal(okGroup.models[1].reasoning.defaultEffort, 'high')
   assert.equal(result.groups[1].error, 'provider down')
   assert.deepEqual(result.groups[1].models, [])
   assert.deepEqual(
@@ -8960,8 +8972,70 @@ test('T27 context docs', async () => {
   // All 27 top-level tests exist in this file.
   const suite = await readFile(new URL('./settings.test.js', import.meta.url), 'utf8')
   const names = [...suite.matchAll(/^test\('(T\d\d) /gm)].map((match) => match[1])
-  for (let index = 1; index <= 27; index += 1) {
+  for (let index = 1; index <= 28; index += 1) {
     assert.ok(names.includes(`T${String(index).padStart(2, '0')}`), `T${index} exists`)
   }
-  assert.equal(names.length, 27)
+  assert.equal(names.length, 28)
+})
+
+/** T28 — reasoning options come from exact model metadata; unsupported levels are rejected. */
+test('T28 reasoning catalog is model-scoped', async () => {
+  const { createRequestHandler } = await import('../http.js')
+  const settings = contextAgentSettings({
+    worker1: { executor: 'local', model: 'p/m1', reasoning: 'max' },
+    worker2: { executor: 'local', model: 'p/m1', reasoning: '' },
+  })
+  let current = { ...settings, version: 4, revision: 1 }
+  const store = {
+    read: async () => current,
+    save: async ({ agents, worktree }) => {
+      current = { ...current, revision: current.revision + 1, agents, worktree }
+      return current
+    },
+    defaults: () => contextAgentSettings(),
+  }
+  const models = {
+    llm: {
+      listProviders: () => [{ id: 'p', name: 'P' }],
+      listModels: async () => [{ provider: 'p', id: 'm1', name: 'M1' }],
+      resolveModelInfo: async (provider, model) => ({
+        provider,
+        id: model,
+        name: 'M1',
+        reasoning: { efforts: [{ id: 'low', name: 'Low' }, { id: 'high', name: 'High' }, { id: 'max', name: 'Max' }] },
+      }),
+    },
+    subagents: { list: () => ['spawn', 'fork', 'mock-ext'] },
+  }
+  const handler = createRequestHandler({ store, models })
+  const makeRes = () => ({
+    statusCode: 0, headers: {}, body: '',
+    setHeader(name, value) { this.headers[name] = value },
+    writeHead(status, headers) { this.statusCode = status; Object.assign(this.headers, headers) },
+    end(text) { this.body = String(text ?? '') },
+  })
+  const put = async (reasoning) => {
+    const agents = current.agents.map((agent) =>
+      agent.id === 'worker1' ? { ...agent, reasoning } : agent)
+    const body = JSON.stringify({ expectedRevision: current.revision, agents, worktree: current.worktree })
+    const { EventEmitter } = await import('node:events')
+    const req = Object.assign(new EventEmitter(), {
+      method: 'PUT', url: '/agent-squad/settings',
+      headers: { host: '127.0.0.1:57954', 'content-type': 'application/json' },
+      socket: { remoteAddress: '127.0.0.1', localPort: 57954 },
+    })
+    setImmediate(() => {
+      req.emit('data', Buffer.from(body))
+      req.emit('end')
+    })
+    const res = makeRes()
+    await handler(req, res)
+    return res
+  }
+  const rejected = await put('xhigh')
+  assert.equal(rejected.statusCode, 400)
+  assert.equal(JSON.parse(rejected.body).error.fields['agents.worker1.reasoning'], 'REASONING_UNSUPPORTED')
+  const accepted = await put('max')
+  assert.equal(accepted.statusCode, 200)
+  assert.equal(JSON.parse(accepted.body).settings.agents.find((agent) => agent.id === 'worker1').reasoning, 'max')
 })
