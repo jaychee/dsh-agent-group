@@ -55,13 +55,13 @@
         # 8192 stays the summarization generation cap. `false` restores the
         # legacy behavior (no caps, no automatic usage lines, no squad_compact).
         contextPolicy: {thresholdRatio: &squadRatio 0.86, maxOutputTokens: 16384, autoCompact: true, showUsage: true}
-        # Worker is fixed to three members: zcode (primary backend, local
-        # GLM-5.3 max), opencode (backup backend) and qoder (frontend-only,
-        # local Qwen4-Max xhigh); codex/gpt are brain/architect on local
-        # models and do not implement by default. These rows only seed the
-        # settings file on first run.
+        # Worker is fixed to three members: worker1 (primary backend, local
+        # GLM-5.3 max), worker2 (backup backend) and front1 (frontend-only,
+        # local Qwen4-Max xhigh); brain/tester are local models and do not
+        # implement by default. These rows only seed the settings file on
+        # first run; v4 display names come from the plugin defaults.
         agents:
-          - name: codex
+          - name: brain
             role: brain
             provider: ''
             model: openai-codex/gpt-6.2-astra
@@ -69,14 +69,14 @@
             worker: false
             context: fresh
             description: 业务设计与验收：给出业务方案、对外行为与验收标准，并做业务验收（本地 OpenAI Codex GPT-6.2-Astra，xhigh）。
-          - name: gpt
+          - name: tester
             role: tester
             provider: ''
             model: openai/gpt-6.2-sol
             worker: false
             context: fresh
             description: 测试验收者：依据 brain 的技术实现规格与验收方案审核 worker 的测试用例，不合格时补充测试用例并完整测试（默认不参与实现）。
-          - name: zcode
+          - name: worker1
             role: worker
             provider: ''
             model: zai-coding-cn/glm-5.3
@@ -84,15 +84,15 @@
             worker: true
             context: fresh
             description: 主力后端 worker：后端任务优先派发；实现后端代码并自测，自测通过后才交付（本地 GLM-5.3，max）。
-          - name: opencode
+          - name: worker2
             role: worker
             provider: ''
             model: dsh-opencode-go/deepseek-v4.1-flash
             reasoning: max
             worker: true
             context: fresh
-            description: 备份后端 worker：zcode 不可用时接手后端实现与自测（OpenCode Go DeepSeek V4.1 Flash，max，可续跑）。
-          - name: qoder
+            description: 备份后端 worker：worker1 不可用时接手后端实现与自测（OpenCode Go DeepSeek V4.1 Flash，max，可续跑）。
+          - name: front1
             role: worker
             provider: ''
             model: qoder/qmodel_latest

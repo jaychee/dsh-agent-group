@@ -1,7 +1,7 @@
 {
   "meta": {
     "title": "智能体小队",
-    "description": "按角色组织的本地多智能体团队：Lead 把业务方案、技术规格、实现与双验收分别交给 codex、gpt、zcode、qoder，返工时继续各自的同一段对话。默认不启用，仅用户明确要求时进入小队。"
+    "description": "按角色组织的本地多智能体团队：Lead 把业务方案、技术规格、实现与双验收分别交给 brain、tester、worker1、front1，返工时继续各自的同一段对话。默认不启用，仅用户明确要求时进入小队。"
   },
   "settings": {
     "title": "智能体小队",

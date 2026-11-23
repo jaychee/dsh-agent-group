@@ -15,11 +15,11 @@ const run = promisify(execFile)
 const delayMs = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 
 const BUNDLE_AGENTS = [
-  { name: 'codex', role: 'brain', provider: 'mock-ext', context: 'fresh', description: 'brain' },
-  { name: 'gpt', role: 'tester', provider: '', model: '', context: 'fresh', description: 'tester' },
-  { name: 'zcode', role: 'worker', provider: '', model: 'zai-coding-cn/glm-5.3', context: 'fresh', description: 'worker' },
-  { name: 'qoder', role: 'worker', provider: '', model: 'zai-coding-cn/glm-5.3', context: 'fresh', description: 'worker2' },
-  { name: 'opencode', role: 'worker', provider: '', model: 'dsh-opencode-go/deepseek-v4.1-flash', context: 'fresh', description: 'worker3' },
+  { name: 'brain', role: 'brain', provider: 'mock-ext', context: 'fresh', description: 'brain' },
+  { name: 'tester', role: 'tester', provider: '', model: '', context: 'fresh', description: 'tester' },
+  { name: 'worker1', role: 'worker', provider: '', model: 'zai-coding-cn/glm-5.3', context: 'fresh', description: 'worker' },
+  { name: 'front1', role: 'worker', provider: '', model: 'zai-coding-cn/glm-5.3', context: 'fresh', description: 'worker2' },
+  { name: 'worker2', role: 'worker', provider: '', model: 'dsh-opencode-go/deepseek-v4.1-flash', context: 'fresh', description: 'worker3' },
 ]
 
 /** Shared S/E/M contract lines and charter items, asserted verbatim (PLAN §2/§3). */
@@ -36,7 +36,7 @@ const BRAIN_ITEMS = [
   '写完后自检“一个没有上下文的实现者能否只靠 PLAN 拍板技术设计”，把结论写入 PLAN.md；不能时补全方案，或列入“假设与待确认”并标明阻塞项，不得宣称方案可执行。',
   '设计轮（spec）读取已批准的 PLAN-APPROVED.md，把技术规格写入 SPEC.md，至少覆盖适用的：代码结构、文件与模块职责、数据库表与迁移、领域模型及其依赖、对外接口与错误行为、各模块实现、可执行验证用例；对不适用的部分逐项明确说明“不适用”。',
   '技术验收轮（tech-review）以当前 SPEC.md 为唯一权威技术规格：做代码审查、亲自运行验证测试，在 TECH-REVIEW.md 逐条记录需求/AC 编号、命令、退出码、关键输出与可执行的编号缺陷清单；技术验收前必须已有一份仍然新鲜的 APPROVED 测试验收（TEST-REVIEW.md）。',
-  '当你本人接手实现过代码时，不能再签署自己改动的技术验收：技术验收改由 tester（gpt）对照 SPEC.md 代签；你的业务验收仍单独签署，两份验收独立记录。',
+  '当你本人接手实现过代码时，不能再签署自己改动的技术验收：技术验收改由 tester 对照 SPEC.md 代签；你的业务验收仍单独签署，两份验收独立记录。',
   '业务验收轮以 PLAN-APPROVED.md 为唯一权威业务规格，逐条核对 AC 并在 REVIEW.md 写明 AC 编号、验证命令、退出码、关键输出与结论；亲自运行或检查，不接受没有证据的声明。',
 ]
 const TESTER_ITEMS = [
@@ -49,7 +49,7 @@ const TESTER_ITEMS = [
 const WORKER_ITEMS = [
   `动手前先读 TASK.md、PLAN-APPROVED.md（业务方案）与 SPEC.md（技术规格）。${S_TEXT}${E_TEXT}`,
   '只做规格定义的最小改动；不得引入规格未定义的接口、文件或依赖，不重新设计、不改名、不扩大范围。',
-  '规格缺失、矛盾或明显错误时立即停止实现，报 "blocked"，引用 PLAN-APPROVED.md/SPEC.md 的具体章节与编号，并列出缺失项或冲突原文；需要归档而文件缺失时明确引用文件名；豁免任务引用 TASK.md 章节或 Lead 派单条目。规格有问题上报 Lead 转 brain（codex）修订发布，不自行偏离或改用 PLAN.md。',
+  '规格缺失、矛盾或明显错误时立即停止实现，报 "blocked"，引用 PLAN-APPROVED.md/SPEC.md 的具体章节与编号，并列出缺失项或冲突原文；需要归档而文件缺失时明确引用文件名；豁免任务引用 TASK.md 章节或 Lead 派单条目。规格有问题上报 Lead 转 brain 修订发布，不自行偏离或改用 PLAN.md。',
   '按 SPEC.md 指定的测试名、输入与期望输出写或更新测试，并亲自运行每条 AC 的验收命令；豁免任务按 TASK.md 与 Lead 本轮派单执行。',
   '在 REPORT.md 逐条 AC 给证据：AC 编号、改动文件路径、测试名、实际命令、退出码、关键输出与结论；失败或未执行必须如实标注，不得只写“测试通过”。',
 ]
@@ -99,17 +99,17 @@ test('T01 settings store seeds, persists, recovers corruption, keeps old file on
   const store = createSettingsStore({ filePath, seed: seedFromBundle(BUNDLE_AGENTS, '.agents/worktrees') })
 
   const first = await store.read()
-  assert.equal(first.version, 3)
+  assert.equal(first.version, 4)
   assert.equal(first.revision, 1)
   assert.equal(first.agents.length, 5)
   assert.deepEqual(
     first.agents.map((agent) => [agent.id, agent.role, agent.executor, agent.model]),
     [
-      ['codex', 'brain', 'external', 'mock-ext'],
-      ['gpt', 'tester', 'team', ''],
-      ['zcode', 'worker', 'local', 'zai-coding-cn/glm-5.3'],
-      ['qoder', 'worker', 'local', 'zai-coding-cn/glm-5.3'],
-      ['opencode', 'worker', 'local', 'dsh-opencode-go/deepseek-v4.1-flash'],
+      ['brain', 'brain', 'external', 'mock-ext'],
+      ['tester', 'tester', 'team', ''],
+      ['worker1', 'worker', 'local', 'zai-coding-cn/glm-5.3'],
+      ['front1', 'worker', 'local', 'zai-coding-cn/glm-5.3'],
+      ['worker2', 'worker', 'local', 'dsh-opencode-go/deepseek-v4.1-flash'],
     ],
   )
   assert.equal(first.worktree.directory, '.agents/worktrees')
@@ -117,18 +117,18 @@ test('T01 settings store seeds, persists, recovers corruption, keeps old file on
   const saved = await store.save({
     expectedRevision: 1,
     agents: first.agents.map((agent) =>
-      agent.id === 'zcode' ? { ...agent, displayName: '实现者' } : agent,
+      agent.id === 'worker1' ? { ...agent, displayName: '实现者' } : agent,
     ),
     worktree: first.worktree,
   })
   assert.equal(saved.revision, 2)
   const persisted = JSON.parse(await readFile(filePath, 'utf8'))
   assert.equal(persisted.revision, 2)
-  assert.equal(persisted.agents.find((agent) => agent.id === 'zcode').displayName, '实现者')
+  assert.equal(persisted.agents.find((agent) => agent.id === 'worker1').displayName, '实现者')
   const reread = await store.read()
   assert.equal(reread.revision, 2)
 
-  // v1 → v2 migration: a three-agent file gains the gpt architect row while
+  // v1 → v2 migration: a three-agent file gains the tester architect row while
   // every user edit and the revision survive; the file converges to v2.
   {
     const v1Path = join(root, 'v1', 'settings.json')
@@ -139,9 +139,9 @@ test('T01 settings store seeds, persists, recovers corruption, keeps old file on
         version: 1,
         revision: 7,
         agents: [
-          { id: 'codex', displayName: '老codex', role: 'brain', executor: 'external', model: 'mock-ext', description: 'kept' },
-          { id: 'zcode', displayName: '实现者', role: 'worker', executor: 'local', model: 'p/m1', description: 'w' },
-          { id: 'qoder', displayName: 'qoder', role: 'worker', executor: 'team', model: '', description: 'w2' },
+          { id: 'brain', displayName: '老codex', role: 'brain', executor: 'external', model: 'mock-ext', description: 'kept' },
+          { id: 'worker1', displayName: '实现者', role: 'worker', executor: 'local', model: 'p/m1', description: 'w' },
+          { id: 'front1', displayName: 'front1', role: 'worker', executor: 'team', model: '', description: 'w2' },
         ],
         worktree: { directory: 'kept-worktrees' },
       }),
@@ -149,20 +149,20 @@ test('T01 settings store seeds, persists, recovers corruption, keeps old file on
     )
     const migratedStore = createSettingsStore({ filePath: v1Path })
     const migrated = await migratedStore.read()
-    assert.equal(migrated.version, 3)
+    assert.equal(migrated.version, 4)
     assert.equal(migrated.revision, 7)
     assert.deepEqual(
       migrated.agents.map((agent) => agent.id),
-      ['codex', 'gpt', 'zcode', 'qoder', 'opencode'],
+      ['brain', 'tester', 'worker1', 'front1', 'worker2'],
     )
     assert.equal(migrated.agents[0].displayName, '老codex')
     assert.equal(migrated.agents[1].role, 'tester')
     assert.equal(migrated.agents[2].displayName, '实现者')
     assert.equal(migrated.worktree.directory, 'kept-worktrees')
     const onDisk = JSON.parse(await readFile(v1Path, 'utf8'))
-    assert.equal(onDisk.version, 3)
+    assert.equal(onDisk.version, 4)
     assert.equal(onDisk.agents.length, 5)
-    // A v2 file (four rows) likewise gains opencode and keeps its edits.
+    // A v2 file (four rows) likewise gains worker2 and keeps its edits.
     {
       const v2Path = join(root, 'v2', 'settings.json')
       await mkdir(join(root, 'v2'), { recursive: true })
@@ -172,22 +172,54 @@ test('T01 settings store seeds, persists, recovers corruption, keeps old file on
           version: 2,
           revision: 4,
           agents: [
-            { id: 'codex', displayName: 'codex', role: 'brain', executor: 'team', model: '', description: 'b' },
-            { id: 'gpt', displayName: 'architect', role: 'tester', executor: 'team', model: '', description: 'a' },
-            { id: 'zcode', displayName: '后端', role: 'worker', executor: 'team', model: '', description: 'w' },
-            { id: 'qoder', displayName: 'qoder', role: 'worker', executor: 'team', model: '', description: 'w2' },
+            { id: 'brain', displayName: 'brain', role: 'brain', executor: 'team', model: '', description: 'b' },
+            { id: 'tester', displayName: 'architect', role: 'tester', executor: 'team', model: '', description: 'a' },
+            { id: 'worker1', displayName: '后端', role: 'worker', executor: 'team', model: '', description: 'w' },
+            { id: 'front1', displayName: 'front1', role: 'worker', executor: 'team', model: '', description: 'w2' },
           ],
           worktree: { directory: 'kept-v2' },
         }),
         'utf8',
       )
       const v2 = await createSettingsStore({ filePath: v2Path }).read()
-      assert.equal(v2.version, 3)
+      assert.equal(v2.version, 4)
       assert.equal(v2.revision, 4)
-      assert.deepEqual(v2.agents.map((agent) => agent.id), ['codex', 'gpt', 'zcode', 'qoder', 'opencode'])
+      assert.deepEqual(v2.agents.map((agent) => agent.id), ['brain', 'tester', 'worker1', 'front1', 'worker2'])
       assert.equal(v2.agents[2].displayName, '后端')
       assert.equal(v2.agents[4].reasoning, 'max')
     }
+  }
+
+  // v3 legacy ids → v4: ids and default labels are renamed, every other field
+  // (role/executor/model/reasoning/worker/description) survives.
+  {
+    const legacyPath = join(root, 'legacy', 'settings.json')
+    await mkdir(join(root, 'legacy'), { recursive: true })
+    await writeFile(
+      legacyPath,
+      JSON.stringify({
+        version: 3,
+        revision: 9,
+        agents: [
+          { id: 'codex', displayName: 'codex', role: 'brain', executor: 'local', model: 'openai-codex/gpt-6.2-astra', reasoning: 'xhigh', worker: false, description: 'b' },
+          { id: 'gpt', displayName: 'gpt', role: 'tester', executor: 'local', model: 'openai/gpt-6.2-sol', worker: false, description: 't' },
+          { id: 'zcode', displayName: 'zcode', role: 'worker', executor: 'local', model: 'zai-coding-cn/glm-5.3', reasoning: 'max', worker: true, description: 'w1' },
+          { id: 'qoder', displayName: 'qoder', role: 'worker', executor: 'local', model: 'qoder/qmodel_latest', reasoning: 'xhigh', worker: true, description: 'f1' },
+          { id: 'opencode', displayName: 'opencode', role: 'worker', executor: 'local', model: 'dsh-opencode-go/deepseek-v4.1-flash', reasoning: 'max', worker: true, description: 'w2' },
+        ],
+        worktree: { directory: '.agents/worktrees' },
+      }),
+      'utf8',
+    )
+    const legacy = await createSettingsStore({ filePath: legacyPath }).read()
+    assert.equal(legacy.version, 4)
+    assert.equal(legacy.revision, 9)
+    assert.deepEqual(legacy.agents.map((agent) => agent.id), ['brain', 'tester', 'worker1', 'front1', 'worker2'])
+    assert.deepEqual(legacy.agents.map((agent) => agent.displayName), ['大脑', '测试者', '后端开发者1', '前端开发者1', '后端开发者2'])
+    assert.equal(legacy.agents[0].model, 'openai-codex/gpt-6.2-astra')
+    assert.equal(legacy.agents[2].worker, true)
+    assert.equal(legacy.agents[3].description, 'f1')
+    assert.equal(JSON.parse(await readFile(legacyPath, 'utf8')).version, 4)
   }
 
   // Corrupt file → backed up, effective seed (not static defaults) restored (R05).
@@ -516,8 +548,8 @@ test('T03 dispatch reads fresh settings and routes external/local/team executors
   const dshHome = await tempRoot()
   const restoreDshHome = useFixtureDshHome(dshHome)
   try {
-    // Pre-write a legal settings file: codex→external(mock-ext), gpt→team(architect),
-    // zcode→local(p/m), qoder→team.
+    // Pre-write a legal settings file: brain→external(mock-ext), tester→team(architect),
+    // worker1→local(p/m), front1→team.
     const settingsPath = join(dshHome, 'agent-squad', 'settings.json')
     await mkdir(join(dshHome, 'agent-squad'), { recursive: true })
     await writeFile(
@@ -527,10 +559,10 @@ test('T03 dispatch reads fresh settings and routes external/local/team executors
           version: 2,
           revision: 1,
           agents: [
-            { id: 'codex', displayName: 'codex', role: 'brain', executor: 'external', model: 'mock-ext', description: 'b' },
-            { id: 'gpt', displayName: 'gpt', role: 'tester', executor: 'team', model: '', description: 'a' },
-            { id: 'zcode', displayName: 'zcode', role: 'worker', executor: 'local', model: 'p/m1', description: 'w' },
-            { id: 'qoder', displayName: 'qoder', role: 'worker', executor: 'team', model: '', description: 'w2' },
+            { id: 'brain', displayName: 'brain', role: 'brain', executor: 'external', model: 'mock-ext', description: 'b' },
+            { id: 'tester', displayName: 'tester', role: 'tester', executor: 'team', model: '', description: 'a' },
+            { id: 'worker1', displayName: 'worker1', role: 'worker', executor: 'local', model: 'p/m1', description: 'w' },
+            { id: 'front1', displayName: 'front1', role: 'worker', executor: 'team', model: '', description: 'w2' },
           ],
           worktree: { directory: '.agents/worktrees' },
         },
@@ -541,14 +573,14 @@ test('T03 dispatch reads fresh settings and routes external/local/team executors
     )
 
     const { apply } = await import('../index.js')
-    // Real qoder-stub CLI: writes the cwd marker file and prints its argv as
+    // Real front1-stub CLI: writes the cwd marker file and prints its argv as
     // JSON, proving the plugin config reaches the provider's spawn.
-    const stubPath = join(dshHome, 'qoder-stub.cjs')
+    const stubPath = join(dshHome, 'front1-stub.cjs')
     await writeFile(
       stubPath,
       '#!/usr/bin/env node\n' +
         "const { writeFileSync } = require('node:fs')\n" +
-        "writeFileSync('qoder-test-output.txt', 'ok\\n')\n" +
+        "writeFileSync('front1-test-output.txt', 'ok\\n')\n" +
         'process.stdout.write(JSON.stringify(process.argv.slice(2)))\n',
       'utf8',
     )
@@ -576,7 +608,7 @@ test('T03 dispatch reads fresh settings and routes external/local/team executors
       // No architect participant: the task downgrades to the legacy gates, so
       // T03 keeps exercising pure executor routing (spec/tech-review gates
       // belong to T11).
-      { goal: 'g', acceptance: 'a', agents: ['codex', 'zcode', 'qoder'] },
+      { goal: 'g', acceptance: 'a', agents: ['brain', 'worker1', 'front1'] },
       exec,
     )
     assert.match(startOutput, /任务 .+ 已创建/)
@@ -588,10 +620,10 @@ test('T03 dispatch reads fresh settings and routes external/local/team executors
 
     // external: one-shot activation through the provider named by settings.model.
     const externalOutput = await tool('squad_dispatch').execute(
-      { agent: 'codex', message: 'design', phase: 'design' },
+      { agent: 'brain', message: 'design', phase: 'design' },
       exec,
     )
-    assert.match(externalOutput, /已外部派发 codex/)
+    assert.match(externalOutput, /已外部派发 brain/)
     assert.match(externalOutput, /planRounds=1\/4/)
     assert.equal(host.activations.at(-1).provider, 'mock-ext')
     // S/E/M contract reaches the external activation prompt (charter included).
@@ -601,7 +633,7 @@ test('T03 dispatch reads fresh settings and routes external/local/team executors
     assert.equal(await readFile(join(firstDir, 'PLAN-R1.md'), 'utf8'), '# PLAN (mock)\n')
     // Plan gate: implement is refused until the Lead approves the PLAN.
     await assert.rejects(
-      tool('squad_dispatch').execute({ agent: 'zcode', message: 'early', phase: 'implement' }, exec),
+      tool('squad_dispatch').execute({ agent: 'worker1', message: 'early', phase: 'implement' }, exec),
       /squad_approve_plan/,
     )
     const approveFirst = await tool('squad_approve_plan').execute({ task_id: firstTaskId }, exec)
@@ -610,10 +642,10 @@ test('T03 dispatch reads fresh settings and routes external/local/team executors
 
     // local: pinned model p/m1, first dispatch creates a child.
     const local1 = await tool('squad_dispatch').execute(
-      { agent: 'zcode', message: 'implement', phase: 'implement' },
+      { agent: 'worker1', message: 'implement', phase: 'implement' },
       exec,
     )
-    assert.match(local1, /已创建本地子代理 zcode/)
+    assert.match(local1, /已创建本地子代理 worker1/)
     const firstChild = host.activations.at(-1).childId
     assert.deepEqual(host.activations.at(-1).agentOptions, { provider: 'p', model: 'm1', maxTokens: 16384 })
     assertSEM(host.activations.at(-1).prompt.map((block) => block.text).join(''))
@@ -621,10 +653,10 @@ test('T03 dispatch reads fresh settings and routes external/local/team executors
 
     // Same binding → resume the same child id.
     const local2 = await tool('squad_dispatch').execute(
-      { agent: 'zcode', message: 'rework', phase: 'rework' },
+      { agent: 'worker1', message: 'rework', phase: 'rework' },
       exec,
     )
-    assert.match(local2, /已续跑本地子代理 zcode/)
+    assert.match(local2, /已续跑本地子代理 worker1/)
     assert.equal(host.sent.at(-1).targetId, firstChild)
     {
       const resumeText = host.sent.at(-1).content.map((block) => block.text).join('')
@@ -634,34 +666,34 @@ test('T03 dispatch reads fresh settings and routes external/local/team executors
     }
     await assertBrief(firstDir)
 
-    // team: spawnTeammate path, with qoder re-roled to brain first (R08).
+    // team: spawnTeammate path, with front1 re-roled to brain first (R08).
     const { createSettingsStore } = await import('../settings.js')
     const settingsStore = createSettingsStore({ filePath: settingsPath })
     let snapshot = await settingsStore.read()
     await settingsStore.save({
       expectedRevision: snapshot.revision,
       agents: snapshot.agents.map((agent) =>
-        agent.id === 'qoder' ? { ...agent, role: 'brain' } : agent,
+        agent.id === 'front1' ? { ...agent, role: 'brain' } : agent,
       ),
       worktree: snapshot.worktree,
     })
     const teamOutput = await tool('squad_dispatch').execute(
-      { agent: 'qoder', message: 'parallel', phase: 'implement' },
+      { agent: 'front1', message: 'parallel', phase: 'implement' },
       exec,
     )
-    assert.match(teamOutput, /已创建 qoder \[brain\]/)
-    assert.equal(host.spawned.at(-1).name, 'qoder')
+    assert.match(teamOutput, /已创建 front1 \[brain\]/)
+    assert.equal(host.spawned.at(-1).name, 'front1')
     assertSEM(host.spawned.at(-1).prompt.map((block) => block.text).join(''))
     await assertBrief(firstDir)
     // The spawned member's identity section follows the dispatch snapshot
     // (R08), including the section installed by agent/created firing before
     // spawnTeammate resolved.
-    assert.match(host.sections.at(-1), /qoder.*brain 角色/s)
-    const qoderBrainSections = host.sections.filter((text) => text.includes('"qoder"'))
+    assert.match(host.sections.at(-1), /front1.*brain 角色/s)
+    const qoderBrainSections = host.sections.filter((text) => text.includes('"front1"'))
     assert.ok(qoderBrainSections.length >= 1)
     for (const text of qoderBrainSections) assert.match(text, /brain 角色/)
     // squad_report uses the same snapshot role, not the current roster (R08).
-    const qoderAgent = [...host.agentsById.values()].find((agent) => agent.__membership?.name === 'qoder')
+    const qoderAgent = [...host.agentsById.values()].find((agent) => agent.__membership?.name === 'front1')
     const reportOutput = await tool('squad_report').execute(
       { status: 'done', summary: 'ok' },
       { agent: qoderAgent, signal: undefined },
@@ -672,12 +704,12 @@ test('T03 dispatch reads fresh settings and routes external/local/team executors
       /role=brain/,
     )
 
-    // Save a new model binding for zcode (child idle: agents.get → undefined).
+    // Save a new model binding for worker1 (child idle: agents.get → undefined).
     snapshot = await settingsStore.read()
     await settingsStore.save({
       expectedRevision: snapshot.revision,
       agents: snapshot.agents.map((agent) =>
-        agent.id === 'zcode' ? { ...agent, model: 'p/m2' } : agent,
+        agent.id === 'worker1' ? { ...agent, model: 'p/m2' } : agent,
       ),
       worktree: snapshot.worktree,
     })
@@ -693,25 +725,25 @@ test('T03 dispatch reads fresh settings and routes external/local/team executors
     host.markRunning(firstChild)
     await assert.rejects(
       tool('squad_dispatch').execute(
-        { agent: 'zcode', message: 'same binding', phase: 'implement' },
+        { agent: 'worker1', message: 'same binding', phase: 'implement' },
         exec,
       ),
       /仍在运行或创建中/,
     )
     await assert.rejects(
-      tool('squad_dispatch').execute({ agent: 'zcode', message: 'new model', phase: 'implement' }, exec),
+      tool('squad_dispatch').execute({ agent: 'worker1', message: 'new model', phase: 'implement' }, exec),
       /仍在运行或创建中/,
     )
     snapshot = await settingsStore.read()
     await settingsStore.save({
       expectedRevision: snapshot.revision,
       agents: snapshot.agents.map((agent) =>
-        agent.id === 'zcode' ? { ...agent, executor: 'external', model: 'mock-ext' } : agent,
+        agent.id === 'worker1' ? { ...agent, executor: 'external', model: 'mock-ext' } : agent,
       ),
       worktree: snapshot.worktree,
     })
     await assert.rejects(
-      tool('squad_dispatch').execute({ agent: 'zcode', message: 'switch', phase: 'implement' }, exec),
+      tool('squad_dispatch').execute({ agent: 'worker1', message: 'switch', phase: 'implement' }, exec),
       /仍在运行或创建中/,
     )
     assert.equal(await readFile(briefPath, 'utf8'), briefBefore)
@@ -729,33 +761,33 @@ test('T03 dispatch reads fresh settings and routes external/local/team executors
     await settingsStore.save({
       expectedRevision: snapshot.revision,
       agents: snapshot.agents.map((agent) =>
-        agent.id === 'zcode' ? { ...agent, executor: 'local', model: 'p/m1' } : agent,
+        agent.id === 'worker1' ? { ...agent, executor: 'local', model: 'p/m1' } : agent,
       ),
       worktree: snapshot.worktree,
     })
     const resumeTaskA = await tool('squad_dispatch').execute(
-      { agent: 'zcode', message: 'back to local on A', phase: 'implement' },
+      { agent: 'worker1', message: 'back to local on A', phase: 'implement' },
       exec,
     )
-    assert.match(resumeTaskA, /已续跑本地子代理 zcode/)
-    const startB = await tool('squad_start').execute({ goal: 'gB', acceptance: 'aB', agents: ['codex'] }, exec)
+    assert.match(resumeTaskA, /已续跑本地子代理 worker1/)
+    const startB = await tool('squad_start').execute({ goal: 'gB', acceptance: 'aB', agents: ['brain'] }, exec)
     const taskB = /任务 (t-\S+) 已创建/.exec(startB)[1]
     // Task B has a brain participant: approve its PLAN before implementing.
     const taskBDir = join(workspace, '.agent-squad', taskB)
     await writeFile(join(taskBDir, 'PLAN.md'), '# PLAN B\n', 'utf8')
     await tool('squad_approve_plan').execute({ task_id: taskB }, exec)
     const resumeTaskAExplicit = await tool('squad_dispatch').execute(
-      { agent: 'zcode', message: 'explicit A resume', phase: 'implement', task_id: firstTaskId },
+      { agent: 'worker1', message: 'explicit A resume', phase: 'implement', task_id: firstTaskId },
       exec,
     )
-    assert.match(resumeTaskAExplicit, /已续跑本地子代理 zcode/)
+    assert.match(resumeTaskAExplicit, /已续跑本地子代理 worker1/)
     host.markRunning(firstChild)
     const stateBPath = join(workspace, '.agent-squad', taskB, 'STATE.json')
     const stateBBefore = await readFile(stateBPath, 'utf8')
     const activationsBefore = host.activations.length
     await assert.rejects(
       tool('squad_dispatch').execute(
-        { agent: 'zcode', message: 'dispatch on B', phase: 'implement' },
+        { agent: 'worker1', message: 'dispatch on B', phase: 'implement' },
         exec,
       ),
       /在任务 .+ 中仍有运行中的本地子代理/,
@@ -768,7 +800,7 @@ test('T03 dispatch reads fresh settings and routes external/local/team executors
     await settingsStore.save({
       expectedRevision: snapshot.revision,
       agents: snapshot.agents.map((agent) =>
-        agent.id === 'zcode' ? { ...agent, executor: 'external', model: 'mock-ext' } : agent,
+        agent.id === 'worker1' ? { ...agent, executor: 'external', model: 'mock-ext' } : agent,
       ),
       worktree: snapshot.worktree,
     })
@@ -778,16 +810,16 @@ test('T03 dispatch reads fresh settings and routes external/local/team executors
     await settingsStore.save({
       expectedRevision: snapshot.revision,
       agents: snapshot.agents.map((agent) =>
-        agent.id === 'qoder' ? { ...agent, role: 'worker' } : agent,
+        agent.id === 'front1' ? { ...agent, role: 'worker' } : agent,
       ),
       worktree: snapshot.worktree,
     })
     const resumeOutput = await tool('squad_dispatch').execute(
-      { agent: 'qoder', message: 'resume as worker', phase: 'implement', task_id: firstTaskId },
+      { agent: 'front1', message: 'resume as worker', phase: 'implement', task_id: firstTaskId },
       exec,
     )
-    assert.match(resumeOutput, /已续跑 qoder \[worker\]/)
-    assert.match(host.sections.at(-1), /qoder.*worker 角色/s)
+    assert.match(resumeOutput, /已续跑 front1 \[worker\]/)
+    assert.match(host.sections.at(-1), /front1.*worker 角色/s)
     {
       const resumeText = host.sent.at(-1).content.map((block) => block.text).join('')
       assertSEM(resumeText)
@@ -809,12 +841,12 @@ test('T03 dispatch reads fresh settings and routes external/local/team executors
     await settingsStore.save({
       expectedRevision: snapshot.revision,
       agents: snapshot.agents.map((agent) =>
-        agent.id === 'zcode' ? { ...agent, executor: 'external', model: 'p2/m9' } : agent,
+        agent.id === 'worker1' ? { ...agent, executor: 'external', model: 'p2/m9' } : agent,
       ),
       worktree: snapshot.worktree,
     })
     const local3 = await tool('squad_dispatch').execute(
-      { agent: 'zcode', message: 'next', phase: 'implement', background: false },
+      { agent: 'worker1', message: 'next', phase: 'implement', background: false },
       exec,
     )
     assert.match(local3, /已外部派发/)
@@ -824,10 +856,10 @@ test('T03 dispatch reads fresh settings and routes external/local/team executors
     {
       const before = host.members.length
       const out = await tool('squad_dispatch').execute(
-        { agent: 'zcode', message: 'one-shot probe', phase: 'implement', background: false },
+        { agent: 'worker1', message: 'one-shot probe', phase: 'implement', background: false },
         exec,
       )
-      assert.match(out, /已外部派发 zcode \(zcode\).*provider=p2\/m9（一次性，不续跑）/)
+      assert.match(out, /已外部派发 worker1 \(worker1\).*provider=p2\/m9（一次性，不续跑）/)
       const act = host.activations.at(-1)
       assert.equal(act.provider, 'spawn')
       assert.deepEqual(act.agentOptions, { provider: 'p2', model: 'm9', maxTokens: 16384 })
@@ -837,21 +869,21 @@ test('T03 dispatch reads fresh settings and routes external/local/team executors
       const st = JSON.parse(
         await readFile(join(workspace, '.agent-squad', oneShotTask, 'STATE.json'), 'utf8'),
       )
-      assert.equal(st.children?.zcode, undefined)
+      assert.equal(st.children?.worker1, undefined)
       // Second dispatch is a brand-new activation (fresh context).
       await tool('squad_dispatch').execute(
-        { agent: 'zcode', message: 'one-shot again', phase: 'implement' },
+        { agent: 'worker1', message: 'one-shot again', phase: 'implement' },
         exec,
       )
       assert.notEqual(host.activations.at(-1).childId, act.childId)
     }
 
     // R09: roles edited after start cannot relax the acceptance gate snapshotted
-    // at task creation. A second task runs with only codex (brain) as the
-    // participant; afterwards codex becomes worker and qoder (not a
+    // at task creation. A second task runs with only brain (brain) as the
+    // participant; afterwards brain becomes worker and front1 (not a
     // participant) becomes brain — the gate still demands an approved REVIEW.
     const secondStart = await tool('squad_start').execute(
-      { goal: 'g2', acceptance: 'a2', agents: ['codex'] },
+      { goal: 'g2', acceptance: 'a2', agents: ['brain'] },
       exec,
     )
     const secondTaskId = /任务 (t-\S+) 已创建/.exec(secondStart)[1]
@@ -859,8 +891,8 @@ test('T03 dispatch reads fresh settings and routes external/local/team executors
     await settingsStore.save({
       expectedRevision: snapshot.revision,
       agents: snapshot.agents.map((agent) => {
-        if (agent.id === 'codex') return { ...agent, role: 'worker' }
-        if (agent.id === 'qoder') return { ...agent, role: 'brain' }
+        if (agent.id === 'brain') return { ...agent, role: 'worker' }
+        if (agent.id === 'front1') return { ...agent, role: 'brain' }
         return agent
       }),
       worktree: snapshot.worktree,
@@ -922,22 +954,22 @@ test('T03 dispatch reads fresh settings and routes external/local/team executors
       )
     }
 
-    // External dispatch through the real stub CLI: settings say qoder runs on
+    // External dispatch through the real stub CLI: settings say front1 runs on
     // the built-in provider with the custom command/mode/model.
     snapshot = await settingsStore.read()
     await settingsStore.save({
       expectedRevision: snapshot.revision,
       agents: snapshot.agents.map((agent) => {
-        if (agent.id === 'qoder') {
+        if (agent.id === 'front1') {
           return { ...agent, role: 'worker', executor: 'external', model: 'qoder-cli' }
         }
-        if (agent.id === 'codex') return { ...agent, role: 'brain' }
+        if (agent.id === 'brain') return { ...agent, role: 'brain' }
         return agent
       }),
       worktree: snapshot.worktree,
     })
     const qoderStart = await tool('squad_start').execute(
-      { goal: 'qoder test', acceptance: 'ok', agents: ['qoder'] },
+      { goal: 'front1 test', acceptance: 'ok', agents: ['front1'] },
       exec,
     )
     assert.match(qoderStart, /已创建/)
@@ -945,10 +977,10 @@ test('T03 dispatch reads fresh settings and routes external/local/team executors
     const spawnedBeforeQoder = host.spawned.length
     const runsBefore = host.runIds.length
     const qoderOut = await tool('squad_dispatch').execute(
-      { agent: 'qoder', message: 'qoder test', phase: 'implement', background: false },
+      { agent: 'front1', message: 'front1 test', phase: 'implement', background: false },
       exec,
     )
-    assert.match(qoderOut, /已外部派发 qoder/)
+    assert.match(qoderOut, /已外部派发 front1/)
     assert.match(qoderOut, /provider=qoder-cli/)
     assert.equal(host.activations.at(-1).provider, 'qoder-cli')
     const qoderPrompt = host.activations
@@ -966,10 +998,10 @@ test('T03 dispatch reads fresh settings and routes external/local/team executors
     assert.ok(stubArgs.includes('--allowed-tools'))
     assert.equal(stubArgs.at(-2), '-m')
     assert.equal(stubArgs.at(-1), 'm1')
-    assert.equal(await readFile(join(workspace, 'qoder-test-output.txt'), 'utf8'), 'ok\n')
+    assert.equal(await readFile(join(workspace, 'front1-test-output.txt'), 'utf8'), 'ok\n')
     // Second one-shot dispatch: fresh run id, still no sendMessage/spawnTeammate.
     await tool('squad_dispatch').execute(
-      { agent: 'qoder', message: 'qoder test again', phase: 'implement' },
+      { agent: 'front1', message: 'front1 test again', phase: 'implement' },
       exec,
     )
     assert.equal(host.activations.at(-1).provider, 'qoder-cli')
@@ -986,7 +1018,7 @@ test('T03 dispatch reads fresh settings and routes external/local/team executors
     qoderDispose() // idempotent no-op
 
     // Independent hosts: no subagents service is skipped; missing/blank/
-    // non-string qoder config falls back to the defaults AND the defaults
+    // non-string front1 config falls back to the defaults AND the defaults
     // actually reach the spawned command line. An isolated PATH stub named
     // `qoderclicn` captures the resolved script and argv — never a vendor CLI.
     {
@@ -996,13 +1028,13 @@ test('T03 dispatch reads fresh settings and routes external/local/team executors
       assert.equal(bare.providers.size, 0)
       await rm(bareRoot, { recursive: true, force: true })
 
-      const stubDir = await mkdtemp(join(tmpdir(), 'asq-qoder-bin-'))
+      const stubDir = await mkdtemp(join(tmpdir(), 'asq-front1-bin-'))
       const stubPath = join(stubDir, 'qoderclicn')
       await writeFile(
         stubPath,
         '#!/usr/bin/env node\n' +
           "const { writeFileSync } = require('node:fs')\n" +
-          "writeFileSync('qoder-default-output.txt', JSON.stringify({ script: process.argv[1], argv: process.argv.slice(2) }) + '\\n')\n",
+          "writeFileSync('front1-default-output.txt', JSON.stringify({ script: process.argv[1], argv: process.argv.slice(2) }) + '\\n')\n",
         'utf8',
       )
       await chmod(stubPath, 0o755)
@@ -1032,7 +1064,7 @@ test('T03 dispatch reads fresh settings and routes external/local/team executors
           })
           const result = await run.result
           assert.equal(result.stopReason, 'completed', label)
-          const captured = JSON.parse(await readFile(join(root, 'qoder-default-output.txt'), 'utf8'))
+          const captured = JSON.parse(await readFile(join(root, 'front1-default-output.txt'), 'utf8'))
           // The provider spawned the DEFAULT command, resolved to the PATH stub.
           assert.ok(captured.script.endsWith('/qoderclicn'), label)
           // Default permission mode, plus the headless toolchain pre-approvals
@@ -1080,90 +1112,90 @@ test('T04 validation rejects invalid rosters with field paths and HTTP refuses n
     description: '',
     ...patch,
   })
-  const architect = validAgent('gpt', { role: 'tester' })
-  const opencode = validAgent('opencode')
-  const four = (codex, zcode, qoder) => [codex, architect, zcode, qoder, opencode]
+  const architect = validAgent('tester', { role: 'tester' })
+  const worker2 = validAgent('worker2')
+  const four = (brain, worker1, front1) => [brain, architect, worker1, front1, worker2]
   const valid = (agents, worktree = { directory: '.agents/worktrees' }) =>
     validateAgentsAndWorktree(agents, worktree)
 
-  assert.equal(valid(four(validAgent('codex', { role: 'brain' }), validAgent('zcode'), validAgent('qoder'))).ok, true)
-  assert.equal(valid(four(validAgent('codex', { role: 'brain' }), validAgent('zcode'), validAgent('qoder'))).ok, true)
-  assert.equal(valid([validAgent('codex', { role: 'brain' }), validAgent('gpt', { role: 'tester', executor: 'local', model: 'openai/gpt-6.2-sol', reasoning: 'xhigh' }), validAgent('zcode'), validAgent('qoder'), opencode]).ok, true)
-  assert.equal(valid(four(validAgent('codex', { role: 'brain' }), validAgent('zcode'), validAgent('qoder', { role: 'tester' }))).ok, true)
+  assert.equal(valid(four(validAgent('brain', { role: 'brain' }), validAgent('worker1'), validAgent('front1'))).ok, true)
+  assert.equal(valid(four(validAgent('brain', { role: 'brain' }), validAgent('worker1'), validAgent('front1'))).ok, true)
+  assert.equal(valid([validAgent('brain', { role: 'brain' }), validAgent('tester', { role: 'tester', executor: 'local', model: 'openai/gpt-6.2-sol', reasoning: 'xhigh' }), validAgent('worker1'), validAgent('front1'), worker2]).ok, true)
+  assert.equal(valid(four(validAgent('brain', { role: 'brain' }), validAgent('worker1'), validAgent('front1', { role: 'tester' }))).ok, true)
 
   const cases = [
     {
       name: 'wrong count',
-      agents: [validAgent('codex', { role: 'brain' }), validAgent('zcode')],
+      agents: [validAgent('brain', { role: 'brain' }), validAgent('worker1')],
       field: 'agents',
       code: 'AGENT_COUNT',
     },
     {
       name: 'v1 three-agent roster is no longer a valid v2 shape',
-      agents: [validAgent('codex', { role: 'brain' }), validAgent('zcode'), validAgent('qoder')],
+      agents: [validAgent('brain', { role: 'brain' }), validAgent('worker1'), validAgent('front1')],
       field: 'agents',
       code: 'AGENT_COUNT',
     },
     {
       name: 'duplicate names',
       agents: four(
-        validAgent('codex', { role: 'brain', displayName: 'Same' }),
-        validAgent('zcode', { displayName: 'same' }),
-        validAgent('qoder'),
+        validAgent('brain', { role: 'brain', displayName: 'Same' }),
+        validAgent('worker1', { displayName: 'same' }),
+        validAgent('front1'),
       ),
-      field: 'agents.zcode.displayName',
+      field: 'agents.worker1.displayName',
       code: 'NAME_DUPLICATE',
     },
     {
       name: 'no brain',
-      agents: four(validAgent('codex'), validAgent('zcode'), validAgent('qoder')),
+      agents: four(validAgent('brain'), validAgent('worker1'), validAgent('front1')),
       field: 'agents',
       code: 'BRAIN_REQUIRED',
     },
     {
       name: 'bad executor',
-      agents: four(validAgent('codex', { role: 'brain', executor: 'magic' }), validAgent('zcode'), validAgent('qoder')),
-      field: 'agents.codex.executor',
+      agents: four(validAgent('brain', { role: 'brain', executor: 'magic' }), validAgent('worker1'), validAgent('front1')),
+      field: 'agents.brain.executor',
       code: 'EXECUTOR_INVALID',
     },
     {
       name: 'bad role on the architect slot',
-      agents: four(validAgent('codex', { role: 'brain' }), validAgent('zcode'), validAgent('qoder')).map((agent) =>
-        agent.id === 'gpt' ? { ...agent, role: 'wizard' } : agent,
+      agents: four(validAgent('brain', { role: 'brain' }), validAgent('worker1'), validAgent('front1')).map((agent) =>
+        agent.id === 'tester' ? { ...agent, role: 'wizard' } : agent,
       ),
-      field: 'agents.gpt.role',
+      field: 'agents.tester.role',
       code: 'ROLE_INVALID',
     },
     {
       name: 'unknown reasoning effort',
-      agents: four(validAgent('codex', { role: 'brain' }), validAgent('zcode'), validAgent('qoder')).map((agent) =>
-        agent.id === 'gpt' ? { ...agent, reasoning: 'extreme' } : agent,
+      agents: four(validAgent('brain', { role: 'brain' }), validAgent('worker1'), validAgent('front1')).map((agent) =>
+        agent.id === 'tester' ? { ...agent, reasoning: 'extreme' } : agent,
       ),
-      field: 'agents.gpt.reasoning',
+      field: 'agents.tester.reasoning',
       code: 'REASONING_INVALID',
     },
     {
       name: 'local model without provider',
-      agents: four(validAgent('codex', { role: 'brain' }), validAgent('zcode', { executor: 'local', model: 'nomodel' }), validAgent('qoder')),
-      field: 'agents.zcode.model',
+      agents: four(validAgent('brain', { role: 'brain' }), validAgent('worker1', { executor: 'local', model: 'nomodel' }), validAgent('front1')),
+      field: 'agents.worker1.model',
       code: 'MODEL_INVALID',
     },
     {
       name: 'changed id',
-      agents: four(validAgent('codex', { role: 'brain' }), validAgent('zcode'), validAgent('other')),
-      field: 'agents.qoder.id',
+      agents: four(validAgent('brain', { role: 'brain' }), validAgent('worker1'), validAgent('other')),
+      field: 'agents.front1.id',
       code: 'ID_READONLY',
     },
     {
       name: 'absolute directory',
-      agents: four(validAgent('codex', { role: 'brain' }), validAgent('zcode'), validAgent('qoder')),
+      agents: four(validAgent('brain', { role: 'brain' }), validAgent('worker1'), validAgent('front1')),
       worktree: { directory: '/abs' },
       field: 'worktree.directory',
       code: 'DIRECTORY_ABSOLUTE',
     },
     {
       name: 'traversal directory',
-      agents: four(validAgent('codex', { role: 'brain' }), validAgent('zcode'), validAgent('qoder')),
+      agents: four(validAgent('brain', { role: 'brain' }), validAgent('worker1'), validAgent('front1')),
       worktree: { directory: 'a/../..' },
       field: 'worktree.directory',
       code: 'DIRECTORY_TRAVERSAL',
@@ -1183,10 +1215,10 @@ test('T04 validation rejects invalid rosters with field paths and HTTP refuses n
   await assert.rejects(
     store.save({
       expectedRevision: current.revision,
-      agents: four(validAgent('codex', { role: 'brain', displayName: 'x' }), validAgent('zcode', { displayName: 'x' }), validAgent('qoder')),
+      agents: four(validAgent('brain', { role: 'brain', displayName: 'x' }), validAgent('worker1', { displayName: 'x' }), validAgent('front1')),
       worktree: current.worktree,
     }),
-    (error) => error.fields['agents.zcode.displayName'] === 'NAME_DUPLICATE',
+    (error) => error.fields['agents.worker1.displayName'] === 'NAME_DUPLICATE',
   )
   assert.equal((await store.read()).revision, current.revision)
 
@@ -1387,9 +1419,9 @@ test('T04 validation rejects invalid rosters with field paths and HTTP refuses n
     const putHandler = createRequestHandler({ store: putStore, models })
     const roster = (zcodeModel) =>
       four(
-        validAgent('codex', { role: 'brain', executor: 'external', model: 'mock-ext' }),
-        validAgent('zcode', { executor: 'external', model: zcodeModel }),
-        validAgent('qoder'),
+        validAgent('brain', { role: 'brain', executor: 'external', model: 'mock-ext' }),
+        validAgent('worker1', { executor: 'external', model: zcodeModel }),
+        validAgent('front1'),
       )
     const sendPut = async (agents, expectedRevision = 1) => {
       const payload = JSON.stringify({ expectedRevision, agents, worktree: current.worktree })
@@ -1418,11 +1450,11 @@ test('T04 validation rejects invalid rosters with field paths and HTTP refuses n
     // A pinned external model missing from the catalog is a field error.
     res = await sendPut(roster('zai-coding-cn/nope-9.9'), 2)
     assert.equal(res.statusCode, 400)
-    assert.equal(JSON.parse(res.body).error.fields['agents.zcode.model'], 'MODEL_NOT_FOUND')
+    assert.equal(JSON.parse(res.body).error.fields['agents.worker1.model'], 'MODEL_NOT_FOUND')
     // A bare external provider still requires registration.
     res = await sendPut(roster('not-registered'), 2)
     assert.equal(res.statusCode, 400)
-    assert.equal(JSON.parse(res.body).error.fields['agents.zcode.model'], 'PROVIDER_NOT_REGISTERED')
+    assert.equal(JSON.parse(res.body).error.fields['agents.worker1.model'], 'PROVIDER_NOT_REGISTERED')
   }
   // R01: full-form mapped loopback and ::1 spellings pass the guard.
   for (const remoteAddress of ['0:0:0:0:0:ffff:7f00:1', '0:0:0:0:0:0:0:0001']) {
@@ -1463,7 +1495,7 @@ test('T05 concurrent saves on one revision yield a single winner and one 409', a
   const base = await storeA.read()
   const make = (name) => ({
     expectedRevision: base.revision,
-    agents: base.agents.map((agent) => (agent.id === 'zcode' ? { ...agent, displayName: name } : agent)),
+    agents: base.agents.map((agent) => (agent.id === 'worker1' ? { ...agent, displayName: name } : agent)),
     worktree: base.worktree,
   })
   // Two instances over the same file share the module-level queue (R03).
@@ -1477,14 +1509,14 @@ test('T05 concurrent saves on one revision yield a single winner and one 409', a
   // R02: the 409 carries the current (winning) settings for the client.
   assert.equal(conflict.current.revision, base.revision + 1)
   assert.equal(
-    conflict.current.agents.find((agent) => agent.id === 'zcode').displayName,
-    outcomes[0].value.agents.find((agent) => agent.id === 'zcode').displayName,
+    conflict.current.agents.find((agent) => agent.id === 'worker1').displayName,
+    outcomes[0].value.agents.find((agent) => agent.id === 'worker1').displayName,
   )
   const finalSettings = await storeB.read()
   assert.equal(finalSettings.revision, base.revision + 1)
   assert.equal(
-    finalSettings.agents.find((agent) => agent.id === 'zcode').displayName,
-    outcomes[0].value.agents.find((agent) => agent.id === 'zcode').displayName,
+    finalSettings.agents.find((agent) => agent.id === 'worker1').displayName,
+    outcomes[0].value.agents.find((agent) => agent.id === 'worker1').displayName,
   )
   await rm(root, { recursive: true, force: true })
 })
@@ -1638,10 +1670,10 @@ test('T07 plan gate: lead review, design budget, squad_approve_plan, archives an
           version: 2,
           revision: 1,
           agents: [
-            { id: 'codex', displayName: 'codex', role: 'brain', executor: 'external', model: 'mock-ext', description: 'b' },
-            { id: 'gpt', displayName: 'gpt', role: 'tester', executor: 'team', model: '', description: 'a' },
-            { id: 'zcode', displayName: 'zcode', role: 'worker', executor: 'local', model: 'p/m1', description: 'w' },
-            { id: 'qoder', displayName: 'qoder', role: 'worker', executor: 'team', model: '', description: 'w2' },
+            { id: 'brain', displayName: 'brain', role: 'brain', executor: 'external', model: 'mock-ext', description: 'b' },
+            { id: 'tester', displayName: 'tester', role: 'tester', executor: 'team', model: '', description: 'a' },
+            { id: 'worker1', displayName: 'worker1', role: 'worker', executor: 'local', model: 'p/m1', description: 'w' },
+            { id: 'front1', displayName: 'front1', role: 'worker', executor: 'team', model: '', description: 'w2' },
           ],
           worktree: { directory: '.agents/worktrees' },
         },
@@ -1673,7 +1705,7 @@ test('T07 plan gate: lead review, design budget, squad_approve_plan, archives an
     apply(host.ctx, { workerProbe: false, agents: BUNDLE_AGENTS })
     const tool = (name) => host.registered.find((entry) => entry.definition.name === name).definition
     const lead = { id: 'lead-1', session: { id: 'session-1' }, __membership: { role: 'lead', name: 'lead' } }
-    const teammate = { id: 'te-1', __membership: { role: 'teammate', name: 'zcode' } }
+    const teammate = { id: 'te-1', __membership: { role: 'teammate', name: 'worker1' } }
     const exec = { agent: lead, signal: undefined }
 
     // --- AC3: registration, opt-in gate and Lead-only visibility ------------
@@ -1702,7 +1734,7 @@ test('T07 plan gate: lead review, design budget, squad_approve_plan, archives an
     assert.match(await tool('squad_enable').execute({}, exec), /已启用/)
 
     // --- AC1: snapshot initialization (no architect → legacy gates) ---------
-    const startA = await tool('squad_start').execute({ goal: 'g', acceptance: 'a', agents: ['codex', 'zcode', 'qoder'] }, exec)
+    const startA = await tool('squad_start').execute({ goal: 'g', acceptance: 'a', agents: ['brain', 'worker1', 'front1'] }, exec)
     const taskA = /任务 (t-\S+) 已创建/.exec(startA)[1]
     const dirA = join(workspace, '.agent-squad', taskA)
     const readState = async (task) =>
@@ -1715,19 +1747,19 @@ test('T07 plan gate: lead review, design budget, squad_approve_plan, archives an
     assert.equal(stateA.flow, 'full')
     assert.equal(stateA.specRequired, false) // no architect → downgraded gates
     assert.equal(stateA.gate.reviewRequired, true) // gate untouched
-    assert.deepEqual(stateA.gate.brainIds, ['codex'])
+    assert.deepEqual(stateA.gate.brainIds, ['brain'])
 
     // --- AC4: unapproved implement/rework are refused with no side effects --
     const dispatch = (args) => tool('squad_dispatch').execute(args, exec)
     const activationsBefore = host.activations.length
-    await assert.rejects(dispatch({ agent: 'zcode', message: 'x', phase: 'implement' }), /squad_approve_plan/)
-    await assert.rejects(dispatch({ agent: 'zcode', message: 'x', phase: 'rework' }), /squad_approve_plan/)
+    await assert.rejects(dispatch({ agent: 'worker1', message: 'x', phase: 'implement' }), /squad_approve_plan/)
+    await assert.rejects(dispatch({ agent: 'worker1', message: 'x', phase: 'rework' }), /squad_approve_plan/)
     await assert.rejects(stat(join(dirA, 'BRIEF.md')))
     assert.deepEqual(await readState(taskA), stateA)
     assert.equal(host.activations.length, activationsBefore)
 
     // --- AC2: design budget = initial + 3 rework rounds = 4 dispatches ------
-    const design = (message) => dispatch({ agent: 'codex', message, phase: 'design' })
+    const design = (message) => dispatch({ agent: 'brain', message, phase: 'design' })
     const lastDispatch = async (task) => (await readState(task)).dispatches.at(-1)
     const assertRound = async (n) => {
       const state = await readState(taskA)
@@ -1796,8 +1828,8 @@ test('T07 plan gate: lead review, design budget, squad_approve_plan, archives an
     await writeFile(join(dirA, 'PLAN.md'), '# UNAPPROVED DRAFT\n', 'utf8')
 
     // --- AC4: independence after approval ------------------------------------
-    assert.match(await dispatch({ agent: 'zcode', message: 'impl', phase: 'implement' }), /本地子代理 zcode/)
-    assert.match(await dispatch({ agent: 'zcode', message: 'fix', phase: 'rework' }), /本地子代理 zcode/)
+    assert.match(await dispatch({ agent: 'worker1', message: 'impl', phase: 'implement' }), /本地子代理 worker1/)
+    assert.match(await dispatch({ agent: 'worker1', message: 'fix', phase: 'rework' }), /本地子代理 worker1/)
     assert.equal(await readFile(join(dirA, 'PLAN-APPROVED.md'), 'utf8'), '# PLAN FINAL\n')
     assertSEM(host.activations.at(-1).prompt.map((block) => block.text).join(''))
     assertSEM(host.sent.at(-1).content.map((block) => block.text).join(''))
@@ -1819,8 +1851,8 @@ test('T07 plan gate: lead review, design budget, squad_approve_plan, archives an
     // call) and the approved archive + REVIEW verdict are untouched.
     skipPlan = true
     assert.match(
-      await dispatch({ agent: 'codex', message: 'review', phase: 'review' }),
-      /已外部派发 codex/,
+      await dispatch({ agent: 'brain', message: 'review', phase: 'review' }),
+      /已外部派发 brain/,
     )
     skipPlan = false
     assertSEM(host.activations.at(-1).prompt.map((block) => block.text).join(''))
@@ -1833,7 +1865,7 @@ test('T07 plan gate: lead review, design budget, squad_approve_plan, archives an
 
     // --- AC3: approve rejections (missing PLAN, zero rounds, closed task) ----
     await assert.rejects(tool('squad_approve_plan').execute({ task_id: 't-nope' }, exec), /未知小队任务/)
-    const startB = await tool('squad_start').execute({ goal: 'b', acceptance: 'b', agents: ['codex'] }, exec)
+    const startB = await tool('squad_start').execute({ goal: 'b', acceptance: 'b', agents: ['brain'] }, exec)
     const taskB = /任务 (t-\S+) 已创建/.exec(startB)[1]
     const dirB = join(workspace, '.agent-squad', taskB)
     await assert.rejects(tool('squad_approve_plan').execute({ task_id: taskB }, exec), /PLAN\.md/)
@@ -1843,7 +1875,7 @@ test('T07 plan gate: lead review, design budget, squad_approve_plan, archives an
     assert.ok(!(await readdir(dirB)).includes('PLAN-R0.md')) // no R0 archive
 
     // Archive failure keeps the task unapproved.
-    const startC = await tool('squad_start').execute({ goal: 'c', acceptance: 'c', agents: ['codex'] }, exec)
+    const startC = await tool('squad_start').execute({ goal: 'c', acceptance: 'c', agents: ['brain'] }, exec)
     const taskC = /任务 (t-\S+) 已创建/.exec(startC)[1]
     const dirC = join(workspace, '.agent-squad', taskC)
     await design('c1')
@@ -1853,11 +1885,11 @@ test('T07 plan gate: lead review, design budget, squad_approve_plan, archives an
     await rm(join(dirC, 'PLAN-APPROVED.md'), { recursive: true, force: true })
 
     // --- AC1: no-brain exemption ----------------------------------------------
-    const startD = await tool('squad_start').execute({ goal: 'd', acceptance: 'd', agents: ['zcode', 'qoder'] }, exec)
+    const startD = await tool('squad_start').execute({ goal: 'd', acceptance: 'd', agents: ['worker1', 'front1'] }, exec)
     const taskD = /任务 (t-\S+) 已创建/.exec(startD)[1]
     assert.equal((await readState(taskD)).planRequired, false)
-    assert.match(await dispatch({ agent: 'zcode', message: 'impl', phase: 'implement' }), /本地子代理 zcode/)
-    assert.match(await dispatch({ agent: 'zcode', message: 'fix', phase: 'rework' }), /本地子代理 zcode/)
+    assert.match(await dispatch({ agent: 'worker1', message: 'impl', phase: 'implement' }), /本地子代理 worker1/)
+    assert.match(await dispatch({ agent: 'worker1', message: 'fix', phase: 'rework' }), /本地子代理 worker1/)
     // Exempt task's BRIEF still carries the exemption line (E).
     const briefD = await readFile(join(workspace, '.agent-squad', taskD, 'BRIEF.md'), 'utf8')
     assert.ok(briefD.includes(E_TEXT))
@@ -1866,7 +1898,7 @@ test('T07 plan gate: lead review, design budget, squad_approve_plan, archives an
     await assert.rejects(tool('squad_approve_plan').execute({ task_id: taskD }, exec), /已经收尾/)
 
     // --- AC1: legacy STATE fallback -------------------------------------------
-    const startE = await tool('squad_start').execute({ goal: 'e', acceptance: 'e', agents: ['codex'] }, exec)
+    const startE = await tool('squad_start').execute({ goal: 'e', acceptance: 'e', agents: ['brain'] }, exec)
     const taskE = /任务 (t-\S+) 已创建/.exec(startE)[1]
     const stateEPath = join(workspace, '.agent-squad', taskE, 'STATE.json')
     const stripPlan = (state, mutate) => {
@@ -1879,17 +1911,17 @@ test('T07 plan gate: lead review, design budget, squad_approve_plan, archives an
     }
     // gate true → plan still required
     await stripPlan(JSON.parse(await readFile(stateEPath, 'utf8')))
-    await assert.rejects(dispatch({ agent: 'zcode', message: 'x', phase: 'implement' }), /squad_approve_plan/)
+    await assert.rejects(dispatch({ agent: 'worker1', message: 'x', phase: 'implement' }), /squad_approve_plan/)
     // gate explicitly false → exempt
     await stripPlan(JSON.parse(await readFile(stateEPath, 'utf8')), (state) => {
       state.gate.reviewRequired = false
     })
-    assert.match(await dispatch({ agent: 'zcode', message: 'x', phase: 'implement' }), /本地子代理 zcode/)
+    assert.match(await dispatch({ agent: 'worker1', message: 'x', phase: 'implement' }), /本地子代理 worker1/)
     // gate missing → conservative (required)
     await stripPlan(JSON.parse(await readFile(stateEPath, 'utf8')), (state) => {
       delete state.gate
     })
-    await assert.rejects(dispatch({ agent: 'zcode', message: 'x', phase: 'implement' }), /squad_approve_plan/)
+    await assert.rejects(dispatch({ agent: 'worker1', message: 'x', phase: 'implement' }), /squad_approve_plan/)
 
     // --- AC5: local/team design archives only at approve time -----------------
     const { createSettingsStore } = await import('../settings.js')
@@ -1897,14 +1929,14 @@ test('T07 plan gate: lead review, design budget, squad_approve_plan, archives an
     let snapshot = await settingsStore.read()
     await settingsStore.save({
       expectedRevision: snapshot.revision,
-      agents: snapshot.agents.map((agent) => (agent.id === 'qoder' ? { ...agent, role: 'brain' } : agent)),
+      agents: snapshot.agents.map((agent) => (agent.id === 'front1' ? { ...agent, role: 'brain' } : agent)),
       worktree: snapshot.worktree,
     })
-    const startF = await tool('squad_start').execute({ goal: 'f', acceptance: 'f', agents: ['qoder'] }, exec)
+    const startF = await tool('squad_start').execute({ goal: 'f', acceptance: 'f', agents: ['front1'] }, exec)
     const taskF = /任务 (t-\S+) 已创建/.exec(startF)[1]
     const dirF = join(workspace, '.agent-squad', taskF)
-    const designF = await dispatch({ agent: 'qoder', message: 'team design', phase: 'design' })
-    assert.match(designF, /已创建 qoder \[brain\]/)
+    const designF = await dispatch({ agent: 'front1', message: 'team design', phase: 'design' })
+    assert.match(designF, /已创建 front1 \[brain\]/)
     assert.equal((await readState(taskF)).planRounds, 1) // counted on delivery
     assert.ok(!(await readdir(dirF)).includes('PLAN-R1.md')) // archived only at approve
     await writeFile(join(dirF, 'PLAN.md'), '# TEAM PLAN\n', 'utf8')
@@ -1928,7 +1960,7 @@ test('T07 plan gate: lead review, design budget, squad_approve_plan, archives an
 
     // --- AC1: roster edits after start cannot relax the plan gate ------------
     const startG = await tool('squad_start').execute(
-      { goal: 'g2', acceptance: 'a2', agents: ['codex'] },
+      { goal: 'g2', acceptance: 'a2', agents: ['brain'] },
       exec,
     )
     const taskG = /任务 (t-\S+) 已创建/.exec(startG)[1]
@@ -1936,14 +1968,14 @@ test('T07 plan gate: lead review, design budget, squad_approve_plan, archives an
     await settingsStore.save({
       expectedRevision: snapshot.revision,
       agents: snapshot.agents.map((agent) => {
-        if (agent.id === 'codex') return { ...agent, role: 'worker' }
-        if (agent.id === 'qoder') return { ...agent, role: 'brain' }
+        if (agent.id === 'brain') return { ...agent, role: 'worker' }
+        if (agent.id === 'front1') return { ...agent, role: 'brain' }
         return agent
       }),
       worktree: snapshot.worktree,
     })
-    await assert.rejects(dispatch({ agent: 'zcode', message: 'x', phase: 'implement' }), /squad_approve_plan/)
-    await assert.rejects(dispatch({ agent: 'zcode', message: 'x', phase: 'rework' }), /squad_approve_plan/)
+    await assert.rejects(dispatch({ agent: 'worker1', message: 'x', phase: 'implement' }), /squad_approve_plan/)
+    await assert.rejects(dispatch({ agent: 'worker1', message: 'x', phase: 'rework' }), /squad_approve_plan/)
 
     // --- AC6: the generated TASK.md protocol distinguishes the two approvals --
     const taskMd = await readFile(join(dirA, 'TASK.md'), 'utf8')
@@ -2012,7 +2044,7 @@ test('T07 plan gate: lead review, design budget, squad_approve_plan, archives an
       'LEAD step 4 sentence missing',
     )
     assert.ok(
-      leadSeg.includes('5. 派 brain（codex），phase="spec"：读取 PLAN-APPROVED.md，发布技术规格 SPEC.md'),
+      leadSeg.includes('5. 派 brain，phase="spec"：读取 PLAN-APPROVED.md，发布技术规格 SPEC.md'),
       'LEAD step 5 sentence missing',
     )
     for (const item of [...BRAIN_ITEMS, ...TESTER_ITEMS, S_TEXT, E_TEXT, M_TEXT]) {
@@ -2052,7 +2084,7 @@ test('T07 plan gate: lead review, design budget, squad_approve_plan, archives an
 })
 
 /** T08 — qoder-cli provider: arg builder defaults/overrides and full process lifecycle. */
-test('T08 qoder provider builds args and handles process lifecycle', async () => {
+test('T08 front1 provider builds args and handles process lifecycle', async () => {
   const { createQoderProvider, buildQoderArgs } = await import('../qoder.js')
   const { PassThrough } = await import('node:stream')
   const { EventEmitter, getEventListeners } = await import('node:events')
@@ -2202,7 +2234,7 @@ test('T08 qoder provider builds args and handles process lifecycle', async () =>
   })
   assert.match(run1.run.id, UUID_RE)
   const customProvider = createQoderProvider({
-    command: '/tmp/qoder',
+    command: '/tmp/front1',
     permissionMode: 'custom',
     model: 'm1',
     addDirs: [],
@@ -2210,7 +2242,7 @@ test('T08 qoder provider builds args and handles process lifecycle', async () =>
     spawnImpl,
   })
   const run2 = await startRun(customProvider)
-  assert.equal(spawnCalls.at(-1).command, '/tmp/qoder')
+  assert.equal(spawnCalls.at(-1).command, '/tmp/front1')
   assert.deepEqual(spawnCalls.at(-1).args, [
     '-p', 'A\nB', '-w', '/tmp/a b', '--permission-mode', 'custom', '-m', 'm1',
   ])
@@ -2492,12 +2524,12 @@ async function writeSquadSettings(dshHome, qoderExecutor) {
         version: 2,
         revision: 1,
         agents: [
-          { id: 'codex', displayName: 'codex', role: 'brain', executor: 'external', model: 'mock-ext', description: 'b' },
-          { id: 'gpt', displayName: 'gpt', role: 'tester', executor: 'team', model: '', description: 'a' },
-          { id: 'zcode', displayName: 'zcode', role: 'worker', executor: 'local', model: 'p/m1', description: 'w' },
+          { id: 'brain', displayName: 'brain', role: 'brain', executor: 'external', model: 'mock-ext', description: 'b' },
+          { id: 'tester', displayName: 'tester', role: 'tester', executor: 'team', model: '', description: 'a' },
+          { id: 'worker1', displayName: 'worker1', role: 'worker', executor: 'local', model: 'p/m1', description: 'w' },
           {
-            id: 'qoder',
-            displayName: 'qoder',
+            id: 'front1',
+            displayName: 'front1',
             role: 'worker',
             executor: qoderExecutor ?? 'team',
             model: qoderExecutor === 'external' ? 'qoder-cli' : '',
@@ -2581,7 +2613,7 @@ test('T09 multi-repository lifecycle, validation, rollback and compatibility', a
         const startOutput = await tool('squad_start').execute(
           // No architect participant → legacy gates; the spec/tech-review
           // pipeline is T11's scope.
-          { goal: 'multi', acceptance: 'ok', agents: ['codex', 'zcode', 'qoder'], repos: ['a/shared repo', repoB] },
+          { goal: 'multi', acceptance: 'ok', agents: ['brain', 'worker1', 'front1'], repos: ['a/shared repo', repoB] },
           exec,
         )
         const taskId = /任务 (t-\S+) 已创建/.exec(startOutput)[1]
@@ -2640,7 +2672,7 @@ test('T09 multi-repository lifecycle, validation, rollback and compatibility', a
 
         // external dispatch: request cwd is the task root; prompt lists repos.
         await tool('squad_dispatch').execute(
-          { agent: 'codex', message: 'review it', phase: 'review', background: false },
+          { agent: 'brain', message: 'review it', phase: 'review', background: false },
           exec,
         )
         assert.equal(host.activations.at(-1).cwd, taskRoot)
@@ -2650,7 +2682,7 @@ test('T09 multi-repository lifecycle, validation, rollback and compatibility', a
 
         // local dispatch: request cwd is the task root; prompt lists repos.
         await tool('squad_dispatch').execute(
-          { agent: 'zcode', message: 'implement', phase: 'implement' },
+          { agent: 'worker1', message: 'implement', phase: 'implement' },
           exec,
         )
         assert.equal(host.activations.at(-1).cwd, taskRoot)
@@ -2661,25 +2693,25 @@ test('T09 multi-repository lifecycle, validation, rollback and compatibility', a
         // team dispatch (new + resume): teammate cwd moves to the task root.
         const setsBefore = host.cwdCalls.filter((c) => c.op === 'set').length
         await tool('squad_dispatch').execute(
-          { agent: 'qoder', message: 'parallel', phase: 'implement' },
+          { agent: 'front1', message: 'parallel', phase: 'implement' },
           exec,
         )
         const spawnedPrompt = host.spawned.at(-1).prompt.map((b) => b.text).join('')
         assert.ok(spawnedPrompt.includes(`仓库：${repoA}`))
         assert.ok(host.cwdCalls.filter((c) => c.op === 'set').length > setsBefore)
         await tool('squad_dispatch').execute(
-          { agent: 'qoder', message: 'again', phase: 'implement' },
+          { agent: 'front1', message: 'again', phase: 'implement' },
           exec,
         )
         assert.ok(host.cwdCalls.some((c) => c.op === 'set' && c.directory === taskRoot))
 
         // qoder-cli external dispatch: -w is the task root, never --add-dir.
-        const stubDir = await mkdtemp(join(tmpdir(), 'asq-qoder-t9-'))
-        const stubPath = join(stubDir, 'qoder-argv.cjs')
+        const stubDir = await mkdtemp(join(tmpdir(), 'asq-front1-t9-'))
+        const stubPath = join(stubDir, 'front1-argv.cjs')
         await writeFile(
           stubPath,
           '#!/usr/bin/env node\n' +
-            "require('node:fs').writeFileSync('qoder-argv.json', JSON.stringify(process.argv.slice(2)))\n" +
+            "require('node:fs').writeFileSync('front1-argv.json', JSON.stringify(process.argv.slice(2)))\n" +
             "process.stdout.write('ARGV-WRITTEN')\n",
           'utf8',
         )
@@ -2691,10 +2723,10 @@ test('T09 multi-repository lifecycle, validation, rollback and compatibility', a
             host2.registered.find((entry) => entry.definition.name === name).definition
           await writeSquadSettings(dshHome, 'external')
           const qoderOut = await tool2('squad_dispatch').execute(
-            { agent: 'qoder', message: 'argv probe', phase: 'review', task_id: taskId, background: false },
+            { agent: 'front1', message: 'argv probe', phase: 'review', task_id: taskId, background: false },
             exec,
           )
-          const argv = JSON.parse(await readFile(join(taskRoot, 'qoder-argv.json'), 'utf8'))
+          const argv = JSON.parse(await readFile(join(taskRoot, 'front1-argv.json'), 'utf8'))
           const wIndex = argv.indexOf('-w')
           assert.equal(argv[wIndex + 1], taskRoot)
           // Toolchain dirs may be pre-approved, but never the sibling worktrees:
@@ -3173,15 +3205,15 @@ test('T09 multi-repository lifecycle, validation, rollback and compatibility', a
       }
     })
 
-    // --- finish (PLAN §34; live-qoder §36 via ASQ_LIVE_QODER) ----------------
+    // --- finish (PLAN §34; live-front1 §36 via ASQ_LIVE_QODER) ----------------
     await labeled('finish', async () => {
       const caller = join(root, 's4-caller')
       await mkdir(caller, { recursive: true })
       const repoK = await makeGitRepo(root, 's4-k/repo-k', 'base A', { 'hello.txt': 'before\n' })
       const repoL = await makeGitRepo(root, 's4-l/repo-l', 'base B', { 'hello.txt': 'before\n' })
       const live = process.env.ASQ_LIVE_QODER === '1'
-      const stubDir = await mkdtemp(join(tmpdir(), 'asq-qoder-hello-'))
-      const stubPath = join(stubDir, 'qoder-hello.cjs')
+      const stubDir = await mkdtemp(join(tmpdir(), 'asq-front1-hello-'))
+      const stubPath = join(stubDir, 'front1-hello.cjs')
       await writeFile(
         stubPath,
         [
@@ -3216,9 +3248,9 @@ test('T09 multi-repository lifecycle, validation, rollback and compatibility', a
       const baseA = await gitOut(repoK, ['rev-parse', 'HEAD'])
       const baseB = await gitOut(repoL, ['rev-parse', 'HEAD'])
       try {
-        // Main flow: one qoder dispatch edits both hello.txt files.
+        // Main flow: one front1 dispatch edits both hello.txt files.
         const startOutput = await tool('squad_start').execute(
-          { goal: 'two repos', acceptance: 'ok', agents: ['qoder'], repos: [repoK, repoL] },
+          { goal: 'two repos', acceptance: 'ok', agents: ['front1'], repos: [repoK, repoL] },
           { agent: lead, signal: undefined },
         )
         const taskId = /任务 (t-\S+) 已创建/.exec(startOutput)[1]
@@ -3229,7 +3261,7 @@ test('T09 multi-repository lifecycle, validation, rollback and compatibility', a
         try {
           await tool('squad_dispatch').execute(
             {
-              agent: 'qoder',
+              agent: 'front1',
               message: '只把任务根下两个 worktree 里的 hello.txt 分别改为 A\\n（1-repo-k）与 B\\n（2-repo-l）；不要提交，不要改其他文件。',
               phase: 'implement',
               background: false, // this test asserts the files right after the run
@@ -3275,7 +3307,7 @@ test('T09 multi-repository lifecycle, validation, rollback and compatibility', a
 
         // Dirty + clean → committed / no-change.
         const startMixed = await tool('squad_start').execute(
-          { goal: 'mixed', acceptance: 'ok', agents: ['qoder'], repos: [repoK, repoL] },
+          { goal: 'mixed', acceptance: 'ok', agents: ['front1'], repos: [repoK, repoL] },
           { agent: lead, signal: undefined },
         )
         const taskMixed = /任务 (t-\S+) 已创建/.exec(startMixed)[1]
@@ -3297,7 +3329,7 @@ test('T09 multi-repository lifecycle, validation, rollback and compatibility', a
         const toolAC = (name) =>
           hostAC.registered.find((entry) => entry.definition.name === name).definition
         const startAC = await toolAC('squad_start').execute(
-          { goal: 'no commit', acceptance: 'ok', agents: ['qoder'], repos: [repoK, repoL] },
+          { goal: 'no commit', acceptance: 'ok', agents: ['front1'], repos: [repoK, repoL] },
           { agent: lead, signal: undefined },
         )
         const taskAC = /任务 (t-\S+) 已创建/.exec(startAC)[1]
@@ -3319,7 +3351,7 @@ test('T09 multi-repository lifecycle, validation, rollback and compatibility', a
         await writeFile(hookPath, '#!/bin/sh\nexit 1\n', 'utf8')
         await chmod(hookPath, 0o755)
         const startHook = await tool('squad_start').execute(
-          { goal: 'hook', acceptance: 'ok', agents: ['qoder'], repos: [repoK, repoL] },
+          { goal: 'hook', acceptance: 'ok', agents: ['front1'], repos: [repoK, repoL] },
           { agent: lead, signal: undefined },
         )
         const taskHook = /任务 (t-\S+) 已创建/.exec(startHook)[1]
@@ -3363,7 +3395,7 @@ test('T09 multi-repository lifecycle, validation, rollback and compatibility', a
           apply(failureHost.ctx, { workerProbe: false, agents: BUNDLE_AGENTS, worktreeAutoCommit: mode !== 'status' })
           const failureTool = (name) => failureHost.registered.find((entry) => entry.definition.name === name).definition
           const started = await failureTool('squad_start').execute(
-            { goal: mode, acceptance: 'ok', agents: ['qoder'], repos: [repoK, repoL] },
+            { goal: mode, acceptance: 'ok', agents: ['front1'], repos: [repoK, repoL] },
             { agent: lead, signal: undefined },
           )
           const id = /任务 (t-\S+) 已创建/.exec(started)[1]
@@ -3466,7 +3498,7 @@ test('T09 multi-repository lifecycle, validation, rollback and compatibility', a
       // Explicit single repository: no slug layer, cwd = worktree, memory
       // inside the worktree.
       const startSingle = await tool('squad_start').execute(
-        { goal: 'single', acceptance: 'ok', agents: ['qoder'], repos: [repoM] },
+        { goal: 'single', acceptance: 'ok', agents: ['front1'], repos: [repoM] },
         exec,
       )
       const singleId = /任务 (t-\S+) 已创建/.exec(startSingle)[1]
@@ -3489,7 +3521,7 @@ test('T09 multi-repository lifecycle, validation, rollback and compatibility', a
       // Omitted repos in a Git directory: identical single-repository layout.
       currentDir = repoN
       const startOmitted = await tool('squad_start').execute(
-        { goal: 'omitted', acceptance: 'ok', agents: ['qoder'] },
+        { goal: 'omitted', acceptance: 'ok', agents: ['front1'] },
         exec,
       )
       const omittedId = /任务 (t-\S+) 已创建/.exec(startOmitted)[1]
@@ -3526,10 +3558,10 @@ test('T09 multi-repository lifecycle, validation, rollback and compatibility', a
       assert.ok(legacyStatus.includes(omittedRoot))
       assert.match(
         await tool('squad_dispatch').execute(
-          { agent: 'qoder', message: 'legacy implement', phase: 'implement', task_id: omittedId },
+          { agent: 'front1', message: 'legacy implement', phase: 'implement', task_id: omittedId },
           exec,
         ),
-        /已创建 qoder/,
+        /已创建 front1/,
       )
       const legacyFinish = await tool('squad_finish').execute(
         { summary: 'legacy' },
@@ -3571,10 +3603,10 @@ test('T10 budget extension requires user confirmation and resumes exhausted budg
           version: 2,
           revision: 1,
           agents: [
-            { id: 'codex', displayName: 'codex', role: 'brain', executor: 'external', model: 'mock-ext', description: 'b' },
-            { id: 'gpt', displayName: 'gpt', role: 'tester', executor: 'team', model: '', description: 'a' },
-            { id: 'zcode', displayName: 'zcode', role: 'worker', executor: 'local', model: 'p/m1', description: 'w' },
-            { id: 'qoder', displayName: 'qoder', role: 'worker', executor: 'team', model: '', description: 'w2' },
+            { id: 'brain', displayName: 'brain', role: 'brain', executor: 'external', model: 'mock-ext', description: 'b' },
+            { id: 'tester', displayName: 'tester', role: 'tester', executor: 'team', model: '', description: 'a' },
+            { id: 'worker1', displayName: 'worker1', role: 'worker', executor: 'local', model: 'p/m1', description: 'w' },
+            { id: 'front1', displayName: 'front1', role: 'worker', executor: 'team', model: '', description: 'w2' },
           ],
           worktree: { directory: '.agents/worktrees' },
         },
@@ -3602,19 +3634,19 @@ test('T10 budget extension requires user confirmation and resumes exhausted budg
     apply(host.ctx, { workerProbe: false, agents: BUNDLE_AGENTS })
     const tool = (name) => host.registered.find((entry) => entry.definition.name === name).definition
     const lead = { id: 'lead-1', session: { id: 'session-1' }, __membership: { role: 'lead', name: 'lead' } }
-    const teammate = { id: 'te-1', __membership: { role: 'teammate', name: 'zcode' } }
+    const teammate = { id: 'te-1', __membership: { role: 'teammate', name: 'worker1' } }
     const exec = { agent: lead, signal: undefined }
     await tool('squad_enable').execute({}, exec)
     const extend = (args, caller = exec) => tool('squad_extend').execute(args, caller)
     const dispatch = (args) => tool('squad_dispatch').execute(args, exec)
     const design = (message, task_id) =>
-      dispatch({ agent: 'codex', message, phase: 'design', ...(task_id ? { task_id } : {}) })
-    const rework = (message) => dispatch({ agent: 'zcode', message, phase: 'rework' })
+      dispatch({ agent: 'brain', message, phase: 'design', ...(task_id ? { task_id } : {}) })
+    const rework = (message) => dispatch({ agent: 'worker1', message, phase: 'rework' })
     const startTask = async (goal) => {
       // No architect participant → legacy gates: T10 exercises the single
       // implement quota and the design/implement extension kinds.
       const out = await tool('squad_start').execute(
-        { goal, acceptance: 'ok', agents: ['codex', 'zcode', 'qoder'] },
+        { goal, acceptance: 'ok', agents: ['brain', 'worker1', 'front1'] },
         exec,
       )
       return /任务 (t-\S+) 已创建/.exec(out)[1]
@@ -3794,7 +3826,7 @@ test('T10 budget extension requires user confirmation and resumes exhausted budg
       }
       // E10: a finished task; the rejection leaves the DONE task untouched.
       const doneStart = await tool('squad_start').execute(
-        { goal: 'done task', acceptance: 'ok', agents: ['zcode', 'qoder'] },
+        { goal: 'done task', acceptance: 'ok', agents: ['worker1', 'front1'] },
         exec,
       )
       const doneTask = /任务 (t-\S+) 已创建/.exec(doneStart)[1]
@@ -3945,7 +3977,7 @@ test('T10 budget extension requires user confirmation and resumes exhausted budg
       )
       await design('d4')
       await tool('squad_approve_plan').execute({ task_id: task }, exec)
-      await dispatch({ agent: 'zcode', message: 'impl', phase: 'implement' })
+      await dispatch({ agent: 'worker1', message: 'impl', phase: 'implement' })
       await rework('rw1')
       await rework('rw2')
       // design 4/4 is exhausted; implement 2/3 is not → E11 for implement.
@@ -4078,7 +4110,7 @@ test('T10 budget extension requires user confirmation and resumes exhausted budg
       assert.match(await readFile(join(dir, 'JOURNAL.md'), 'utf8'), /设计轮次 8\/8/)
       const designBefore = await readState(task)
       // A plain implement does not consume the rework budget.
-      await dispatch({ agent: 'zcode', message: 'impl', phase: 'implement' })
+      await dispatch({ agent: 'worker1', message: 'impl', phase: 'implement' })
       assert.equal((await readState(task)).reworkRounds, 0)
       // Rework 1–3: same local child id, round reaches 4.
       await rework('rw1')
@@ -4127,7 +4159,7 @@ test('T10 budget extension requires user confirmation and resumes exhausted budg
       await noSide(
         task,
         () => design('late'),
-        `任务 ${task} 的 PLAN 已批准（${state.planApprovedAt}）：不能再派 design 返工，请派 brain（codex）发布技术规格（phase="spec"）。`,
+        `任务 ${task} 的 PLAN 已批准（${state.planApprovedAt}）：不能再派 design 返工，请派 brain 发布技术规格（phase="spec"）。`,
       )
     })
 
@@ -4294,8 +4326,8 @@ test('T11 full flow: opt-in gate, spec/tech-review pipeline, dual acceptance, ta
   const dshHome = await tempRoot()
   const restoreDshHome = useFixtureDshHome(dshHome)
   try {
-    // Roster: codex external brain, gpt local architect (pinned p/arch),
-    // zcode local worker (p/m1), qoder team worker.
+    // Roster: brain external brain, tester local architect (pinned p/arch),
+    // worker1 local worker (p/m1), front1 team worker.
     const settingsPath = join(dshHome, 'agent-squad', 'settings.json')
     await mkdir(join(dshHome, 'agent-squad'), { recursive: true })
     await writeFile(
@@ -4305,10 +4337,10 @@ test('T11 full flow: opt-in gate, spec/tech-review pipeline, dual acceptance, ta
           version: 2,
           revision: 1,
           agents: [
-            { id: 'codex', displayName: 'codex', role: 'brain', executor: 'external', model: 'mock-ext', description: 'b' },
-            { id: 'gpt', displayName: 'gpt', role: 'tester', executor: 'local', model: 'p/arch', description: 'a' },
-            { id: 'zcode', displayName: 'zcode', role: 'worker', executor: 'local', model: 'p/m1', description: 'w' },
-            { id: 'qoder', displayName: 'qoder', role: 'worker', executor: 'team', model: '', description: 'w2' },
+            { id: 'brain', displayName: 'brain', role: 'brain', executor: 'external', model: 'mock-ext', description: 'b' },
+            { id: 'tester', displayName: 'tester', role: 'tester', executor: 'local', model: 'p/arch', description: 'a' },
+            { id: 'worker1', displayName: 'worker1', role: 'worker', executor: 'local', model: 'p/m1', description: 'w' },
+            { id: 'front1', displayName: 'front1', role: 'worker', executor: 'team', model: '', description: 'w2' },
           ],
           worktree: { directory: '.agents/worktrees' },
         },
@@ -4354,23 +4386,23 @@ test('T11 full flow: opt-in gate, spec/tech-review pipeline, dual acceptance, ta
       assert.equal(whenOf('squad_enable')({ agent: lead }), false)
     }
 
-    // --- default roster seeds qoder as the frontend developer ---------------
+    // --- default roster seeds front1 as the frontend developer ---------------
     {
       const { createSettingsStore, DEFAULT_AGENTS } = await import('../settings.js')
       const fresh = createSettingsStore({ filePath: join(dshHome, 'seed-probe', 'settings.json') })
       const seeded = await fresh.read()
-      assert.equal(seeded.agents.find((agent) => agent.id === 'gpt').role, 'tester')
-      assert.equal(seeded.agents.find((agent) => agent.id === 'gpt').model, DEFAULT_AGENTS.find((agent) => agent.id === 'gpt').model)
-      const qoder = seeded.agents.find((agent) => agent.id === 'qoder')
-      assert.equal(qoder.role, 'worker')
-      assert.match(qoder.description, /固定负责前端页面交互设计、实现与自测，不做后端/)
-      const zcode = seeded.agents.find((agent) => agent.id === 'zcode')
-      assert.match(zcode.description, /主力后端 worker/)
+      assert.equal(seeded.agents.find((agent) => agent.id === 'tester').role, 'tester')
+      assert.equal(seeded.agents.find((agent) => agent.id === 'tester').model, DEFAULT_AGENTS.find((agent) => agent.id === 'tester').model)
+      const front1 = seeded.agents.find((agent) => agent.id === 'front1')
+      assert.equal(front1.role, 'worker')
+      assert.match(front1.description, /固定负责前端页面交互设计、实现与自测，不做后端/)
+      const worker1 = seeded.agents.find((agent) => agent.id === 'worker1')
+      assert.match(worker1.description, /主力后端 worker/)
       // Worker is fixed to the three worker-role members; architect opts out.
-      for (const id of ['codex', 'gpt']) {
+      for (const id of ['brain', 'tester']) {
         assert.equal(seeded.agents.find((agent) => agent.id === id).worker, false)
       }
-      for (const id of ['zcode', 'qoder', 'opencode']) {
+      for (const id of ['worker1', 'front1', 'worker2']) {
         assert.equal(seeded.agents.find((agent) => agent.id === id).worker, true)
       }
     }
@@ -4393,9 +4425,9 @@ test('T11 full flow: opt-in gate, spec/tech-review pipeline, dual acceptance, ta
     }
 
     // design → PLAN.md (external), spec gated until the Lead approves.
-    await dispatch({ agent: 'codex', message: 'plan', phase: 'design' })
+    await dispatch({ agent: 'brain', message: 'plan', phase: 'design' })
     await assert.rejects(
-      dispatch({ agent: 'codex', message: 'early spec', phase: 'spec' }),
+      dispatch({ agent: 'brain', message: 'early spec', phase: 'spec' }),
       /业务方案（PLAN\.md）尚未经 Lead 审核批准/,
     )
     await tool('squad_approve_plan').execute({ task_id: taskF }, exec)
@@ -4404,12 +4436,12 @@ test('T11 full flow: opt-in gate, spec/tech-review pipeline, dual acceptance, ta
     // (the design-round BRIEF stays byte-identical through the refusal).
     const briefAfterDesign = await readFile(join(dirF, 'BRIEF.md'), 'utf8')
     assert.match(briefAfterDesign, /phase=design/)
-    await assert.rejects(dispatch({ agent: 'zcode', message: 's', phase: 'spec' }), /spec 阶段只能派 brain（codex）——技术设计与技术规格由 brain 负责；zcode 当前是 worker。/)
-    await assert.rejects(dispatch({ agent: 'gpt', message: 's', phase: 'spec' }), /spec 阶段只能派 brain（codex）——技术设计与技术规格由 brain 负责；gpt 当前是 tester。/)
+    await assert.rejects(dispatch({ agent: 'worker1', message: 's', phase: 'spec' }), /spec 阶段只能派 brain——技术设计与技术规格由 brain 负责；worker1 当前是 worker。/)
+    await assert.rejects(dispatch({ agent: 'tester', message: 's', phase: 'spec' }), /spec 阶段只能派 brain——技术设计与技术规格由 brain 负责；tester 当前是 tester。/)
     assert.equal(await readFile(join(dirF, 'BRIEF.md'), 'utf8'), briefAfterDesign)
-    // codex (external mock) publishes the spec; the file exists for archiving.
+    // brain (external mock) publishes the spec; the file exists for archiving.
     await writeFile(join(dirF, 'SPEC.md'), '# SPEC F\n', 'utf8')
-    const specOut = await dispatch({ agent: 'codex', message: 'write SPEC', phase: 'spec' })
+    const specOut = await dispatch({ agent: 'brain', message: 'write SPEC', phase: 'spec' })
     assert.match(specOut, /\[brain\] provider=mock-ext/)
     assert.match(specOut, /specVersion=1/)
     assert.match(specOut, /不需要 Lead 再审批/)
@@ -4420,75 +4452,75 @@ test('T11 full flow: opt-in gate, spec/tech-review pipeline, dual acceptance, ta
     const startG0 = await tool('squad_start').execute({ goal: 'G', acceptance: 'ok' }, exec)
     const taskG = /任务 (t-\S+) 已创建/.exec(startG0)[1]
     const dirG = join(workspace, '.agent-squad', taskG)
-    await dispatch({ agent: 'codex', message: 'plan G', phase: 'design' })
+    await dispatch({ agent: 'brain', message: 'plan G', phase: 'design' })
     await tool('squad_approve_plan').execute({ task_id: taskG }, exec)
     await assert.rejects(
-      dispatch({ agent: 'zcode', message: 'too early', phase: 'implement' }),
-      /技术规格尚未交付：先派 brain（codex）phase="spec" 发布 SPEC\.md，再派 implement；规格发布后即可派工，不需要 Lead 再审批。/,
+      dispatch({ agent: 'worker1', message: 'too early', phase: 'implement' }),
+      /技术规格尚未交付：先派 brain phase="spec" 发布 SPEC\.md，再派 implement；规格发布后即可派工，不需要 Lead 再审批。/,
     )
     await writeFile(join(dirG, 'SPEC.md'), '# SPEC G\n', 'utf8')
-    await dispatch({ agent: 'codex', message: 'spec G', phase: 'spec' })
-    await dispatch({ agent: 'zcode', message: 'impl', phase: 'implement' })
+    await dispatch({ agent: 'brain', message: 'spec G', phase: 'spec' })
+    await dispatch({ agent: 'worker1', message: 'impl', phase: 'implement' })
     let stateG = await readState(taskG)
     assert.equal(stateG.codeEpoch, 1)
-    assert.deepEqual(stateG.implementers, ['zcode'])
+    assert.deepEqual(stateG.implementers, ['worker1'])
 
     // test-review gates tech-review: a missing/stale TEST-REVIEW refuses it.
-    await assert.rejects(dispatch({ agent: 'codex', message: 'tr', phase: 'tech-review' }), /测试验收未通过或已失效：技术验收前必须先有仍然新鲜的测试验收（TEST-REVIEW\.md 以 VERDICT: APPROVED 结束，且验收后代码\/规格未再变动）。先派 gpt phase="test-review"。/)
-    await assert.rejects(dispatch({ agent: 'zcode', message: 'tstr', phase: 'test-review' }), /test-review 只能派 tester（gpt）；zcode 当前是 worker。/)
-    // gpt is a pinned local child: the first test-review spawn carries the model options.
+    await assert.rejects(dispatch({ agent: 'brain', message: 'tr', phase: 'tech-review' }), /测试验收未通过或已失效：技术验收前必须先有仍然新鲜的测试验收（TEST-REVIEW\.md 以 VERDICT: APPROVED 结束，且验收后代码\/规格未再变动）。先派 tester phase="test-review"。/)
+    await assert.rejects(dispatch({ agent: 'worker1', message: 'tstr', phase: 'test-review' }), /test-review 只能派 tester；worker1 当前是 worker。/)
+    // tester is a pinned local child: the first test-review spawn carries the model options.
     await writeVerdict(taskG, 'TEST-REVIEW.md', 'APPROVED')
-    const testOut = await dispatch({ agent: 'gpt', message: 'review tests', phase: 'test-review' })
-    assert.match(testOut, /已创建本地子代理 gpt \[tester\] model=p\/arch/)
+    const testOut = await dispatch({ agent: 'tester', message: 'review tests', phase: 'test-review' })
+    assert.match(testOut, /已创建本地子代理 tester \[tester\] model=p\/arch/)
     assert.deepEqual(host.activations.at(-1).agentOptions, { provider: 'p', model: 'arch', maxTokens: 16384 })
     assert.match(testOut, /testReview: codeEpoch=1 specVersion=1/)
     assert.ok(await stat(join(dirG, 'TEST-REVIEW-R1.md')))
     // tech-review: needs implementation; default brain; workers refused.
     await writeVerdict(taskG, 'TECH-REVIEW.md', 'APPROVED')
-    await assert.rejects(dispatch({ agent: 'zcode', message: 'tr', phase: 'tech-review' }), /tech-review 默认派 brain（codex）；brain 已在本任务写代码时改派 tester（gpt）代签；zcode 当前是 worker（已在本任务写代码，不能签署自己改动的技术验收）。/)
+    await assert.rejects(dispatch({ agent: 'worker1', message: 'tr', phase: 'tech-review' }), /tech-review 默认派 brain；brain 已在本任务写代码时改派 tester 代签；worker1 当前是 worker（已在本任务写代码，不能签署自己改动的技术验收）。/)
     // business review: refused until a FRESH technical approval exists.
-    await assert.rejects(dispatch({ agent: 'codex', message: 'br', phase: 'review' }), /技术验收未通过或已失效.*先派 tech-review。/s)
-    // qoder is a worker: the full-flow business review is brain-only.
-    await assert.rejects(dispatch({ agent: 'qoder', message: 'br', phase: 'review' }), /完整流程的业务验收只能派 brain 角色；qoder 当前是 worker。/)
+    await assert.rejects(dispatch({ agent: 'brain', message: 'br', phase: 'review' }), /技术验收未通过或已失效.*先派 tech-review。/s)
+    // front1 is a worker: the full-flow business review is brain-only.
+    await assert.rejects(dispatch({ agent: 'front1', message: 'br', phase: 'review' }), /完整流程的业务验收只能派 brain 角色；front1 当前是 worker。/)
 
     // --- task F continues: tech failure → rework → fresh gates --------------
     // (current.json now points at G, so every F dispatch passes task_id.)
-    await dispatch({ agent: 'zcode', message: 'impl F', phase: 'implement', task_id: taskF })
+    await dispatch({ agent: 'worker1', message: 'impl F', phase: 'implement', task_id: taskF })
     await writeVerdict(taskF, 'TEST-REVIEW.md', 'APPROVED')
-    await dispatch({ agent: 'gpt', message: 'test 1', phase: 'test-review', task_id: taskF })
+    await dispatch({ agent: 'tester', message: 'test 1', phase: 'test-review', task_id: taskF })
     await writeVerdict(taskF, 'TECH-REVIEW.md', 'CHANGES_REQUESTED')
-    await dispatch({ agent: 'codex', message: 'tech 1', phase: 'tech-review', task_id: taskF })
+    await dispatch({ agent: 'brain', message: 'tech 1', phase: 'tech-review', task_id: taskF })
     let stateF = await readState(taskF)
     assert.equal(stateF.lastTechVerdict, 'CHANGES_REQUESTED')
     assert.equal(stateF.techReview.codeEpoch, stateF.codeEpoch)
     assert.ok(await stat(join(dirF, 'TECH-REVIEW-R1.md'))) // round-numbered archive
     // rework kind inference: fresh failing tech → tech rework (quota shared
-    // across zcode AND qoder).
-    const reworkQoder = await dispatch({ agent: 'qoder', message: 'fix frontend', phase: 'rework', task_id: taskF })
+    // across worker1 AND front1).
+    const reworkQoder = await dispatch({ agent: 'front1', message: 'fix frontend', phase: 'rework', task_id: taskF })
     assert.match(reworkQoder, /rework: tech=1\/3 business=0\/3/)
     stateF = await readState(taskF)
     assert.equal(stateF.techReworkRounds, 1)
     assert.equal(stateF.codeEpoch, 2) // implement(1) + rework(2)
-    assert.deepEqual(stateF.implementers, ['zcode', 'qoder'])
+    assert.deepEqual(stateF.implementers, ['worker1', 'front1'])
     assert.equal(stateF.dispatches.at(-1).reworkKind, 'tech')
     // business review still refused: the tech binding went stale after rework.
-    await assert.rejects(dispatch({ agent: 'codex', message: 'br', phase: 'review', task_id: taskF }), /旧结论已因代码\/规格变动失效，需重新验收/)
+    await assert.rejects(dispatch({ agent: 'brain', message: 'br', phase: 'review', task_id: taskF }), /旧结论已因代码\/规格变动失效，需重新验收/)
     // no pending failing acceptance → rework refused.
-    await assert.rejects(dispatch({ agent: 'zcode', message: 'nothing', phase: 'rework', task_id: taskF }), /没有待返工的验收结论/)
+    await assert.rejects(dispatch({ agent: 'worker1', message: 'nothing', phase: 'rework', task_id: taskF }), /没有待返工的验收结论/)
     // fresh tech approval → business review records its own binding.
     await writeVerdict(taskF, 'TEST-REVIEW.md', 'APPROVED')
-    await dispatch({ agent: 'gpt', message: 'test 2', phase: 'test-review', task_id: taskF })
+    await dispatch({ agent: 'tester', message: 'test 2', phase: 'test-review', task_id: taskF })
     await writeVerdict(taskF, 'TECH-REVIEW.md', 'APPROVED')
-    await dispatch({ agent: 'codex', message: 'tech 2', phase: 'tech-review', task_id: taskF })
+    await dispatch({ agent: 'brain', message: 'tech 2', phase: 'tech-review', task_id: taskF })
     await writeVerdict(taskF, 'REVIEW.md', 'CHANGES_REQUESTED')
-    await dispatch({ agent: 'codex', message: 'business 1', phase: 'review', task_id: taskF })
+    await dispatch({ agent: 'brain', message: 'business 1', phase: 'review', task_id: taskF })
     stateF = await readState(taskF)
     assert.equal(stateF.lastVerdict, 'CHANGES_REQUESTED')
     assert.equal(stateF.businessReview.codeEpoch, stateF.codeEpoch)
     // finish: needs BOTH acceptances; business failure blocks it.
     await assert.rejects(tool('squad_finish').execute({ summary: 'no', task_id: taskF }, exec), /CHANGES_REQUESTED/)
     // business rework: inferred from the fresh failing business acceptance.
-    await dispatch({ agent: 'zcode', message: 'fix business', phase: 'rework', task_id: taskF })
+    await dispatch({ agent: 'worker1', message: 'fix business', phase: 'rework', task_id: taskF })
     stateF = await readState(taskF)
     assert.equal(stateF.businessReworkRounds, 1)
     assert.equal(stateF.dispatches.at(-1).reworkKind, 'business')
@@ -4496,33 +4528,33 @@ test('T11 full flow: opt-in gate, spec/tech-review pipeline, dual acceptance, ta
     await writeVerdict(taskF, 'REVIEW.md', 'APPROVED')
     await assert.rejects(tool('squad_finish').execute({ summary: 'no', task_id: taskF }, exec), /技术验收结论已失效/)
     await writeVerdict(taskF, 'TEST-REVIEW.md', 'APPROVED')
-    await dispatch({ agent: 'gpt', message: 'test 3', phase: 'test-review', task_id: taskF })
+    await dispatch({ agent: 'tester', message: 'test 3', phase: 'test-review', task_id: taskF })
     await writeVerdict(taskF, 'TECH-REVIEW.md', 'APPROVED')
-    await dispatch({ agent: 'codex', message: 'tech 3', phase: 'tech-review', task_id: taskF })
-    await dispatch({ agent: 'codex', message: 'business 2', phase: 'review', task_id: taskF })
+    await dispatch({ agent: 'brain', message: 'tech 3', phase: 'tech-review', task_id: taskF })
+    await dispatch({ agent: 'brain', message: 'business 2', phase: 'review', task_id: taskF })
     stateF = await readState(taskF)
-    assert.equal(stateF.techReview.reviewer, 'codex')
-    assert.equal(stateF.businessReview.reviewer, 'codex')
+    assert.equal(stateF.techReview.reviewer, 'brain')
+    assert.equal(stateF.businessReview.reviewer, 'brain')
     assert.equal(stateF.techReview.codeEpoch, stateF.codeEpoch)
     assert.equal(stateF.businessReview.codeEpoch, stateF.codeEpoch)
     assert.equal(stateF.techReworkRounds, 1)
     assert.equal(stateF.businessReworkRounds, 1)
     assert.match(await tool('squad_finish').execute({ summary: 'F done', task_id: taskF }, exec), /收尾/)
 
-    // --- task H: architect takeover + self-sign ban + codex dual signing ----
+    // --- task H: architect takeover + self-sign ban + brain dual signing ----
     const startH = await tool('squad_start').execute({ goal: 'H', acceptance: 'ok' }, exec)
     const taskH = /任务 (t-\S+) 已创建/.exec(startH)[1]
-    await dispatch({ agent: 'codex', message: 'plan H', phase: 'design' })
+    await dispatch({ agent: 'brain', message: 'plan H', phase: 'design' })
     await tool('squad_approve_plan').execute({ task_id: taskH }, exec)
     const dirH = join(workspace, '.agent-squad', taskH)
     await writeFile(join(dirH, 'SPEC.md'), '# SPEC H\n', 'utf8')
-    await dispatch({ agent: 'codex', message: 'spec H', phase: 'spec' })
+    await dispatch({ agent: 'brain', message: 'spec H', phase: 'spec' })
     // The tester no longer implements by default (worker is fixed to
-    // zcode/opencode/qoder): the takeover first refuses, then succeeds after
+    // worker1/worker2/front1): the takeover first refuses, then succeeds after
     // an explicit worker opt-in.
     await assert.rejects(
-      dispatch({ agent: 'gpt', message: 'gpt implements', phase: 'implement' }),
-      /完整流程的 implement 需要 worker 能力：gpt（tester）的 worker 能力未启用/,
+      dispatch({ agent: 'tester', message: 'tester implements', phase: 'implement' }),
+      /完整流程的 implement 需要 worker 能力：tester 的 worker 能力未启用/,
     )
     {
       const { createSettingsStore } = await import('../settings.js')
@@ -4530,64 +4562,64 @@ test('T11 full flow: opt-in gate, spec/tech-review pipeline, dual acceptance, ta
       const snap = await takeoverStore.read()
       await takeoverStore.save({
         expectedRevision: snap.revision,
-        agents: snap.agents.map((agent) => (agent.id === 'gpt' ? { ...agent, worker: true } : agent)),
+        agents: snap.agents.map((agent) => (agent.id === 'tester' ? { ...agent, worker: true } : agent)),
         worktree: snap.worktree,
         leaderWorker: snap.leaderWorker ?? false,
       })
     }
-    await dispatch({ agent: 'gpt', message: 'gpt implements', phase: 'implement' })
+    await dispatch({ agent: 'tester', message: 'tester implements', phase: 'implement' })
     stateG = await readState(taskH)
-    assert.deepEqual(stateG.implementers, ['gpt'])
+    assert.deepEqual(stateG.implementers, ['tester'])
     assert.equal(stateG.codeEpoch, 1)
-    // Self-sign ban: gpt (implemented) cannot sign the technical acceptance.
+    // Self-sign ban: tester (implemented) cannot sign the technical acceptance.
     await writeVerdict(taskH, 'TEST-REVIEW.md', 'APPROVED')
-    await dispatch({ agent: 'gpt', message: 'test H', phase: 'test-review' })
+    await dispatch({ agent: 'tester', message: 'test H', phase: 'test-review' })
     await writeVerdict(taskH, 'TECH-REVIEW.md', 'APPROVED')
     await assert.rejects(
-      dispatch({ agent: 'gpt', message: 'self sign', phase: 'tech-review' }),
-      /tech-review 默认派 brain（codex）；brain 已在本任务写代码时改派 tester（gpt）代签；gpt 当前是 tester（已在本任务写代码，不能签署自己改动的技术验收）。/,
+      dispatch({ agent: 'tester', message: 'self sign', phase: 'tech-review' }),
+      /tech-review 默认派 brain；brain 已在本任务写代码时改派 tester 代签；tester 当前是 tester（已在本任务写代码，不能签署自己改动的技术验收）。/,
     )
-    // codex signs BOTH acceptances as two independent records.
-    await dispatch({ agent: 'codex', message: 'tech on behalf', phase: 'tech-review' })
+    // brain signs BOTH acceptances as two independent records.
+    await dispatch({ agent: 'brain', message: 'tech on behalf', phase: 'tech-review' })
     stateG = await readState(taskH)
-    assert.equal(stateG.techReview.reviewer, 'codex')
+    assert.equal(stateG.techReview.reviewer, 'brain')
     await writeVerdict(taskH, 'REVIEW.md', 'APPROVED')
-    await dispatch({ agent: 'codex', message: 'business', phase: 'review' })
+    await dispatch({ agent: 'brain', message: 'business', phase: 'review' })
     // H is the current task: status renders the full-flow state.
     const statusH = await tool('squad_status').execute({}, exec)
     assert.match(statusH, /flow=full/)
     assert.match(statusH, /specPublished=true  specVersion=1/)
-    assert.match(statusH, /技术验收：新鲜  verdict=APPROVED  reviewer=codex（TECH-REVIEW\.md）/)
-    assert.match(statusH, /业务验收：新鲜  verdict=APPROVED  reviewer=codex（REVIEW\.md）/)
+    assert.match(statusH, /技术验收：新鲜  verdict=APPROVED  reviewer=brain（TECH-REVIEW\.md）/)
+    assert.match(statusH, /业务验收：新鲜  verdict=APPROVED  reviewer=brain（REVIEW\.md）/)
     assert.match(statusH, /tech 上限=3 已用=0 剩余=3；business 上限=3 已用=0 剩余=3/)
-    assert.match(statusH, /implementers=gpt/)
+    assert.match(statusH, /implementers=tester/)
     assert.match(await tool('squad_finish').execute({ summary: 'H done', task_id: taskH }, exec), /收尾/)
 
     // --- task Q: tech quota shared, capped at 3, extended only by the user --
     const startQ = await tool('squad_start').execute({ goal: 'Q', acceptance: 'ok' }, exec)
     const taskQ = /任务 (t-\S+) 已创建/.exec(startQ)[1]
-    await dispatch({ agent: 'codex', message: 'plan Q', phase: 'design' })
+    await dispatch({ agent: 'brain', message: 'plan Q', phase: 'design' })
     await tool('squad_approve_plan').execute({ task_id: taskQ }, exec)
     const dirQ = join(workspace, '.agent-squad', taskQ)
     await writeFile(join(dirQ, 'SPEC.md'), '# SPEC Q\n', 'utf8')
-    await dispatch({ agent: 'codex', message: 'spec Q', phase: 'spec' })
-    await dispatch({ agent: 'zcode', message: 'impl Q', phase: 'implement' })
+    await dispatch({ agent: 'brain', message: 'spec Q', phase: 'spec' })
+    await dispatch({ agent: 'worker1', message: 'impl Q', phase: 'implement' })
     for (let round = 1; round <= 3; round += 1) {
       await writeVerdict(taskQ, 'TEST-REVIEW.md', 'APPROVED')
-      await dispatch({ agent: 'gpt', message: `test ${round}`, phase: 'test-review' })
+      await dispatch({ agent: 'tester', message: `test ${round}`, phase: 'test-review' })
       await writeVerdict(taskQ, 'TECH-REVIEW.md', 'CHANGES_REQUESTED')
-      await dispatch({ agent: 'codex', message: `tech ${round}`, phase: 'tech-review' })
-      const worker = round === 2 ? 'qoder' : 'zcode' // quota shared across workers
+      await dispatch({ agent: 'brain', message: `tech ${round}`, phase: 'tech-review' })
+      const worker = round === 2 ? 'front1' : 'worker1' // quota shared across workers
       await dispatch({ agent: worker, message: `fix ${round}`, phase: 'rework' })
       assert.equal((await readState(taskQ)).techReworkRounds, round)
     }
     await writeVerdict(taskQ, 'TEST-REVIEW.md', 'APPROVED')
-    await dispatch({ agent: 'gpt', message: 'test 4', phase: 'test-review' })
+    await dispatch({ agent: 'tester', message: 'test 4', phase: 'test-review' })
     await writeVerdict(taskQ, 'TECH-REVIEW.md', 'CHANGES_REQUESTED')
-    await dispatch({ agent: 'codex', message: 'tech 4', phase: 'tech-review' })
+    await dispatch({ agent: 'brain', message: 'tech 4', phase: 'tech-review' })
     const briefBefore = await readFile(join(dirG, 'BRIEF.md'), 'utf8').catch(() => undefined)
     await assert.rejects(
-      dispatch({ agent: 'zcode', message: '4th rework', phase: 'rework' }),
+      dispatch({ agent: 'worker1', message: '4th rework', phase: 'rework' }),
       /技术返工已达上限 3 轮（已用 3）。先向用户说明阻塞点与已完成部分并等待决策；用户同意后调用 squad_extend\(kind="tech", confirmed=true, reason="用户批准的追加理由"\) 追加轮次，再派 rework；用户拒绝或未回复时保持暂停，不得自动续跑。/,
     )
     // Full-flow tasks have no implement budget: the kind is flow-checked.
@@ -4601,12 +4633,12 @@ test('T11 full flow: opt-in gate, spec/tech-review pipeline, dual acceptance, ta
       await extendTool({ kind: 'tech', rounds: 1, reason: '用户同意再来一轮', confirmed: true }),
       /的 tech 预算已扩展：上限 3 → 4，已用 3，剩余 1（追加 1 轮）。/,
     )
-    await dispatch({ agent: 'zcode', message: '4th rework after consent', phase: 'rework' })
+    await dispatch({ agent: 'worker1', message: '4th rework after consent', phase: 'rework' })
     assert.equal((await readState(taskQ)).techReworkRounds, 4)
 
     // --- task S: simple flow skips the new gates entirely -------------------
     const startS = await tool('squad_start').execute(
-      { goal: 'S', acceptance: 'ok', flow: 'simple', agents: ['codex', 'zcode'] },
+      { goal: 'S', acceptance: 'ok', flow: 'simple', agents: ['brain', 'worker1'] },
       exec,
     )
     const taskS = /任务 (t-\S+) 已创建/.exec(startS)[1]
@@ -4614,13 +4646,13 @@ test('T11 full flow: opt-in gate, spec/tech-review pipeline, dual acceptance, ta
     const stateS = await readState(taskS)
     assert.equal(stateS.flow, 'simple')
     assert.equal(stateS.specRequired, false)
-    await assert.rejects(dispatch({ agent: 'gpt', message: 'no spec', phase: 'spec' }), /未启用完整流程/)
-    await dispatch({ agent: 'codex', message: 'plan S', phase: 'design' })
+    await assert.rejects(dispatch({ agent: 'tester', message: 'no spec', phase: 'spec' }), /未启用完整流程/)
+    await dispatch({ agent: 'brain', message: 'plan S', phase: 'design' })
     await tool('squad_approve_plan').execute({ task_id: taskS }, exec)
-    await dispatch({ agent: 'zcode', message: 'impl S', phase: 'implement' })
-    await assert.rejects(dispatch({ agent: 'gpt', message: 'no tech', phase: 'tech-review' }), /未启用完整流程/)
+    await dispatch({ agent: 'worker1', message: 'impl S', phase: 'implement' })
+    await assert.rejects(dispatch({ agent: 'tester', message: 'no tech', phase: 'tech-review' }), /未启用完整流程/)
     await writeVerdict(taskS, 'REVIEW.md', 'APPROVED')
-    await dispatch({ agent: 'codex', message: 'review S', phase: 'review' })
+    await dispatch({ agent: 'brain', message: 'review S', phase: 'review' })
     // Simple tasks keep the design/implement extension kinds; tech is refused.
     await assert.rejects(
       extendTool({ kind: 'tech', rounds: 1, reason: 'x', confirmed: true }),
@@ -4640,7 +4672,7 @@ test('T12 failover suspends a quota-exhausted tester and hands its duties to the
   const dshHome = await tempRoot()
   const restoreDshHome = useFixtureDshHome(dshHome)
   try {
-    // All-team roster: codex brain, gpt tester, zcode worker.
+    // All-team roster: brain brain, tester tester, worker1 worker.
     const settingsPath = join(dshHome, 'agent-squad', 'settings.json')
     await mkdir(join(dshHome, 'agent-squad'), { recursive: true })
     await writeFile(
@@ -4650,10 +4682,10 @@ test('T12 failover suspends a quota-exhausted tester and hands its duties to the
           version: 2,
           revision: 1,
           agents: [
-            { id: 'codex', displayName: 'codex', role: 'brain', executor: 'team', model: '', description: 'b' },
-            { id: 'gpt', displayName: 'gpt', role: 'tester', executor: 'team', model: '', description: 'a' },
-            { id: 'zcode', displayName: 'zcode', role: 'worker', executor: 'team', model: '', description: 'w' },
-            { id: 'qoder', displayName: 'qoder', role: 'worker', executor: 'team', model: '', description: 'w2' },
+            { id: 'brain', displayName: 'brain', role: 'brain', executor: 'team', model: '', description: 'b' },
+            { id: 'tester', displayName: 'tester', role: 'tester', executor: 'team', model: '', description: 'a' },
+            { id: 'worker1', displayName: 'worker1', role: 'worker', executor: 'team', model: '', description: 'w' },
+            { id: 'front1', displayName: 'front1', role: 'worker', executor: 'team', model: '', description: 'w2' },
           ],
           worktree: { directory: '.agents/worktrees' },
         },
@@ -4680,81 +4712,81 @@ test('T12 failover suspends a quota-exhausted tester and hands its duties to the
       writeFile(join(workspace, '.agent-squad', task, file), `# ${file}\n\n结论如上。\n\nVERDICT: ${verdict}\n`, 'utf8')
 
     // --- task F: manual suspension, handover gates, recovery ----------------
-    const taskF = await startTask('F', ['codex', 'gpt', 'zcode'])
+    const taskF = await startTask('F', ['brain', 'tester', 'worker1'])
     const dirF = join(workspace, '.agent-squad', taskF)
-    await dispatch({ agent: 'codex', message: 'plan', phase: 'design' })
+    await dispatch({ agent: 'brain', message: 'plan', phase: 'design' })
     await writeFile(join(dirF, 'PLAN.md'), '# PLAN F\n', 'utf8')
     await tool('squad_approve_plan').execute({ task_id: taskF }, exec)
 
     // The technical spec is the brain's own duty; the tester is refused.
-    await assert.rejects(dispatch({ agent: 'gpt', message: 's', phase: 'spec' }), /spec 阶段只能派 brain（codex）——技术设计与技术规格由 brain 负责；gpt 当前是 tester。/)
-    const specOut = await dispatch({ agent: 'codex', message: 'write spec', phase: 'spec' })
-    assert.match(specOut, /已(创建|续跑) codex \[brain\]/)
+    await assert.rejects(dispatch({ agent: 'tester', message: 's', phase: 'spec' }), /spec 阶段只能派 brain——技术设计与技术规格由 brain 负责；tester 当前是 tester。/)
+    const specOut = await dispatch({ agent: 'brain', message: 'write spec', phase: 'spec' })
+    assert.match(specOut, /已(创建|续跑) brain \[brain\]/)
     assert.ok(!/代行/.test(specOut), 'the brain spec round is its own duty, no acting marker')
     const stateSpec = JSON.parse(await readFile(join(dirF, 'STATE.json'), 'utf8'))
     assert.equal(stateSpec.specPublished, true)
     assert.equal(stateSpec.specVersion, 1)
     // Failover tool validation: reason required; only testers.
-    await assert.rejects(failover({ agent: 'gpt' }), /reason 必须是非空字符串/)
-    await assert.rejects(failover({ agent: 'zcode', reason: 'x' }), /仅测试验收者（tester）支持挂起交接（brain 代行测试验收）；zcode 当前是 worker/)
+    await assert.rejects(failover({ agent: 'tester' }), /reason 必须是非空字符串/)
+    await assert.rejects(failover({ agent: 'worker1', reason: 'x' }), /仅测试验收者（tester）支持挂起交接（brain 代行测试验收）；worker1 当前是 worker/)
     // Manual suspension persists and shows in status.
-    const suspendOut = await failover({ agent: 'gpt', reason: '额度耗尽（手动验证）' })
-    assert.match(suspendOut, /测试验收者 gpt 已挂起/)
-    assert.match(suspendOut, /squad_dispatch\({ agent: "codex", phase: "test-review", … }\)/)
+    const suspendOut = await failover({ agent: 'tester', reason: '额度耗尽（手动验证）' })
+    assert.match(suspendOut, /测试验收者 tester 已挂起/)
+    assert.match(suspendOut, /squad_dispatch\({ agent: "brain", phase: "test-review", … }\)/)
     assert.deepEqual(
       Object.keys(JSON.parse(await readFile(failoverPath, 'utf8')).suspended),
-      ['gpt'],
+      ['tester'],
     )
-    await assert.rejects(failover({ agent: 'gpt', reason: 'again' }), /已处于挂起状态/)
+    await assert.rejects(failover({ agent: 'tester', reason: 'again' }), /已处于挂起状态/)
     const statusSuspended = await tool('squad_status').execute({}, exec)
-    assert.match(statusSuspended, /挂起：gpt（自 .+；手动；原因：额度耗尽（手动验证））→ 测试验收职责由 brain 代行/)
+    assert.match(statusSuspended, /挂起：tester（自 .+；手动；原因：额度耗尽（手动验证））→ 测试验收职责由 brain 代行/)
     // Suspended tester refuses dispatch with handover guidance.
     await assert.rejects(
-      dispatch({ agent: 'gpt', message: 'tests', phase: 'test-review' }),
-      /gpt 已挂起.*测试验收职责由 brain 代行：squad_dispatch\({ agent: "codex", phase: "test-review", … }\).*squad_failover\({ agent: "gpt", recover: true }\)/s,
+      dispatch({ agent: 'tester', message: 'tests', phase: 'test-review' }),
+      /tester 已挂起.*测试验收职责由 brain 代行：squad_dispatch\({ agent: "brain", phase: "test-review", … }\).*squad_failover\({ agent: "tester", recover: true }\)/s,
     )
     // The brain covers test acceptance while the tester is suspended; the
     // dispatch return itself carries the acting marker for auditability.
-    await dispatch({ agent: 'zcode', message: 'impl', phase: 'implement' })
+    await dispatch({ agent: 'worker1', message: 'impl', phase: 'implement' })
     await writeVerdict(taskF, 'TEST-REVIEW.md', 'APPROVED')
-    const trOut = await dispatch({ agent: 'codex', message: 'test', phase: 'test-review' })
-    assert.match(trOut, /已续跑 codex \[brain\]/)
+    const trOut = await dispatch({ agent: 'brain', message: 'test', phase: 'test-review' })
+    assert.match(trOut, /已续跑 brain \[brain\]/)
     assert.match(trOut, /（代行测试验收职责：测试者挂起，交付 TEST-REVIEW\.md）/)
     const testPrompt = host.sent.at(-1).content.map((block) => block.text).join('')
     assert.match(testPrompt, /代行测试验收职责/)
     assert.match(testPrompt, /TEST-REVIEW\.md/)
     // tech-review stays the brain's own duty (no acting marker).
     await writeVerdict(taskF, 'TECH-REVIEW.md', 'APPROVED')
-    const techOut = await dispatch({ agent: 'codex', message: 'tech', phase: 'tech-review' })
+    const techOut = await dispatch({ agent: 'brain', message: 'tech', phase: 'tech-review' })
     assert.ok(!/代行/.test(techOut), 'regular brain tech-review carries no acting marker')
 
     // Recovery restores the tester and closes the acting gate.
-    const recoverOut = await failover({ agent: 'gpt', recover: true })
+    const recoverOut = await failover({ agent: 'tester', recover: true })
     assert.match(recoverOut, /已解除挂起/)
     assert.match(recoverOut, /test-review 重新派给它/)
     assert.deepEqual(JSON.parse(await readFile(failoverPath, 'utf8')).suspended, {})
-    await assert.rejects(failover({ agent: 'gpt', recover: true }), /未挂起，无需恢复/)
-    const gptTestAgain = await dispatch({ agent: 'gpt', message: 'test again', phase: 'test-review' })
-    assert.match(gptTestAgain, /已创建 gpt \[tester\]/)
+    await assert.rejects(failover({ agent: 'tester', recover: true }), /未挂起，无需恢复/)
+    const gptTestAgain = await dispatch({ agent: 'tester', message: 'test again', phase: 'test-review' })
+    assert.match(gptTestAgain, /已创建 tester \[tester\]/)
     assert.ok(!/代行/.test(gptTestAgain), 'regular tester dispatch carries no acting marker')
     const statusRestored = await tool('squad_status').execute({}, exec)
     assert.match(statusRestored, /挂起：无/)
 
     // --- auto-suspend: dispatch dies with a quota-like error ----------------
-    const taskG = await startTask('G', ['codex', 'gpt', 'zcode'])
+    const taskG = await startTask('G', ['brain', 'tester', 'worker1'])
     const dirG = join(workspace, '.agent-squad', taskG)
-    await dispatch({ agent: 'codex', message: 'plan', phase: 'design' })
+    await dispatch({ agent: 'brain', message: 'plan', phase: 'design' })
     await writeFile(join(dirG, 'PLAN.md'), '# PLAN G\n', 'utf8')
     await tool('squad_approve_plan').execute({ task_id: taskG }, exec)
-    await dispatch({ agent: 'codex', message: 'spec G', phase: 'spec' })
-    await dispatch({ agent: 'zcode', message: 'impl G', phase: 'implement' })
+    await dispatch({ agent: 'brain', message: 'spec G', phase: 'spec' })
+    await dispatch({ agent: 'worker1', message: 'impl G', phase: 'implement' })
     await writeVerdict(taskG, 'TEST-REVIEW.md', 'APPROVED')
     const originalStart = host.subagents.startActivation
     const originalSend = host.subagents.sendMessage
     const gptMemberId = host.members.find(
-      (member) => member.name === 'gpt' || String(member.name ?? '').endsWith('-gpt'),
+      (member) => member.name === 'tester' || String(member.name ?? '').endsWith('-tester'),
     )?.id
-    const isGptName = (name) => name === 'gpt' || String(name ?? '').endsWith('-gpt')
+    const isGptName = (name) => name === 'tester' || String(name ?? '').endsWith('-tester')
     const installQuotaThrow = (message) => {
       host.subagents.startActivation = async (spec) => {
         if (isGptName(spec.name)) throw new Error(message)
@@ -4768,68 +4800,68 @@ test('T12 failover suspends a quota-exhausted tester and hands its duties to the
     installQuotaThrow('HTTP 429 quota exceeded：账户额度耗尽')
     try {
       await assert.rejects(
-        dispatch({ agent: 'gpt', message: 'tests', phase: 'test-review' }),
+        dispatch({ agent: 'tester', message: 'tests', phase: 'test-review' }),
         (error) =>
           /额度耗尽/.test(error.message) &&
-          /gpt 已因额度问题自动挂起.*squad_dispatch\({ agent: "codex", phase: "test-review", … }\).*squad_failover\({ agent: "gpt", recover: true }\)/s.test(error.message),
+          /tester 已因额度问题自动挂起.*squad_dispatch\({ agent: "brain", phase: "test-review", … }\).*squad_failover\({ agent: "tester", recover: true }\)/s.test(error.message),
       )
     } finally {
       host.subagents.startActivation = originalStart
       host.subagents.sendMessage = originalSend
     }
-    const autoRecord = JSON.parse(await readFile(failoverPath, 'utf8')).suspended.gpt
+    const autoRecord = JSON.parse(await readFile(failoverPath, 'utf8')).suspended.tester
     assert.match(autoRecord.reason, /派单失败自动挂起：HTTP 429/)
     assert.equal(autoRecord.auto, true)
-    assert.match(await tool('squad_status').execute({}, exec), /挂起：gpt（自 .+；自动；/)
+    assert.match(await tool('squad_status').execute({}, exec), /挂起：tester（自 .+；自动；/)
     // Non-quota dispatch errors do NOT suspend.
-    await tool('squad_failover').execute({ agent: 'gpt', recover: true }, exec)
+    await tool('squad_failover').execute({ agent: 'tester', recover: true }, exec)
     installQuotaThrow('spawn crashed for unrelated reasons')
     try {
-      await assert.rejects(dispatch({ agent: 'gpt', message: 'tests', phase: 'test-review' }), /spawn crashed/)
-      assert.equal(JSON.parse(await readFile(failoverPath, 'utf8')).suspended.gpt, undefined)
+      await assert.rejects(dispatch({ agent: 'tester', message: 'tests', phase: 'test-review' }), /spawn crashed/)
+      assert.equal(JSON.parse(await readFile(failoverPath, 'utf8')).suspended.tester, undefined)
     } finally {
       host.subagents.startActivation = originalStart
       host.subagents.sendMessage = originalSend
     }
 
     // --- auto-suspend: the tester reports blocked with a quota summary ------
-    await dispatch({ agent: 'gpt', message: 'tests', phase: 'test-review' })
-    const gptAgent = [...host.agentsById.values()].find((agent) => agent.__membership?.name === 'gpt')
-    assert.ok(gptAgent, 'spawned gpt member exists')
+    await dispatch({ agent: 'tester', message: 'tests', phase: 'test-review' })
+    const gptAgent = [...host.agentsById.values()].find((agent) => agent.__membership?.name === 'tester')
+    assert.ok(gptAgent, 'spawned tester member exists')
     const reportOut = await tool('squad_report').execute(
       { status: 'blocked', summary: 'API 报 429 quota：模型额度已耗尽，无法继续' },
       { agent: gptAgent, signal: undefined },
     )
     assert.match(reportOut, /status=blocked/)
-    assert.match(JSON.parse(await readFile(failoverPath, 'utf8')).suspended.gpt.reason, /队友报告额度耗尽/)
-    await assert.rejects(dispatch({ agent: 'gpt', message: 'again', phase: 'test-review' }), /已挂起/)
+    assert.match(JSON.parse(await readFile(failoverPath, 'utf8')).suspended.tester.reason, /队友报告额度耗尽/)
+    await assert.rejects(dispatch({ agent: 'tester', message: 'again', phase: 'test-review' }), /已挂起/)
 
     // --- persistence: a fresh plugin generation keeps the suspension --------
     {
-      await tool('squad_failover').execute({ agent: 'gpt', recover: true }, exec)
-      await writeFile(failoverPath, JSON.stringify({ suspended: { gpt: { at: '2026-11-20T00:00:00.000Z', reason: '重启前挂起', auto: true } } }, null, 2), 'utf8')
+      await tool('squad_failover').execute({ agent: 'tester', recover: true }, exec)
+      await writeFile(failoverPath, JSON.stringify({ suspended: { tester: { at: '2026-11-20T00:00:00.000Z', reason: '重启前挂起', auto: true } } }, null, 2), 'utf8')
       const host2 = mockHost(workspace, dshHome)
       apply(host2.ctx, { workerProbe: false, agents: BUNDLE_AGENTS })
       const tool2 = (name) => host2.registered.find((entry) => entry.definition.name === name).definition
       const exec2 = { agent: { id: 'lead-2', session: { id: 'session-2' }, __membership: { role: 'lead', name: 'lead' } }, signal: undefined }
       await tool2('squad_enable').execute({}, exec2)
-      const out = await tool2('squad_start').execute({ goal: 'P', acceptance: 'ok', agents: ['codex', 'gpt', 'zcode'] }, exec2)
+      const out = await tool2('squad_start').execute({ goal: 'P', acceptance: 'ok', agents: ['brain', 'tester', 'worker1'] }, exec2)
       const taskP = /任务 (t-\S+) 已创建/.exec(out)[1]
       const dirP = join(workspace, '.agent-squad', taskP)
-      await tool2('squad_dispatch').execute({ agent: 'codex', message: 'plan', phase: 'design' }, exec2)
+      await tool2('squad_dispatch').execute({ agent: 'brain', message: 'plan', phase: 'design' }, exec2)
       await writeFile(join(dirP, 'PLAN.md'), '# PLAN P\n', 'utf8')
       await tool2('squad_approve_plan').execute({ task_id: taskP }, exec2)
       await assert.rejects(
-        tool2('squad_dispatch').execute({ agent: 'gpt', message: 'tests', phase: 'test-review' }, exec2),
-        /gpt 已挂起（自 2026-11-20T00:00:00.000Z；原因：重启前挂起）/,
+        tool2('squad_dispatch').execute({ agent: 'tester', message: 'tests', phase: 'test-review' }, exec2),
+        /tester 已挂起（自 2026-11-20T00:00:00.000Z；原因：重启前挂起）/,
       )
       // And the brain may act while the persisted suspension is in force.
-      await tool2('squad_dispatch').execute({ agent: 'codex', message: 'spec P', phase: 'spec' }, exec2)
-      await tool2('squad_dispatch').execute({ agent: 'zcode', message: 'impl P', phase: 'implement' }, exec2)
+      await tool2('squad_dispatch').execute({ agent: 'brain', message: 'spec P', phase: 'spec' }, exec2)
+      await tool2('squad_dispatch').execute({ agent: 'worker1', message: 'impl P', phase: 'implement' }, exec2)
       await writeFile(join(dirP, 'TEST-REVIEW.md'), 'VERDICT: APPROVED\n', 'utf8')
       assert.match(
-        await tool2('squad_dispatch').execute({ agent: 'codex', message: 'acting test review', phase: 'test-review' }, exec2),
-        /已(创建|续跑) codex \[brain\]/,
+        await tool2('squad_dispatch').execute({ agent: 'brain', message: 'acting test review', phase: 'test-review' }, exec2),
+        /已(创建|续跑) brain \[brain\]/,
       )
     }
   } finally {
@@ -4845,7 +4877,7 @@ test('T13 background dispatch is the default for external implement and unblocks
   const dshHome = await tempRoot()
   const restoreDshHome = useFixtureDshHome(dshHome)
   try {
-    // zcode external mock provider, qoder local.
+    // worker1 external mock provider, front1 local.
     const settingsPath = join(dshHome, 'agent-squad', 'settings.json')
     await mkdir(join(dshHome, 'agent-squad'), { recursive: true })
     await writeFile(
@@ -4855,10 +4887,10 @@ test('T13 background dispatch is the default for external implement and unblocks
           version: 2,
           revision: 1,
           agents: [
-            { id: 'codex', displayName: 'codex', role: 'brain', executor: 'team', model: '', description: 'b' },
-            { id: 'gpt', displayName: 'gpt', role: 'tester', executor: 'team', model: '', description: 'a' },
-            { id: 'zcode', displayName: 'zcode', role: 'worker', executor: 'external', model: 'mock-ext', description: 'w' },
-            { id: 'qoder', displayName: 'qoder', role: 'worker', executor: 'local', model: 'p/fe', description: 'w2' },
+            { id: 'brain', displayName: 'brain', role: 'brain', executor: 'team', model: '', description: 'b' },
+            { id: 'tester', displayName: 'tester', role: 'tester', executor: 'team', model: '', description: 'a' },
+            { id: 'worker1', displayName: 'worker1', role: 'worker', executor: 'external', model: 'mock-ext', description: 'w' },
+            { id: 'front1', displayName: 'front1', role: 'worker', executor: 'local', model: 'p/fe', description: 'w2' },
           ],
           worktree: { directory: '.agents/worktrees' },
         },
@@ -4879,7 +4911,7 @@ test('T13 background dispatch is the default for external implement and unblocks
 
     // No-brain task: exempt from plan/review gates so implement runs directly.
     const startOut = await tool('squad_start').execute(
-      { goal: 'P', acceptance: 'ok', agents: ['zcode', 'qoder'] },
+      { goal: 'P', acceptance: 'ok', agents: ['worker1', 'front1'] },
       exec,
     )
     const task = /任务 (t-\S+) 已创建/.exec(startOut)[1]
@@ -4887,14 +4919,14 @@ test('T13 background dispatch is the default for external implement and unblocks
     // Validation: explicit background:true outside external implement/rework
     // is rejected; background:false is the blocking opt-out.
     await assert.rejects(
-      dispatch({ agent: 'qoder', message: 'x', phase: 'implement', background: true }),
+      dispatch({ agent: 'front1', message: 'x', phase: 'implement', background: true }),
       /background 仅支持 external 执行者（一次性外部 provider）；local\/team 执行者本就不阻塞。/,
     )
     // design/review may also run in the background now (the old phase
     // restriction is gone) — prove it with the design phase on the slow provider.
     await writeFile(join(workspace, '.agent-squad', task, 'PLAN.md'), '# PLAN\n', 'utf8')
-    const designBg = await dispatch({ agent: 'zcode', message: 'design probe', phase: 'design' })
-    assert.match(designBg, /已后台派发 zcode/)
+    const designBg = await dispatch({ agent: 'worker1', message: 'design probe', phase: 'design' })
+    assert.match(designBg, /已后台派发 worker1/)
     let designState = JSON.parse(await readFile(join(workspace, '.agent-squad', task, 'STATE.json'), 'utf8'))
     assert.equal(designState.pendingRuns.length, 1)
     assert.equal(designState.pendingRuns[0].phase, 'design')
@@ -4908,23 +4940,23 @@ test('T13 background dispatch is the default for external implement and unblocks
 
     // Parallel-by-default: an external implement dispatch WITHOUT any flag
     // runs in the background — no output section, delivery 'parent'.
-    const bg = await dispatch({ agent: 'zcode', message: 'parallel part', phase: 'implement' })
-    assert.match(bg, /已后台派发 zcode \(zcode\) \[worker\] provider=mock-ext（不阻塞，可继续派其他队友）/)
+    const bg = await dispatch({ agent: 'worker1', message: 'parallel part', phase: 'implement' })
+    assert.match(bg, /已后台派发 worker1 \(worker1\) \[worker\] provider=mock-ext（不阻塞，可继续派其他队友）/)
     assert.ok(!/输出：/.test(bg), 'default external implement must not block on the output')
     assert.match(bg, /结果完成时会以后台消息送达/)
     assert.equal(host.activations.at(-1).delivery, 'parent')
     let state = JSON.parse(await readFile(join(workspace, '.agent-squad', task, 'STATE.json'), 'utf8'))
     assert.equal(state.dispatches.at(-1).mode, 'external-background')
     assert.equal(state.codeEpoch, 1)
-    assert.deepEqual(state.implementers, ['zcode'])
+    assert.deepEqual(state.implementers, ['worker1'])
     assert.match(await readFile(join(workspace, '.agent-squad', task, 'RUNS.md'), 'utf8'), /mode=background/)
 
     // The Lead can immediately issue another worker while the background run
-    // is in flight (qoder is local, non-blocking anyway) — the guard only
+    // is in flight (front1 is local, non-blocking anyway) — the guard only
     // blocks re-dispatch of the SAME binding.
     assert.match(
-      await dispatch({ agent: 'qoder', message: 'frontend part', phase: 'implement' }),
-      /已创建本地子代理 qoder/,
+      await dispatch({ agent: 'front1', message: 'frontend part', phase: 'implement' }),
+      /已创建本地子代理 front1/,
     )
 
     // squad_status renders the running background executors; finish waits.
@@ -4939,12 +4971,12 @@ test('T13 background dispatch is the default for external implement and unblocks
     host.unmarkRunning(bgChild ?? 'bg-unknown')
 
     // Explicit background:false restores the blocking call with inline output.
-    const blocking = await dispatch({ agent: 'zcode', message: 'serial', phase: 'implement', background: false })
-    assert.match(blocking, /已外部派发 zcode/)
+    const blocking = await dispatch({ agent: 'worker1', message: 'serial', phase: 'implement', background: false })
+    assert.match(blocking, /已外部派发 worker1/)
     assert.match(blocking, /输出：/)
     state = JSON.parse(await readFile(join(workspace, '.agent-squad', task, 'STATE.json'), 'utf8'))
     assert.equal(state.dispatches.at(-1).mode, 'external')
-    assert.equal(state.codeEpoch, 3) // bg zcode + qoder + blocking zcode
+    assert.equal(state.codeEpoch, 3) // bg worker1 + front1 + blocking worker1
 
     // Charter guidance: worker prompts carry the parallel-by-default hint.
     const workerPrompt = host.activations.at(-1).prompt.map((block) => block.text).join('')
@@ -4957,7 +4989,7 @@ test('T13 background dispatch is the default for external implement and unblocks
   }
 })
 
-/** T14 — per-role worker capability, lead worker config and qoder's scope. */
+/** T14 — per-role worker capability, lead worker config and front1's scope. */
 test('T14 any role can act as a worker and the Lead has its own worker switch', async () => {
   const workspace = await tempRoot()
   const dshHome = await tempRoot()
@@ -4974,10 +5006,10 @@ test('T14 any role can act as a worker and the Lead has its own worker switch', 
           revision: 1,
           leaderWorker: false,
           agents: [
-            { id: 'codex', displayName: 'codex', role: 'brain', executor: 'team', model: '', description: 'b' },
-            { id: 'gpt', displayName: 'gpt', role: 'tester', executor: 'team', model: '', description: 'a' },
-            { id: 'zcode', displayName: 'zcode', role: 'worker', executor: 'local', model: 'p/m1', description: 'w' },
-            { id: 'qoder', displayName: 'qoder', role: 'worker', executor: 'local', model: 'p/fe', description: 'w2' },
+            { id: 'brain', displayName: 'brain', role: 'brain', executor: 'team', model: '', description: 'b' },
+            { id: 'tester', displayName: 'tester', role: 'tester', executor: 'team', model: '', description: 'a' },
+            { id: 'worker1', displayName: 'worker1', role: 'worker', executor: 'local', model: 'p/m1', description: 'w' },
+            { id: 'front1', displayName: 'front1', role: 'worker', executor: 'local', model: 'p/fe', description: 'w2' },
           ],
           worktree: { directory: '.agents/worktrees' },
         },
@@ -4999,10 +5031,10 @@ test('T14 any role can act as a worker and the Lead has its own worker switch', 
     // --- validation: worker / leaderWorker must be booleans -----------------
     {
       const base = (await settingsStore.read()).agents
-      const badWorker = base.map((agent) => (agent.id === 'codex' ? { ...agent, worker: 'yes' } : agent))
+      const badWorker = base.map((agent) => (agent.id === 'brain' ? { ...agent, worker: 'yes' } : agent))
       const checked = validateAgentsAndWorktree(badWorker, { directory: '.agents/worktrees' })
       assert.equal(checked.ok, false)
-      assert.equal(checked.fields['agents.codex.worker'], 'WORKER_INVALID')
+      assert.equal(checked.fields['agents.brain.worker'], 'WORKER_INVALID')
       const badLeader = validateAgentsAndWorktree(base, { directory: '.agents/worktrees' }, 'yes')
       assert.equal(badLeader.ok, false)
       assert.equal(badLeader.fields.leaderWorker, 'WORKER_INVALID')
@@ -5027,51 +5059,51 @@ test('T14 any role can act as a worker and the Lead has its own worker switch', 
     const startOut = await tool('squad_start').execute({ goal: 'W', acceptance: 'ok' }, exec)
     const task = /任务 (t-\S+) 已创建/.exec(startOut)[1]
     const dir = join(workspace, '.agent-squad', task)
-    await dispatch({ agent: 'codex', message: 'plan', phase: 'design' })
+    await dispatch({ agent: 'brain', message: 'plan', phase: 'design' })
     await writeFile(join(dir, 'PLAN.md'), '# PLAN W\n', 'utf8')
     await tool('squad_approve_plan').execute({ task_id: task }, exec)
-    await dispatch({ agent: 'codex', message: 'spec', phase: 'spec' })
+    await dispatch({ agent: 'brain', message: 'spec', phase: 'spec' })
 
-    // codex defaults to worker:false → implement refused with guidance.
+    // brain defaults to worker:false → implement refused with guidance.
     await assert.rejects(
-      dispatch({ agent: 'codex', message: 'write code', phase: 'implement' }),
-      /完整流程的 implement 需要 worker 能力：codex（brain）的 worker 能力未启用；worker 固定为 zcode（主力后端）\/ opencode（备份后端）\/ qoder（固定前端）/,
+      dispatch({ agent: 'brain', message: 'write code', phase: 'implement' }),
+      /完整流程的 implement 需要 worker 能力：brain 的 worker 能力未启用；worker 固定为 worker1（主力后端）\/ worker2（备份后端）\/ front1（固定前端）/,
     )
-    // Enable codex's worker capability and retry: the brain now implements.
+    // Enable brain's worker capability and retry: the brain now implements.
     {
       const snap = await settingsStore.read()
       await settingsStore.save({
         expectedRevision: snap.revision,
-        agents: snap.agents.map((agent) => (agent.id === 'codex' ? { ...agent, worker: true } : agent)),
+        agents: snap.agents.map((agent) => (agent.id === 'brain' ? { ...agent, worker: true } : agent)),
         worktree: snap.worktree,
         leaderWorker: snap.leaderWorker,
       })
     }
-    assert.match(await dispatch({ agent: 'codex', message: 'write code', phase: 'implement' }), /已(创建|续跑) codex \[brain\]/)
+    assert.match(await dispatch({ agent: 'brain', message: 'write code', phase: 'implement' }), /已(创建|续跑) brain \[brain\]/)
     let state = JSON.parse(await readFile(join(dir, 'STATE.json'), 'utf8'))
-    assert.deepEqual(state.implementers, ['codex'])
+    assert.deepEqual(state.implementers, ['brain'])
     assert.equal(state.codeEpoch, 1)
     // Independence: the implementer cannot sign its own technical acceptance;
     // the tester countersigns when the brain implemented.
     await writeFile(join(dir, 'TEST-REVIEW.md'), '# TEST\n\nVERDICT: APPROVED\n', 'utf8')
-    assert.match(await dispatch({ agent: 'gpt', message: 'test', phase: 'test-review' }), /已(创建|续跑) gpt \[tester\]/)
+    assert.match(await dispatch({ agent: 'tester', message: 'test', phase: 'test-review' }), /已(创建|续跑) tester \[tester\]/)
     await assert.rejects(
-      dispatch({ agent: 'codex', message: 'self sign', phase: 'tech-review' }),
-      /codex 已在本任务中写代码，不能签署自己改动的技术验收：改派 tester（gpt）对照 SPEC\.md 代签技术验收/,
+      dispatch({ agent: 'brain', message: 'self sign', phase: 'tech-review' }),
+      /brain 已在本任务中写代码，不能签署自己改动的技术验收：改派 tester 对照 SPEC\.md 代签技术验收/,
     )
-    assert.match(await dispatch({ agent: 'gpt', message: 'tech', phase: 'tech-review' }), /已(创建|续跑) gpt \[tester\]/)
+    assert.match(await dispatch({ agent: 'tester', message: 'tech', phase: 'tech-review' }), /已(创建|续跑) tester \[tester\]/)
     state = JSON.parse(await readFile(join(dir, 'STATE.json'), 'utf8'))
-    assert.equal(state.techReview.reviewer, 'gpt')
+    assert.equal(state.techReview.reviewer, 'tester')
 
-    // Worker-role agents stay unimpeded; qoder's charter covers backend too.
-    assert.match(await dispatch({ agent: 'qoder', message: 'frontend impl', phase: 'implement' }), /已创建本地子代理 qoder/)
-    const qoder = (await settingsStore.read()).agents.find((agent) => agent.id === 'qoder')
-    assert.equal(qoder.role, 'worker')
+    // Worker-role agents stay unimpeded; front1's charter covers backend too.
+    assert.match(await dispatch({ agent: 'front1', message: 'frontend impl', phase: 'implement' }), /已创建本地子代理 front1/)
+    const front1 = (await settingsStore.read()).agents.find((agent) => agent.id === 'front1')
+    assert.equal(front1.role, 'worker')
     // Older rows omit `worker`; the runtime defaults worker-role agents to
     // capable (proven by the successful dispatch above).
-    // The qoder-specific charter ships with the fallback defaults (a bundle
+    // The front1-specific charter ships with the fallback defaults (a bundle
     // that omits per-agent charters dispatches the generic worker charter);
-    // qoder is fixed frontend and hands backend work to zcode/opencode.
+    // front1 is fixed frontend and hands backend work to worker1/worker2.
     const indexForQoder = await readFile(new URL('../index.js', import.meta.url), 'utf8')
     assert.match(indexForQoder, /固定前端：负责前端页面的交互设计、实现与自测/)
     assert.match(indexForQoder, /不承担后端代码（接口\/脚本\/数据层）的实现/)
@@ -5080,9 +5112,9 @@ test('T14 any role can act as a worker and the Lead has its own worker switch', 
     const indexSource = await readFile(new URL('../index.js', import.meta.url), 'utf8')
     const clientSource = await readFile(new URL('../client.js', import.meta.url), 'utf8')
     assert.match(indexSource, /leaderWorker/)
-    assert.match(indexSource, /worker 固定为 zcode \/ opencode \/ qoder 三名/)
-    assert.match(indexSource, /优先派 zcode/)
-    assert.match(indexSource, /备份 opencode/)
+    assert.match(indexSource, /worker 固定为 worker1 \/ worker2 \/ front1 三名/)
+    assert.match(indexSource, /优先派 worker1/)
+    assert.match(indexSource, /备份 worker2/)
     // The settings page no longer exposes the worker-capability switches; the
     // persisted flags keep applying (all members configured worker=false).
     assert.doesNotMatch(clientSource, /fieldWorker/)
@@ -5112,11 +5144,11 @@ test('T15 worker availability probe suspends a quota-limited worker and substitu
           version: 2,
           revision: 1,
           agents: [
-            { id: 'codex', displayName: 'codex', role: 'brain', executor: 'team', model: '', description: 'b' },
-            { id: 'gpt', displayName: 'gpt', role: 'tester', executor: 'team', model: '', description: 'a' },
-            { id: 'zcode', displayName: 'zcode', role: 'worker', executor: 'external', model: 'mock-ext', description: 'w' },
-            { id: 'qoder', displayName: 'qoder', role: 'worker', executor: 'external', model: 'mock-ext', description: 'w2' },
-            { id: 'opencode', displayName: 'opencode', role: 'worker', executor: 'team', model: '', worker: false, description: 'w3' },
+            { id: 'brain', displayName: 'brain', role: 'brain', executor: 'team', model: '', description: 'b' },
+            { id: 'tester', displayName: 'tester', role: 'tester', executor: 'team', model: '', description: 'a' },
+            { id: 'worker1', displayName: 'worker1', role: 'worker', executor: 'external', model: 'mock-ext', description: 'w' },
+            { id: 'front1', displayName: 'front1', role: 'worker', executor: 'external', model: 'mock-ext', description: 'w2' },
+            { id: 'worker2', displayName: 'worker2', role: 'worker', executor: 'team', model: '', worker: false, description: 'w3' },
           ],
           worktree: { directory: '.agents/worktrees' },
         },
@@ -5125,7 +5157,7 @@ test('T15 worker availability probe suspends a quota-limited worker and substitu
       ),
       'utf8',
     )
-    let failProbeFor = 'zcode'
+    let failProbeFor = 'worker1'
     let failProbeMessage = 'HTTP 429 quota exceeded：额度耗尽'
     const host = mockHost(workspace, dshHome, {
       onExternal: async (_provider, request) => {
@@ -5146,93 +5178,93 @@ test('T15 worker availability probe suspends a quota-limited worker and substitu
     const startOut = await tool('squad_start').execute({ goal: 'G', acceptance: 'ok' }, exec)
     const task = /任务 (t-\S+) 已创建/.exec(startOut)[1]
     const dir = join(workspace, '.agent-squad', task)
-    await dispatch({ agent: 'codex', message: 'plan', phase: 'design' })
+    await dispatch({ agent: 'brain', message: 'plan', phase: 'design' })
     await writeFile(join(dir, 'PLAN.md'), '# PLAN G\n', 'utf8')
     await tool('squad_approve_plan').execute({ task_id: task }, exec)
-    await dispatch({ agent: 'codex', message: 'spec', phase: 'spec' })
+    await dispatch({ agent: 'brain', message: 'spec', phase: 'spec' })
 
-    // --- zcode probe hits the quota: report, suspend, substitute qoder ------
-    const out = await dispatch({ agent: 'zcode', message: 'impl', phase: 'implement', background: false })
+    // --- worker1 probe hits the quota: report, suspend, substitute front1 ------
+    const out = await dispatch({ agent: 'worker1', message: 'impl', phase: 'implement', background: false })
     assert.match(
       out,
-      /\[可用性门禁\] zcode 不可用（可用性探测失败：HTTP 429 quota exceeded：额度耗尽）→ 已上报，并自动改由 qoder 执行本轮任务。/,
+      /\[可用性门禁\] worker1 不可用（可用性探测失败：HTTP 429 quota exceeded：额度耗尽）→ 已上报，并自动改由 front1 执行本轮任务。/,
     )
     assert.match(out, /已记录为不可用（其他轮次也会自动绕开）/)
-    assert.match(out, /已外部派发 qoder/)
+    assert.match(out, /已外部派发 front1/)
     const suspended = JSON.parse(await readFile(failoverPath, 'utf8')).suspended
-    assert.equal(suspended.zcode.auto, true)
-    assert.equal(suspended.zcode.role, 'worker')
-    assert.match(suspended.zcode.reason, /可用性探测失败/)
+    assert.equal(suspended.worker1.auto, true)
+    assert.equal(suspended.worker1.role, 'worker')
+    assert.match(suspended.worker1.reason, /可用性探测失败/)
     let state = JSON.parse(await readFile(join(dir, 'STATE.json'), 'utf8'))
-    assert.deepEqual(state.dispatches.at(-1).substitutedFrom, ['zcode'])
+    assert.deepEqual(state.dispatches.at(-1).substitutedFrom, ['worker1'])
     assert.match(state.dispatches.at(-1).substitutionReason, /可用性探测失败/)
-    assert.equal(state.probes.qoder.ok, true)
-    assert.equal(probes().filter((row) => row.label === 'probe/qoder').length, 1)
+    assert.equal(state.probes.front1.ok, true)
+    assert.equal(probes().filter((row) => row.label === 'probe/front1').length, 1)
 
     // Status surfaces the worker's substitution handover.
     const statusOut = await tool('squad_status').execute({}, exec)
-    assert.match(statusOut, /zcode（自 .+；自动；原因：可用性探测失败：.+）→ 派单将自动改由其他 worker 执行/)
+    assert.match(statusOut, /worker1（自 .+；自动；原因：可用性探测失败：.+）→ 派单将自动改由其他 worker 执行/)
 
     // A later dispatch addressed to the suspended worker auto-routes too.
-    const routed = await dispatch({ agent: 'zcode', message: 'impl 2', phase: 'implement', background: false })
-    assert.match(routed, /\[可用性门禁\] zcode 不可用（已挂起（自 .+；原因：可用性探测失败：.+））\s*→ 已上报，并自动改由 qoder 执行本轮任务。/)
-    // Probe cache: qoder is not re-probed on the second dispatch.
-    assert.equal(probes().filter((row) => row.label === 'probe/qoder').length, 1)
+    const routed = await dispatch({ agent: 'worker1', message: 'impl 2', phase: 'implement', background: false })
+    assert.match(routed, /\[可用性门禁\] worker1 不可用（已挂起（自 .+；原因：可用性探测失败：.+））\s*→ 已上报，并自动改由 front1 执行本轮任务。/)
+    // Probe cache: front1 is not re-probed on the second dispatch.
+    assert.equal(probes().filter((row) => row.label === 'probe/front1').length, 1)
 
     // --- recovery: the worker is usable again after squad_failover ----------
     failProbeFor = 'none'
-    const recoverOut = await tool('squad_failover').execute({ agent: 'zcode', recover: true }, exec)
+    const recoverOut = await tool('squad_failover').execute({ agent: 'worker1', recover: true }, exec)
     assert.match(recoverOut, /已解除挂起，恢复正常职责/)
     assert.match(recoverOut, /下次派单恢复由它执行/)
-    const back = await dispatch({ agent: 'zcode', message: 'impl 3', phase: 'implement', background: false, probe: true })
-    assert.match(back, /已外部派发 zcode/)
+    const back = await dispatch({ agent: 'worker1', message: 'impl 3', phase: 'implement', background: false, probe: true })
+    assert.match(back, /已外部派发 worker1/)
     assert.ok(!/\[可用性门禁\]/.test(back))
 
     // --- non-quota probe failure: note and continue -------------------------
-    failProbeFor = 'qoder'
+    failProbeFor = 'front1'
     failProbeMessage = 'network unreachable'
-    const warned = await dispatch({ agent: 'qoder', message: 'impl 4', phase: 'implement', background: false, probe: true })
-    assert.match(warned, /\[可用性门禁\] qoder 探测异常（非额度类）：network unreachable；继续按计划派发/)
-    assert.match(warned, /已外部派发 qoder/)
+    const warned = await dispatch({ agent: 'front1', message: 'impl 4', phase: 'implement', background: false, probe: true })
+    assert.match(warned, /\[可用性门禁\] front1 探测异常（非额度类）：network unreachable；继续按计划派发/)
+    assert.match(warned, /已外部派发 front1/)
 
     // --- cross-task cache: a fresh success is reused (no re-probe) ----------
     {
       // No architect participant → legacy gates (plan approval only).
       const startNew = await tool('squad_start').execute(
-        { goal: 'H', acceptance: 'ok', agents: ['codex', 'zcode'] },
+        { goal: 'H', acceptance: 'ok', agents: ['brain', 'worker1'] },
         exec,
       )
       const taskH = /任务 (t-\S+) 已创建/.exec(startNew)[1]
       const dirH = join(workspace, '.agent-squad', taskH)
       await writeFile(join(dirH, 'PLAN.md'), '# PLAN H\n', 'utf8')
       await tool('squad_approve_plan').execute({ task_id: taskH }, exec)
-      const before = probes().filter((row) => row.label === 'probe/zcode').length
+      const before = probes().filter((row) => row.label === 'probe/worker1').length
       // No probe flag: the profile-wide cache from the earlier success applies.
-      await dispatch({ agent: 'zcode', message: 'impl H', phase: 'implement', background: false })
-      assert.equal(probes().filter((row) => row.label === 'probe/zcode').length, before)
+      await dispatch({ agent: 'worker1', message: 'impl H', phase: 'implement', background: false })
+      assert.equal(probes().filter((row) => row.label === 'probe/worker1').length, before)
       // probe:true still forces a fresh probe.
-      await dispatch({ agent: 'zcode', message: 'impl H2', phase: 'implement', background: false, probe: true })
-      assert.equal(probes().filter((row) => row.label === 'probe/zcode').length, before + 1)
+      await dispatch({ agent: 'worker1', message: 'impl H2', phase: 'implement', background: false, probe: true })
+      assert.equal(probes().filter((row) => row.label === 'probe/worker1').length, before + 1)
       assert.ok(await stat(join(dshHome, 'agent-squad', 'probe-cache.json')))
     }
 
     // --- probe:false skips the gate -----------------------------------------
     {
       const before = probes().length
-      await dispatch({ agent: 'qoder', message: 'impl 5', phase: 'implement', background: false, probe: false })
+      await dispatch({ agent: 'front1', message: 'impl 5', phase: 'implement', background: false, probe: false })
       assert.equal(probes().length, before)
     }
 
     // --- no substitute left: the dispatch is refused with a report ----------
     {
       // Suspend both workers through their own probes.
-      failProbeFor = 'zcode'
+      failProbeFor = 'worker1'
       failProbeMessage = 'HTTP 429 quota exceeded：额度耗尽'
-      const subOut = await dispatch({ agent: 'zcode', message: 'x', phase: 'implement', background: false, probe: true })
-      assert.match(subOut, /自动改由 qoder 执行本轮任务/)
-      failProbeFor = 'qoder'
+      const subOut = await dispatch({ agent: 'worker1', message: 'x', phase: 'implement', background: false, probe: true })
+      assert.match(subOut, /自动改由 front1 执行本轮任务/)
+      failProbeFor = 'front1'
       await assert.rejects(
-        dispatch({ agent: 'qoder', message: 'x', phase: 'implement', background: false, probe: true }),
+        dispatch({ agent: 'front1', message: 'x', phase: 'implement', background: false, probe: true }),
         /且没有其他可用 worker 可以替代，本轮派单被拒绝/,
       )
     }
@@ -5260,10 +5292,10 @@ test('T16 parallel features branch from the Base branch and merge back after del
           version: 2,
           revision: 1,
           agents: [
-            { id: 'codex', displayName: 'codex', role: 'brain', executor: 'team', model: '', description: 'b' },
-            { id: 'gpt', displayName: 'gpt', role: 'tester', executor: 'team', model: '', description: 'a' },
-            { id: 'zcode', displayName: 'zcode', role: 'worker', executor: 'local', model: 'p/m1', description: 'w' },
-            { id: 'qoder', displayName: 'qoder', role: 'worker', executor: 'local', model: 'p/fe', description: 'w2' },
+            { id: 'brain', displayName: 'brain', role: 'brain', executor: 'team', model: '', description: 'b' },
+            { id: 'tester', displayName: 'tester', role: 'tester', executor: 'team', model: '', description: 'a' },
+            { id: 'worker1', displayName: 'worker1', role: 'worker', executor: 'local', model: 'p/m1', description: 'w' },
+            { id: 'front1', displayName: 'front1', role: 'worker', executor: 'local', model: 'p/fe', description: 'w2' },
           ],
           worktree: { directory: '.agents/worktrees' },
         },
@@ -5293,11 +5325,11 @@ test('T16 parallel features branch from the Base branch and merge back after del
     let state = await readState(task)
     assert.equal(state.stage, undefined)
     assert.equal(state.worktree.sourceBranch, 'master')
-    await dispatch({ agent: 'codex', message: 'plan', phase: 'design' })
+    await dispatch({ agent: 'brain', message: 'plan', phase: 'design' })
     await writeFile(join(dir, 'PLAN.md'), '# PLAN\n', 'utf8')
     await tool('squad_approve_plan').execute({ task_id: task }, exec)
-    await dispatch({ agent: 'codex', message: 'spec', phase: 'spec' })
-    await dispatch({ agent: 'zcode', message: 'base impl', phase: 'implement' })
+    await dispatch({ agent: 'brain', message: 'spec', phase: 'spec' })
+    await dispatch({ agent: 'worker1', message: 'base impl', phase: 'implement' })
     // Common code lands in the task worktree.
     await writeFile(join(state.worktree.path, 'core.js'), 'module.exports = { core: true }\n', 'utf8')
     // Parallel phase is gated until the base delivery is merged.
@@ -5310,11 +5342,11 @@ test('T16 parallel features branch from the Base branch and merge back after del
 
     // --- base acceptance, then deliver to Base ------------------------------
     await writeVerdict(task, 'TEST-REVIEW.md', 'APPROVED')
-    await dispatch({ agent: 'gpt', message: 'test', phase: 'test-review' })
+    await dispatch({ agent: 'tester', message: 'test', phase: 'test-review' })
     await writeVerdict(task, 'TECH-REVIEW.md', 'APPROVED')
-    await dispatch({ agent: 'codex', message: 'tech', phase: 'tech-review' })
+    await dispatch({ agent: 'brain', message: 'tech', phase: 'tech-review' })
     await writeVerdict(task, 'REVIEW.md', 'APPROVED')
-    await dispatch({ agent: 'codex', message: 'review', phase: 'review' })
+    await dispatch({ agent: 'brain', message: 'review', phase: 'review' })
     const baseBefore = (await gitOut(repo, ['rev-parse', 'HEAD'])).trim()
     const deliverOut = await tool('squad_deliver').execute({ summary: 'base' }, exec)
     assert.match(deliverOut, /通用功能已交付并合入 Base 分支/)
@@ -5356,21 +5388,21 @@ test('T16 parallel features branch from the Base branch and merge back after del
     const featureAPath = state.features.find((item) => item.name === 'feat-a').path
     const featureBPath = state.features.find((item) => item.name === 'feat-b').path
     assert.match(
-      await dispatch({ agent: 'zcode', message: 'impl a', phase: 'implement', feature: 'feat-a' }),
+      await dispatch({ agent: 'worker1', message: 'impl a', phase: 'implement', feature: 'feat-a' }),
       new RegExp(`workspace=${featureAPath.replace(/[.*+?^${}()|[\\]\\]/g, '\\$&')}`),
     )
     assert.match(
-      await dispatch({ agent: 'qoder', message: 'impl b', phase: 'implement', feature: 'feat-b' }),
+      await dispatch({ agent: 'front1', message: 'impl b', phase: 'implement', feature: 'feat-b' }),
       new RegExp(`workspace=${featureBPath.replace(/[.*+?^${}()|[\\]\\]/g, '\\$&')}`),
     )
     // Without a feature the parallel phase refuses implement.
     await assert.rejects(
-      dispatch({ agent: 'zcode', message: 'stray', phase: 'implement' }),
+      dispatch({ agent: 'worker1', message: 'stray', phase: 'implement' }),
       /并行阶段请用 feature 指定本次实现的特性/,
     )
     // Unknown/merged feature names are rejected.
     await assert.rejects(
-      dispatch({ agent: 'zcode', message: 'x', phase: 'implement', feature: 'nope' }),
+      dispatch({ agent: 'worker1', message: 'x', phase: 'implement', feature: 'nope' }),
       /未知 feature "nope"/,
     )
 
@@ -5380,8 +5412,8 @@ test('T16 parallel features branch from the Base branch and merge back after del
       assert.match(progress, /## 进度总览/)
       assert.match(progress, /## 分阶段进度/)
       assert.match(progress, /## 并行特性/)
-      assert.match(progress, /feat-a.*zcode implement r1/s)
-      assert.match(progress, /feat-b.*qoder implement r1/s)
+      assert.match(progress, /feat-a.*worker1 implement r1/s)
+      assert.match(progress, /feat-b.*front1 implement r1/s)
       assert.match(progress, /## 队员进度/)
     }
 
@@ -5407,12 +5439,12 @@ test('T16 parallel features branch from the Base branch and merge back after del
     state = await readState(task)
     assert.ok(state.features.every((item) => item.merged))
     await writeVerdict(task, 'TEST-REVIEW.md', 'APPROVED')
-    await dispatch({ agent: 'gpt', message: 'final test', phase: 'test-review' })
+    await dispatch({ agent: 'tester', message: 'final test', phase: 'test-review' })
     await writeVerdict(task, 'TECH-REVIEW.md', 'APPROVED')
-    const finalTech = await dispatch({ agent: 'codex', message: 'final tech', phase: 'tech-review' })
+    const finalTech = await dispatch({ agent: 'brain', message: 'final tech', phase: 'tech-review' })
     assert.match(finalTech, new RegExp(`workspace=${repo.replace(/[.*+?^${}()|[\\]\\]/g, '\\$&')}`)) // reviews run on the merged Base
     await writeVerdict(task, 'REVIEW.md', 'APPROVED')
-    await dispatch({ agent: 'codex', message: 'final review', phase: 'review' })
+    await dispatch({ agent: 'brain', message: 'final review', phase: 'review' })
     const statusOut = await tool('squad_status').execute({}, exec)
     assert.match(statusOut, /并行：Base 已交付（base @ .+）；特性：feat-a（已合并 .+）、feat-b（已合并 .+）/)
     const finishOut = await tool('squad_finish').execute({ summary: 'parallel done' }, exec)
@@ -5452,10 +5484,10 @@ test('T17 status and PROGRESS.md show layered task and teammate progress', async
           version: 2,
           revision: 1,
           agents: [
-            { id: 'codex', displayName: 'codex', role: 'brain', executor: 'team', model: '', description: 'b' },
-            { id: 'gpt', displayName: 'gpt', role: 'tester', executor: 'team', model: '', description: 'a' },
-            { id: 'zcode', displayName: 'zcode', role: 'worker', executor: 'team', model: '', description: 'w' },
-            { id: 'qoder', displayName: 'qoder', role: 'worker', executor: 'team', model: '', description: 'w2' },
+            { id: 'brain', displayName: 'brain', role: 'brain', executor: 'team', model: '', description: 'b' },
+            { id: 'tester', displayName: 'tester', role: 'tester', executor: 'team', model: '', description: 'a' },
+            { id: 'worker1', displayName: 'worker1', role: 'worker', executor: 'team', model: '', description: 'w' },
+            { id: 'front1', displayName: 'front1', role: 'worker', executor: 'team', model: '', description: 'w2' },
           ],
           worktree: { directory: '.agents/worktrees' },
         },
@@ -5490,16 +5522,16 @@ test('T17 status and PROGRESS.md show layered task and teammate progress', async
     assert.match(initial, /## 分阶段进度/)
     assert.match(initial, /业务方案：待 Lead 批准/)
     assert.match(initial, /## 队员进度/)
-    assert.match(initial, /codex \[brain\] 空闲 · 尚未派单/)
-    assert.match(initial, /zcode \[worker\] 空闲 · 尚未派单/)
+    assert.match(initial, /brain \[brain\] 空闲 · 尚未派单/)
+    assert.match(initial, /worker1 \[worker\] 空闲 · 尚未派单/)
 
     // Design dispatch + approval refresh the progress.
-    await dispatch({ agent: 'codex', message: 'plan', phase: 'design' })
+    await dispatch({ agent: 'brain', message: 'plan', phase: 'design' })
     await writeFile(join(dir, 'PLAN.md'), '# PLAN\n', 'utf8')
     await tool('squad_approve_plan').execute({ task_id: task }, exec)
     const afterApprove = await readProgress()
     assert.match(afterApprove, /✓ 业务方案：已批准/)
-    assert.match(afterApprove, /codex \[brain\] 空闲 · 最近 design r1 @ /)
+    assert.match(afterApprove, /brain \[brain\] 空闲 · 最近 design r1 @ /)
     // Status carries the same layered block.
     const status = await tool('squad_status').execute({}, exec)
     assert.match(status, /## 进度总览/)
@@ -5507,13 +5539,13 @@ test('T17 status and PROGRESS.md show layered task and teammate progress', async
     assert.match(status, /## 队员进度/)
 
     // Spec + implement advance the phase checklist.
-    await dispatch({ agent: 'codex', message: 'spec', phase: 'spec' })
+    await dispatch({ agent: 'brain', message: 'spec', phase: 'spec' })
     assert.match(await readProgress(), /✓ 技术规格：v1（SPEC\.md）/)
-    await dispatch({ agent: 'zcode', message: 'impl', phase: 'implement' })
+    await dispatch({ agent: 'worker1', message: 'impl', phase: 'implement' })
     assert.match(await readProgress(), /✓ 基础层实现：1 轮/)
 
     // A teammate report syncs progress and carries a compact progress line.
-    const zcodeAgent = [...host.agentsById.values()].find((agent) => agent.__membership?.name === 'zcode')
+    const zcodeAgent = [...host.agentsById.values()].find((agent) => agent.__membership?.name === 'worker1')
     assert.ok(zcodeAgent)
     const reportOut = await tool('squad_report').execute(
       { status: 'done', summary: 'impl done', next: 'review' },
@@ -5523,7 +5555,7 @@ test('T17 status and PROGRESS.md show layered task and teammate progress', async
     const forwarded = host.sent.filter((item) => item.targetId === 'lead-1').at(-1).content[0].text
     assert.match(forwarded, /进度同步：串行阶段（基础层）：phase=implement round=1/)
     const afterReport = await readProgress()
-    assert.match(afterReport, /zcode \[worker\] 空闲 · 最近 implement r1 @ /)
+    assert.match(afterReport, /worker1 \[worker\] 空闲 · 最近 implement r1 @ /)
     assert.match(afterReport, /自动同步：/)
   } finally {
     restoreDshHome()
@@ -5547,10 +5579,10 @@ test('T18 slow external phases return immediately, stay pending, then flush', as
           version: 2,
           revision: 1,
           agents: [
-            { id: 'codex', displayName: 'codex', role: 'brain', executor: 'external', model: 'mock-ext', description: 'b' },
-            { id: 'gpt', displayName: 'gpt', role: 'tester', executor: 'external', model: 'mock-ext', description: 'a' },
-            { id: 'zcode', displayName: 'zcode', role: 'worker', executor: 'external', model: 'mock-ext', description: 'w' },
-            { id: 'qoder', displayName: 'qoder', role: 'worker', executor: 'external', model: 'mock-ext', description: 'w2' },
+            { id: 'brain', displayName: 'brain', role: 'brain', executor: 'external', model: 'mock-ext', description: 'b' },
+            { id: 'tester', displayName: 'tester', role: 'tester', executor: 'external', model: 'mock-ext', description: 'a' },
+            { id: 'worker1', displayName: 'worker1', role: 'worker', executor: 'external', model: 'mock-ext', description: 'w' },
+            { id: 'front1', displayName: 'front1', role: 'worker', executor: 'external', model: 'mock-ext', description: 'w2' },
           ],
           worktree: { directory: '.agents/worktrees' },
         },
@@ -5576,9 +5608,9 @@ test('T18 slow external phases return immediately, stay pending, then flush', as
 
     // --- design returns at once and is recorded as pending -----------------
     const started = Date.now()
-    const designOut = await dispatch({ agent: 'codex', message: 'plan', phase: 'design' })
+    const designOut = await dispatch({ agent: 'brain', message: 'plan', phase: 'design' })
     assert.ok(Date.now() - started < 50, 'dispatch must not wait for the run')
-    assert.match(designOut, /已后台派发 codex/)
+    assert.match(designOut, /已后台派发 brain/)
     assert.match(designOut, /结果完成时会以后台消息送达/)
     let state = await readState(task)
     assert.equal(state.pendingRuns.length, 1)
@@ -5586,11 +5618,11 @@ test('T18 slow external phases return immediately, stay pending, then flush', as
     // Gates refuse while the deliverable is still being produced.
     await assert.rejects(
       tool('squad_approve_plan').execute({ task_id: task }, exec),
-      /后台任务仍在运行：codex design r1；结果以后台消息送达，等它到达（squad_status 可查看进度）后再批准方案。/,
+      /后台任务仍在运行：brain design r1；结果以后台消息送达，等它到达（squad_status 可查看进度）后再批准方案。/,
     )
     // The progress view names the background run.
     const statusPending = await tool('squad_status').execute({}, exec)
-    assert.match(statusPending, /后台运行中：codex design r1/)
+    assert.match(statusPending, /后台运行中：brain design r1/)
 
     // Once it settles, the next tool call flushes: PLAN-R1 archived, pending [].
     await delayMs(120)
@@ -5607,23 +5639,23 @@ test('T18 slow external phases return immediately, stay pending, then flush', as
     assert.match(await tool('squad_approve_plan').execute({ task_id: task }, exec), /已批准/)
 
     // --- spec pending → deferred SPEC-V archive -----------------------------
-    assert.match(await dispatch({ agent: 'codex', message: 'spec', phase: 'spec' }), /已后台派发 codex/)
+    assert.match(await dispatch({ agent: 'brain', message: 'spec', phase: 'spec' }), /已后台派发 brain/)
     await delayMs(120)
     await writeFile(join(dir, 'SPEC.md'), '# SPEC\n', 'utf8')
     await tool('squad_status').execute({}, exec)
     assert.ok(await stat(join(dir, 'SPEC-V1.md')))
 
     // --- review pending → deferred verdict capture + round archive ---------
-    await dispatch({ agent: 'zcode', message: 'impl', phase: 'implement' })
+    await dispatch({ agent: 'worker1', message: 'impl', phase: 'implement' })
     await delayMs(120)
     await tool('squad_status').execute({}, exec)
     await writeFile(join(dir, 'TEST-REVIEW.md'), '# TEST\n\nVERDICT: APPROVED\n', 'utf8')
-    assert.match(await dispatch({ agent: 'gpt', message: 'test', phase: 'test-review' }), /已后台派发 gpt/)
+    assert.match(await dispatch({ agent: 'tester', message: 'test', phase: 'test-review' }), /已后台派发 tester/)
     await delayMs(120)
     await tool('squad_status').execute({}, exec)
     assert.ok(await stat(join(dir, 'TEST-REVIEW-R1.md')))
     await writeFile(join(dir, 'TECH-REVIEW.md'), '# TECH\n\nVERDICT: APPROVED\n', 'utf8')
-    assert.match(await dispatch({ agent: 'codex', message: 'tech', phase: 'tech-review' }), /已后台派发 codex/)
+    assert.match(await dispatch({ agent: 'brain', message: 'tech', phase: 'tech-review' }), /已后台派发 brain/)
     // finish is blocked while the review is still in flight (the generic
     // running-child guard fires first, the pending gate covers the rest).
     await assert.rejects(
@@ -5637,7 +5669,7 @@ test('T18 slow external phases return immediately, stay pending, then flush', as
     assert.ok(await stat(join(dir, 'TECH-REVIEW-R1.md')))
 
     await writeFile(join(dir, 'REVIEW.md'), '# REVIEW\n\nVERDICT: APPROVED\n', 'utf8')
-    assert.match(await dispatch({ agent: 'codex', message: 'review', phase: 'review' }), /已后台派发 codex/)
+    assert.match(await dispatch({ agent: 'brain', message: 'review', phase: 'review' }), /已后台派发 brain/)
     await delayMs(120)
     await tool('squad_status').execute({}, exec)
     state = await readState(task)
@@ -5668,11 +5700,11 @@ test('T19 two active tasks keep separate state, teammates and addressing', async
           version: 3,
           revision: 1,
           agents: [
-            { id: 'codex', displayName: 'codex', role: 'brain', executor: 'team', model: '', description: 'b' },
-            { id: 'gpt', displayName: 'gpt', role: 'tester', executor: 'team', model: '', description: 'a' },
-            { id: 'zcode', displayName: 'zcode', role: 'worker', executor: 'team', model: '', description: 'w' },
-            { id: 'qoder', displayName: 'qoder', role: 'worker', executor: 'team', model: '', description: 'w2' },
-            { id: 'opencode', displayName: 'opencode', role: 'worker', executor: 'team', model: '', description: 'w3' },
+            { id: 'brain', displayName: 'brain', role: 'brain', executor: 'team', model: '', description: 'b' },
+            { id: 'tester', displayName: 'tester', role: 'tester', executor: 'team', model: '', description: 'a' },
+            { id: 'worker1', displayName: 'worker1', role: 'worker', executor: 'team', model: '', description: 'w' },
+            { id: 'front1', displayName: 'front1', role: 'worker', executor: 'team', model: '', description: 'w2' },
+            { id: 'worker2', displayName: 'worker2', role: 'worker', executor: 'team', model: '', description: 'w3' },
           ],
           worktree: { directory: '.agents/worktrees' },
         },
@@ -5690,7 +5722,7 @@ test('T19 two active tasks keep separate state, teammates and addressing', async
     await tool('squad_enable').execute({}, exec)
     const dispatch = (args) => tool('squad_dispatch').execute(args, exec)
     const startTask = async (goal) => {
-      const out = await tool('squad_start').execute({ goal, acceptance: 'ok', agents: ['codex', 'zcode'] }, exec)
+      const out = await tool('squad_start').execute({ goal, acceptance: 'ok', agents: ['brain', 'worker1'] }, exec)
       return /任务 (t-\S+) 已创建/.exec(out)[1]
     }
     const readState = async (task) =>
@@ -5703,26 +5735,26 @@ test('T19 two active tasks keep separate state, teammates and addressing', async
     assert.equal((await readState(taskA)).taskId, taskA)
     assert.equal((await readState(taskB)).taskId, taskB)
 
-    // Each task keeps its own zcode teammate with a task-scoped spawn name.
+    // Each task keeps its own worker1 teammate with a task-scoped spawn name.
     await writeFile(join(workspace, '.agent-squad', taskA, 'PLAN.md'), '# A\n', 'utf8')
     await writeFile(join(workspace, '.agent-squad', taskB, 'PLAN.md'), '# B\n', 'utf8')
     await tool('squad_approve_plan').execute({ task_id: taskA }, exec)
     await tool('squad_approve_plan').execute({ task_id: taskB }, exec)
-    const aOut = await dispatch({ agent: 'zcode', message: 'impl A', phase: 'implement', task_id: taskA })
+    const aOut = await dispatch({ agent: 'worker1', message: 'impl A', phase: 'implement', task_id: taskA })
     assert.match(aOut, new RegExp(`task=${taskA}`))
-    assert.equal(host.spawned.at(-1).name, `${taskA}-zcode`)
-    const bOut = await dispatch({ agent: 'zcode', message: 'impl B', phase: 'implement', task_id: taskB })
+    assert.equal(host.spawned.at(-1).name, `${taskA}-worker1`)
+    const bOut = await dispatch({ agent: 'worker1', message: 'impl B', phase: 'implement', task_id: taskB })
     assert.match(bOut, new RegExp(`task=${taskB}`))
-    assert.equal(host.spawned.at(-1).name, `${taskB}-zcode`)
+    assert.equal(host.spawned.at(-1).name, `${taskB}-worker1`)
     // Same roster member, two distinct children.
     const childrenA = (await readState(taskA)).members
     const childrenB = (await readState(taskB)).members
-    assert.ok(childrenA.zcode?.id && childrenB.zcode?.id)
-    assert.notEqual(childrenA.zcode.id, childrenB.zcode.id)
+    assert.ok(childrenA.worker1?.id && childrenB.worker1?.id)
+    assert.notEqual(childrenA.worker1.id, childrenB.worker1.id)
     // Re-dispatching a task resumes ITS child (not the other task's).
-    const resumeA = await dispatch({ agent: 'zcode', message: 'again A', phase: 'implement', task_id: taskA })
-    assert.match(resumeA, /已续跑 zcode/)
-    assert.equal(host.sent.at(-1).targetId, childrenA.zcode.id)
+    const resumeA = await dispatch({ agent: 'worker1', message: 'again A', phase: 'implement', task_id: taskA })
+    assert.match(resumeA, /已续跑 worker1/)
+    assert.equal(host.sent.at(-1).targetId, childrenA.worker1.id)
 
     // Addressability by id works even though current.json points at B.
     const status = await tool('squad_status').execute({}, exec)
@@ -5730,13 +5762,13 @@ test('T19 two active tasks keep separate state, teammates and addressing', async
     assert.match(status, new RegExp(`- ${taskA}  phase=`))
     // Unknown ids are refused with guidance.
     await assert.rejects(
-      dispatch({ agent: 'zcode', message: 'x', phase: 'implement', task_id: 't-nope' }),
+      dispatch({ agent: 'worker1', message: 'x', phase: 'implement', task_id: 't-nope' }),
       /未知小队任务 "t-nope"：先 squad_start 创建，或核对任务 id。/,
     )
 
     // Finishing one task leaves the other active and addressable.
     await writeFile(join(workspace, '.agent-squad', taskA, 'REVIEW.md'), '# R\n\nVERDICT: APPROVED\n', 'utf8')
-    await dispatch({ agent: 'codex', message: 'review A', phase: 'review', task_id: taskA })
+    await dispatch({ agent: 'brain', message: 'review A', phase: 'review', task_id: taskA })
     assert.match(await tool('squad_finish').execute({ summary: 'A done', task_id: taskA }, exec), /收尾/)
     assert.equal((await readState(taskA)).phase, 'done')
     assert.notEqual((await readState(taskB)).phase, 'done')
@@ -5744,8 +5776,8 @@ test('T19 two active tasks keep separate state, teammates and addressing', async
     assert.ok(!new RegExp(`- ${taskA}  phase=`).test(statusB), 'finished task leaves the active list')
     // B still dispatches normally after A closed.
     assert.match(
-      await dispatch({ agent: 'zcode', message: 'again B', phase: 'implement', task_id: taskB }),
-      /已(续跑|创建) zcode/,
+      await dispatch({ agent: 'worker1', message: 'again B', phase: 'implement', task_id: taskB }),
+      /已(续跑|创建) worker1/,
     )
   } finally {
     restoreDshHome()
@@ -5771,11 +5803,11 @@ test('T20 a second task gets its own worktree and a runtime-safe child name', as
           version: 3,
           revision: 1,
           agents: [
-            { id: 'codex', displayName: 'codex', role: 'brain', executor: 'team', model: '', description: 'b' },
-            { id: 'gpt', displayName: 'gpt', role: 'tester', executor: 'team', model: '', description: 'a' },
-            { id: 'zcode', displayName: 'zcode', role: 'worker', executor: 'team', model: '', description: 'w' },
-            { id: 'qoder', displayName: 'qoder', role: 'worker', executor: 'team', model: '', description: 'w2' },
-            { id: 'opencode', displayName: 'opencode', role: 'worker', executor: 'team', model: '', description: 'w3' },
+            { id: 'brain', displayName: 'brain', role: 'brain', executor: 'team', model: '', description: 'b' },
+            { id: 'tester', displayName: 'tester', role: 'tester', executor: 'team', model: '', description: 'a' },
+            { id: 'worker1', displayName: 'worker1', role: 'worker', executor: 'team', model: '', description: 'w' },
+            { id: 'front1', displayName: 'front1', role: 'worker', executor: 'team', model: '', description: 'w2' },
+            { id: 'worker2', displayName: 'worker2', role: 'worker', executor: 'team', model: '', description: 'w3' },
           ],
           worktree: { directory: '.agents/worktrees' },
         },
@@ -5795,7 +5827,7 @@ test('T20 a second task gets its own worktree and a runtime-safe child name', as
     await tool('squad_enable').execute({}, exec)
     const startTask = async (goal) => {
       const out = await tool('squad_start').execute(
-        { goal, acceptance: 'ok', agents: ['zcode'] },
+        { goal, acceptance: 'ok', agents: ['worker1'] },
         exec,
       )
       return /任务 (t-\S+) 已创建/.exec(out)[1]
@@ -5828,12 +5860,12 @@ test('T20 a second task gets its own worktree and a runtime-safe child name', as
     await tool('squad_approve_plan').execute({ task_id: taskA }, exec)
     await tool('squad_approve_plan').execute({ task_id: taskB }, exec)
     await tool('squad_dispatch').execute(
-      { agent: 'zcode', message: 'impl A', phase: 'implement', task_id: taskA },
+      { agent: 'worker1', message: 'impl A', phase: 'implement', task_id: taskA },
       exec,
     )
     const nameA = host.spawned.at(-1).name
     await tool('squad_dispatch').execute(
-      { agent: 'zcode', message: 'impl B', phase: 'implement', task_id: taskB },
+      { agent: 'worker1', message: 'impl B', phase: 'implement', task_id: taskB },
       exec,
     )
     const nameB = host.spawned.at(-1).name
@@ -5881,11 +5913,11 @@ test('T21 acceptance mode runs dual acceptance against an authority document', a
           version: 3,
           revision: 1,
           agents: [
-            { id: 'codex', displayName: 'codex', role: 'brain', executor: 'team', model: '', description: 'b' },
-            { id: 'gpt', displayName: 'gpt', role: 'tester', executor: 'team', model: '', description: 'a' },
-            { id: 'zcode', displayName: 'zcode', role: 'worker', executor: 'team', model: '', description: 'w' },
-            { id: 'qoder', displayName: 'qoder', role: 'worker', executor: 'team', model: '', description: 'w2' },
-            { id: 'opencode', displayName: 'opencode', role: 'worker', executor: 'team', model: '', description: 'w3' },
+            { id: 'brain', displayName: 'brain', role: 'brain', executor: 'team', model: '', description: 'b' },
+            { id: 'tester', displayName: 'tester', role: 'tester', executor: 'team', model: '', description: 'a' },
+            { id: 'worker1', displayName: 'worker1', role: 'worker', executor: 'team', model: '', description: 'w' },
+            { id: 'front1', displayName: 'front1', role: 'worker', executor: 'team', model: '', description: 'w2' },
+            { id: 'worker2', displayName: 'worker2', role: 'worker', executor: 'team', model: '', description: 'w3' },
           ],
           worktree: { directory: '.agents/worktrees' },
         },
@@ -5922,7 +5954,7 @@ test('T21 acceptance mode runs dual acceptance against an authority document', a
     )
     const task = /任务 (t-\S+) 已创建/.exec(startOut)[1]
     const dir = join(workspace, '.agent-squad', task)
-    assert.match(startOut, /acceptance（权威方案 → gpt 技术维度验收 → codex 业务维度验收 → 验收报告 → worker 修复循环）/)
+    assert.match(startOut, /acceptance（权威方案 → tester 技术维度验收 → brain 业务维度验收 → 验收报告 → worker 修复循环）/)
     assert.match(startOut, /已固化到 AUTHORITY\.md/)
     const authority = await readFile(join(dir, 'AUTHORITY.md'), 'utf8')
     assert.match(authority, /权威方案 AC：登录接口返回 token/)
@@ -5933,47 +5965,47 @@ test('T21 acceptance mode runs dual acceptance against an authority document', a
     assert.equal(state.authority.file, 'AUTHORITY.md')
 
     // --- dev phases are refused in acceptance mode ---------------------------
-    await assert.rejects(dispatch({ agent: 'codex', message: 'p', phase: 'design' }), /验收模式任务没有 design 阶段/)
-    await assert.rejects(dispatch({ agent: 'zcode', message: 'i', phase: 'implement' }), /验收模式任务没有 implement 阶段/)
+    await assert.rejects(dispatch({ agent: 'brain', message: 'p', phase: 'design' }), /验收模式任务没有 design 阶段/)
+    await assert.rejects(dispatch({ agent: 'worker1', message: 'i', phase: 'implement' }), /验收模式任务没有 implement 阶段/)
 
     // --- round 1: order enforced, roles gated --------------------------------
-    await assert.rejects(dispatch({ agent: 'codex', message: 'biz first', phase: 'acceptance' }), /双验收顺序（强制）：先派 tester（gpt，phase="acceptance"）完成技术维度验收/)
-    await assert.rejects(dispatch({ agent: 'zcode', message: 'who', phase: 'acceptance' }), /acceptance 只能派 tester（gpt，技术维度）与 brain（codex，业务维度）；zcode 当前是 worker。/)
-    assert.match(await dispatch({ agent: 'gpt', message: 'tech review r1', phase: 'acceptance' }), /acceptance: 轮次=1/)
-    await assert.rejects(dispatch({ agent: 'gpt', message: 'tech again', phase: 'acceptance' }), /本轮（第 1 轮）技术维度验收已由 gpt 完成/)
+    await assert.rejects(dispatch({ agent: 'brain', message: 'biz first', phase: 'acceptance' }), /双验收顺序（强制）：先派 tester（phase="acceptance"）完成技术维度验收/)
+    await assert.rejects(dispatch({ agent: 'worker1', message: 'who', phase: 'acceptance' }), /acceptance 只能派 tester（技术维度）与 brain（业务维度）；worker1 当前是 worker。/)
+    assert.match(await dispatch({ agent: 'tester', message: 'tech review r1', phase: 'acceptance' }), /acceptance: 轮次=1/)
+    await assert.rejects(dispatch({ agent: 'tester', message: 'tech again', phase: 'acceptance' }), /本轮（第 1 轮）技术维度验收已由 tester 完成/)
     await writeReport(task, 'CHANGES_REQUESTED', 1)
-    assert.match(await dispatch({ agent: 'codex', message: 'biz finalize r1', phase: 'acceptance' }), /acceptance: 轮次=1 技术维度=gpt 业务维度=codex verdict=CHANGES_REQUESTED/)
+    assert.match(await dispatch({ agent: 'brain', message: 'biz finalize r1', phase: 'acceptance' }), /acceptance: 轮次=1 技术维度=tester 业务维度=brain verdict=CHANGES_REQUESTED/)
     state = await readState(task)
     assert.equal(state.acceptanceRounds, 1)
-    assert.deepEqual(state.acceptanceSteps, { tech: 'gpt', biz: 'codex' })
+    assert.deepEqual(state.acceptanceSteps, { tech: 'tester', biz: 'brain' })
     assert.equal(state.lastAcceptanceVerdict, 'CHANGES_REQUESTED')
     assert.ok(await stat(join(dir, 'ACCEPTANCE-REPORT-R1.md')))
     // Round 1 concluded: another brain dispatch refuses until the issues are fixed.
-    await assert.rejects(dispatch({ agent: 'codex', message: 'again', phase: 'acceptance' }), /本轮（第 1 轮）验收已定稿/)
+    await assert.rejects(dispatch({ agent: 'brain', message: 'again', phase: 'acceptance' }), /本轮（第 1 轮）验收已定稿/)
     // finish needs APPROVED.
     await assert.rejects(tool('squad_finish').execute({ summary: 'no', task_id: task }, exec), /不是 APPROVED/)
 
     // --- worker fixes ride the tech budget; fixes stale the round ------------
     assert.match(
-      await dispatch({ agent: 'zcode', message: 'fix P1', phase: 'rework' }),
+      await dispatch({ agent: 'worker1', message: 'fix P1', phase: 'rework' }),
       /rework: tech=1\/3 business=0\/3/,
     )
     state = await readState(task)
     assert.equal(state.codeEpoch, 1)
-    assert.deepEqual(state.implementers, ['zcode'])
+    assert.deepEqual(state.implementers, ['worker1'])
     assert.equal(bindingStale(state), false, 'the acceptance binding must be stale after the fix')
-    await assert.rejects(dispatch({ agent: 'zcode', message: 'fix P2', phase: 'rework' }), /需要仍然新鲜的 CHANGES_REQUESTED 验收结论/)
+    await assert.rejects(dispatch({ agent: 'worker1', message: 'fix P2', phase: 'rework' }), /需要仍然新鲜的 CHANGES_REQUESTED 验收结论/)
 
     // --- round 2: fresh dual acceptance, previous-round fix status ------------
-    assert.match(await dispatch({ agent: 'gpt', message: 'tech review r2', phase: 'acceptance' }), /acceptance: 轮次=2/)
+    assert.match(await dispatch({ agent: 'tester', message: 'tech review r2', phase: 'acceptance' }), /acceptance: 轮次=2/)
     state = await readState(task)
     assert.equal(state.acceptanceRounds, 2)
-    assert.deepEqual(state.acceptanceSteps, { tech: 'gpt', biz: null })
+    assert.deepEqual(state.acceptanceSteps, { tech: 'tester', biz: null })
     const prompt = host.sent.at(-1).content.map((block) => block.text).join('')
     assert.match(prompt, /AUTHORITY\.md/)
     assert.match(prompt, /ACCEPTANCE-REPORT-R<上一轮>\.md|ACCEPTANCE-REPORT-R/)
     await writeReport(task, 'APPROVED', 2)
-    assert.match(await dispatch({ agent: 'codex', message: 'biz finalize r2', phase: 'acceptance' }), /verdict=APPROVED/)
+    assert.match(await dispatch({ agent: 'brain', message: 'biz finalize r2', phase: 'acceptance' }), /verdict=APPROVED/)
     state = await readState(task)
     assert.equal(state.lastAcceptanceVerdict, 'APPROVED')
     assert.ok(await stat(join(dir, 'ACCEPTANCE-REPORT-R2.md')))
@@ -5984,7 +6016,7 @@ test('T21 acceptance mode runs dual acceptance against an authority document', a
     const devStart = await tool('squad_start').execute({ goal: 'D', acceptance: 'ok' }, exec)
     const devTask = /任务 (t-\S+) 已创建/.exec(devStart)[1]
     await assert.rejects(
-      dispatch({ agent: 'gpt', message: 'x', phase: 'acceptance', task_id: devTask }),
+      dispatch({ agent: 'tester', message: 'x', phase: 'acceptance', task_id: devTask }),
       /研发模式任务没有 acceptance 阶段/,
     )
 
@@ -6008,11 +6040,11 @@ const USAGE_SAMPLE_LINE =
 /** Settings rows used by the context-management tests. */
 function contextAgentSettings(overrides = {}) {
   const rows = [
-    { id: 'codex', displayName: 'codex', role: 'brain', executor: 'external', model: 'mock-ext', description: 'b' },
-    { id: 'gpt', displayName: 'gpt', role: 'tester', executor: 'team', model: '', description: 'a' },
-    { id: 'zcode', displayName: 'zcode', role: 'worker', executor: 'local', model: 'p/m1', description: 'w' },
-    { id: 'qoder', displayName: 'qoder', role: 'worker', executor: 'team', model: '', description: 'w2' },
-    { id: 'opencode', displayName: 'opencode', role: 'worker', executor: 'local', model: 'dsh-opencode-go/deepseek-v4.1-flash', description: 'w3' },
+    { id: 'brain', displayName: 'brain', role: 'brain', executor: 'external', model: 'mock-ext', description: 'b' },
+    { id: 'tester', displayName: 'tester', role: 'tester', executor: 'team', model: '', description: 'a' },
+    { id: 'worker1', displayName: 'worker1', role: 'worker', executor: 'local', model: 'p/m1', description: 'w' },
+    { id: 'front1', displayName: 'front1', role: 'worker', executor: 'team', model: '', description: 'w2' },
+    { id: 'worker2', displayName: 'worker2', role: 'worker', executor: 'local', model: 'dsh-opencode-go/deepseek-v4.1-flash', description: 'w3' },
   ]
   return {
     version: 3,
@@ -6192,8 +6224,8 @@ test('T22 context policy', async (t) => {
 
   for (const thresholdRatio of [0.121, 1]) {
     await withSquadHost({ config: { contextPolicy: { thresholdRatio, maxOutputTokens: 1 } } }, async ({ tool, exec, host }) => {
-      await startContextTask(tool, exec, { agents: ['zcode'] })
-      const out = await tool('squad_dispatch').execute({ agent: 'zcode', message: 'impl', phase: 'implement' }, exec)
+      await startContextTask(tool, exec, { agents: ['worker1'] })
+      const out = await tool('squad_dispatch').execute({ agent: 'worker1', message: 'impl', phase: 'implement' }, exec)
       assert.ok(out.includes(`threshold=${thresholdRatio}（新建/暂无用量）`))
       assert.equal(host.activations.at(-1).agentOptions.maxTokens, 1)
     })
@@ -6201,22 +6233,22 @@ test('T22 context policy', async (t) => {
 
   // --- S1/S3: defaults, explicit values, caps and false --------------------
   await withSquadHost({}, async ({ tool, exec, host }) => {
-    const { taskId } = await startContextTask(tool, exec, { agents: ['zcode', 'qoder', 'opencode'] })
-    await tool('squad_dispatch').execute({ agent: 'zcode', message: 'impl', phase: 'implement' }, exec)
+    const { taskId } = await startContextTask(tool, exec, { agents: ['worker1', 'front1', 'worker2'] })
+    await tool('squad_dispatch').execute({ agent: 'worker1', message: 'impl', phase: 'implement' }, exec)
     assert.deepEqual(host.activations.at(-1).agentOptions, {
       provider: 'p',
       model: 'm1',
       maxTokens: 16384,
     })
     // Team spawn only adds the cap; the route stays inherited.
-    await tool('squad_dispatch').execute({ agent: 'qoder', message: 'impl', phase: 'implement' }, exec)
+    await tool('squad_dispatch').execute({ agent: 'front1', message: 'impl', phase: 'implement' }, exec)
     assert.deepEqual(host.activations.at(-1).agentOptions, { maxTokens: 16384 })
     assert.equal(host.activations.at(-1).provider, 'spawn')
     // A smaller parent cap wins.
     exec.agent.options = { maxTokens: 4096 }
-    const second = await startContextTask(tool, exec, { agents: ['zcode'] })
+    const second = await startContextTask(tool, exec, { agents: ['worker1'] })
     await tool('squad_dispatch').execute(
-      { agent: 'zcode', message: 'impl', phase: 'implement', task_id: second.taskId },
+      { agent: 'worker1', message: 'impl', phase: 'implement', task_id: second.taskId },
       exec,
     )
     assert.deepEqual(host.activations.at(-1).agentOptions, {
@@ -6227,24 +6259,24 @@ test('T22 context policy', async (t) => {
     assert.ok(taskId)
   })
   await withSquadHost({ config: { contextPolicy: { maxOutputTokens: null } } }, async ({ tool, exec, host }) => {
-    await startContextTask(tool, exec, { agents: ['zcode'] })
-    await tool('squad_dispatch').execute({ agent: 'zcode', message: 'impl', phase: 'implement' }, exec)
+    await startContextTask(tool, exec, { agents: ['worker1'] })
+    await tool('squad_dispatch').execute({ agent: 'worker1', message: 'impl', phase: 'implement' }, exec)
     assert.deepEqual(host.activations.at(-1).agentOptions, { provider: 'p', model: 'm1' })
   })
   await withSquadHost({ config: { contextPolicy: false } }, async ({ tool, exec, host }) => {
-    await startContextTask(tool, exec, { agents: ['zcode'] })
-    await tool('squad_dispatch').execute({ agent: 'zcode', message: 'impl', phase: 'implement' }, exec)
+    await startContextTask(tool, exec, { agents: ['worker1'] })
+    await tool('squad_dispatch').execute({ agent: 'worker1', message: 'impl', phase: 'implement' }, exec)
     assert.deepEqual(host.activations.at(-1).agentOptions, { provider: 'p', model: 'm1' })
     assert.equal(tool('squad_compact'), undefined, 'no compact tool without the policy')
     assert.ok(!host.activations.at(-1).prompt.map((block) => block.text).join('').includes('上下文纪律'))
   })
   // External pinned gets the cap; non-pinned external gets no options at all.
   await withSquadHost({
-    overrides: { codex: { executor: 'external', model: 'p/m9' } },
+    overrides: { brain: { executor: 'external', model: 'p/m9' } },
   }, async ({ tool, exec, host, workspace }) => {
-    const { taskId } = await startContextTask(tool, exec, { agents: ['codex'] })
+    const { taskId } = await startContextTask(tool, exec, { agents: ['brain'] })
     await writeFile(join(workspace, '.agent-squad', taskId, 'PLAN.md'), '# PLAN (mock)\n', 'utf8')
-    await tool('squad_dispatch').execute({ agent: 'codex', message: 'design', phase: 'design' }, exec)
+    await tool('squad_dispatch').execute({ agent: 'brain', message: 'design', phase: 'design' }, exec)
     assert.equal(host.activations.at(-1).provider, 'spawn')
     assert.deepEqual(host.activations.at(-1).agentOptions, {
       provider: 'p',
@@ -6253,26 +6285,26 @@ test('T22 context policy', async (t) => {
     })
   })
   await withSquadHost({}, async ({ tool, exec, host, workspace }) => {
-    const { taskId } = await startContextTask(tool, exec, { agents: ['codex'] })
+    const { taskId } = await startContextTask(tool, exec, { agents: ['brain'] })
     await writeFile(join(workspace, '.agent-squad', taskId, 'PLAN.md'), '# PLAN (mock)\n', 'utf8')
-    await tool('squad_dispatch').execute({ agent: 'codex', message: 'design', phase: 'design' }, exec)
+    await tool('squad_dispatch').execute({ agent: 'brain', message: 'design', phase: 'design' }, exec)
     assert.equal(host.activations.at(-1).provider, 'mock-ext')
     assert.equal(host.activations.at(-1).agentOptions, undefined)
   })
   // Team fork: host capability decides whether the cap is injected.
   const forkAgents = BUNDLE_AGENTS.map((agent) =>
-    agent.name === 'qoder' ? { ...agent, context: 'fork' } : agent,
+    agent.name === 'front1' ? { ...agent, context: 'fork' } : agent,
   )
   await withSquadHost({ config: { agents: forkAgents } }, async ({ tool, exec, host }) => {
     host.providers.set('fork', { capabilities: { agentOptions: true } })
-    const first = await startContextTask(tool, exec, { agents: ['qoder'] })
-    await tool('squad_dispatch').execute({ agent: 'qoder', message: 'impl', phase: 'implement' }, exec)
+    const first = await startContextTask(tool, exec, { agents: ['front1'] })
+    await tool('squad_dispatch').execute({ agent: 'front1', message: 'impl', phase: 'implement' }, exec)
     assert.equal(host.activations.at(-1).provider, 'fork')
     assert.deepEqual(host.activations.at(-1).agentOptions, { maxTokens: 16384 })
     host.providers.set('fork', { capabilities: { agentOptions: false } })
-    const second = await startContextTask(tool, exec, { agents: ['qoder'] })
+    const second = await startContextTask(tool, exec, { agents: ['front1'] })
     const out = await tool('squad_dispatch').execute(
-      { agent: 'qoder', message: 'impl', phase: 'implement', task_id: second.taskId },
+      { agent: 'front1', message: 'impl', phase: 'implement', task_id: second.taskId },
       exec,
     )
     assert.equal(host.activations.at(-1).provider, 'fork')
@@ -6281,9 +6313,9 @@ test('T22 context policy', async (t) => {
     assert.ok(first.taskId)
     // Unknown fork capability (no provider registered) behaves like false.
     host.providers.delete('fork')
-    const third = await startContextTask(tool, exec, { agents: ['qoder'] })
+    const third = await startContextTask(tool, exec, { agents: ['front1'] })
     const unknownOut = await tool('squad_dispatch').execute(
-      { agent: 'qoder', message: 'impl', phase: 'implement', task_id: third.taskId },
+      { agent: 'front1', message: 'impl', phase: 'implement', task_id: third.taskId },
       exec,
     )
     assert.equal(host.activations.at(-1).provider, 'fork')
@@ -6294,10 +6326,10 @@ test('T22 context policy', async (t) => {
       if (id === 'fork') throw new Error('capability unavailable')
       return originalGetProvider(id)
     }
-    const fourth = await startContextTask(tool, exec, { agents: ['qoder'] })
+    const fourth = await startContextTask(tool, exec, { agents: ['front1'] })
     const before = host.activations.length
     const failedLookupOut = await tool('squad_dispatch').execute(
-      { agent: 'qoder', message: 'impl', phase: 'implement', task_id: fourth.taskId }, exec,
+      { agent: 'front1', message: 'impl', phase: 'implement', task_id: fourth.taskId }, exec,
     )
     assert.equal(host.activations.length, before + 1, 'do not fall back by starting another child')
     assert.equal(host.activations.at(-1).provider, 'fork')
@@ -6313,11 +6345,11 @@ test('T22 context policy', async (t) => {
   ]) {
     await withSquadHost({
       config: { workerProbe: true },
-      overrides: { zcode: { executor, model, reasoning: 'max' } },
+      overrides: { worker1: { executor, model, reasoning: 'max' } },
     }, async ({ tool, exec, host }) => {
-      await startContextTask(tool, exec, { agents: ['zcode'] })
-      await tool('squad_dispatch').execute({ agent: 'zcode', message: 'impl', phase: 'implement' }, exec)
-      const probe = host.activations.find((row) => row.label === 'probe/zcode')
+      await startContextTask(tool, exec, { agents: ['worker1'] })
+      await tool('squad_dispatch').execute({ agent: 'worker1', message: 'impl', phase: 'implement' }, exec)
+      const probe = host.activations.find((row) => row.label === 'probe/worker1')
       const business = host.activations.at(-1)
       assert.equal(business.provider, provider)
       assert.deepEqual(business.agentOptions, agentOptions)
@@ -6337,8 +6369,8 @@ test('T22 context policy', async (t) => {
   await t.test('pre-step delegates T−1/T and prune/re-measure to the host', async () => {
     await withSquadHost({}, async ({ tool, exec, host, lead }) => {
       await tool('squad_enable').execute({}, exec)
-      await startContextTask(tool, exec, { agents: ['zcode'] })
-      await tool('squad_dispatch').execute({ agent: 'zcode', message: 'impl', phase: 'implement' }, exec)
+      await startContextTask(tool, exec, { agents: ['worker1'] })
+      await tool('squad_dispatch').execute({ agent: 'worker1', message: 'impl', phase: 'implement' }, exec)
       const { childId, agentOptions } = host.activations.at(-1)
       const o = agentOptions.maxTokens
       assert.equal(o, cap, 'O comes from the child request, not the summary cap')
@@ -6390,8 +6422,8 @@ test('T22 context policy', async (t) => {
   // --- S4: exactly one automatic executor ---------------------------------
   await withSquadHost({}, async ({ tool, exec, host, lead }) => {
     await tool('squad_enable').execute({}, exec)
-    const { taskId } = await startContextTask(tool, exec, { agents: ['zcode'] })
-    await tool('squad_dispatch').execute({ agent: 'zcode', message: 'impl', phase: 'implement' }, exec)
+    const { taskId } = await startContextTask(tool, exec, { agents: ['worker1'] })
+    await tool('squad_dispatch').execute({ agent: 'worker1', message: 'impl', phase: 'implement' }, exec)
     const childId = host.activations.at(-1).childId
     const child = host.makeAgent(childId, undefined, {
       header: { config: { provider: 'p', model: 'm1' } },
@@ -6435,7 +6467,7 @@ test('T22 context policy', async (t) => {
     compaction.config = { auto: false }
     await handler({ agent: lead, signal: new AbortController().signal }, next)
     await handler({ agent: host.makeAgent('unbound-1', undefined), signal: new AbortController().signal }, next)
-    const sameName = host.makeAgent('same-name-1', { role: 'teammate', name: 'zcode' })
+    const sameName = host.makeAgent('same-name-1', { role: 'teammate', name: 'worker1' })
     sameName.__root = lead
     await handler({ agent: sameName, signal: new AbortController().signal }, next)
     const otherTree = host.makeAgent('other-tree-1', undefined)
@@ -6475,28 +6507,28 @@ test('T22 context policy', async (t) => {
   await t.test('probe substitution recomputes executor, pinned route and cap', async () => {
     await withSquadHost({
       config: { workerProbe: true },
-      overrides: { opencode: { executor: 'external', reasoning: 'max' } },
+      overrides: { worker2: { executor: 'external', reasoning: 'max' } },
     }, async ({ workspace, tool, exec, host }) => {
-      const { taskId } = await startContextTask(tool, exec, { agents: ['zcode', 'opencode'] })
+      const { taskId } = await startContextTask(tool, exec, { agents: ['worker1', 'worker2'] })
       exec.agent.options = { maxTokens: 4096 }
       const originalStart = host.subagents.startActivation
       host.subagents.startActivation = (spec) => {
-        if (spec.label === 'probe/zcode') throw new Error('HTTP 429 quota exceeded (fixture)')
+        if (spec.label === 'probe/worker1') throw new Error('HTTP 429 quota exceeded (fixture)')
         return originalStart(spec)
       }
-      const out = await tool('squad_dispatch').execute({ agent: 'zcode', message: 'impl', phase: 'implement' }, exec)
-      assert.match(out, /自动改由 opencode 执行/)
+      const out = await tool('squad_dispatch').execute({ agent: 'worker1', message: 'impl', phase: 'implement' }, exec)
+      assert.match(out, /自动改由 worker2 执行/)
       const [probe, business] = host.activations
       const state = JSON.parse(await readFile(join(workspace, '.agent-squad', taskId, 'STATE.json'), 'utf8'))
       const backupOptions = { provider: 'dsh-opencode-go', model: 'deepseek-v4.1-flash', reasoningEffort: 'max', maxTokens: 4096 }
-      assert.equal(probe.label, 'probe/opencode')
+      assert.equal(probe.label, 'probe/worker2')
       assert.deepEqual(probe.agentOptions, backupOptions)
       assert.deepEqual({
         capAndRoute: business.agentOptions,
         name: business.name,
         delivery: business.delivery,
         mode: state.dispatches.at(-1).mode,
-        localChild: state.children?.opencode,
+        localChild: state.children?.worker2,
       }, { capAndRoute: backupOptions, name: undefined, delivery: 'parent', mode: 'external', localChild: undefined })
     })
   })
@@ -6504,10 +6536,10 @@ test('T22 context policy', async (t) => {
   await t.test('quota substitute rechecks current busy state and background eligibility', async () => {
     await withSquadHost({
       config: { workerProbe: true },
-      overrides: { opencode: { executor: 'team', model: '' } },
+      overrides: { worker2: { executor: 'team', model: '' } },
     }, async ({ workspace, tool, exec, host }) => {
-      const { taskId } = await startContextTask(tool, exec, { agents: ['zcode', 'opencode'] })
-      await tool('squad_dispatch').execute({ agent: 'opencode', message: 'first', phase: 'implement' }, exec)
+      const { taskId } = await startContextTask(tool, exec, { agents: ['worker1', 'worker2'] })
+      await tool('squad_dispatch').execute({ agent: 'worker2', message: 'first', phase: 'implement' }, exec)
       const member = host.members.at(-1)
       const statePath = join(workspace, '.agent-squad', taskId, 'STATE.json')
       const briefPath = join(dirname(statePath), 'BRIEF.md')
@@ -6515,22 +6547,22 @@ test('T22 context policy', async (t) => {
       const briefBefore = await readFile(briefPath, 'utf8')
       const startActivation = host.subagents.startActivation
       host.subagents.startActivation = (spec) => {
-        if (spec.label === 'probe/zcode') {
+        if (spec.label === 'probe/worker1') {
           member.status = 'running' // The first catalog read saw this backup idle.
           throw new Error('HTTP 429 quota exceeded (fixture)')
         }
         return startActivation(spec)
       }
-      await assert.rejects(tool('squad_dispatch').execute({ agent: 'zcode', message: 'retry', phase: 'implement' }, exec), /目标 opencode 仍在运行或创建中/)
+      await assert.rejects(tool('squad_dispatch').execute({ agent: 'worker1', message: 'retry', phase: 'implement' }, exec), /目标 worker2 仍在运行或创建中/)
       assert.equal(host.activations.length, 1)
       assert.equal(host.sent.length, 0)
       assert.equal(await readFile(statePath, 'utf8'), before)
       assert.equal(await readFile(briefPath, 'utf8'), briefBefore)
     })
 
-    await withSquadHost({ config: { workerProbe: true }, overrides: { zcode: { executor: 'external' } } },
+    await withSquadHost({ config: { workerProbe: true }, overrides: { worker1: { executor: 'external' } } },
       async ({ workspace, tool, exec, host }) => {
-        const { taskId } = await startContextTask(tool, exec, { agents: ['zcode', 'opencode'] })
+        const { taskId } = await startContextTask(tool, exec, { agents: ['worker1', 'worker2'] })
         const statePath = join(workspace, '.agent-squad', taskId, 'STATE.json')
         const roundAndBudget = async () => {
           const { round, codeEpoch, dispatches, reworkRounds, techReworkRounds, businessReworkRounds } = JSON.parse(await readFile(statePath, 'utf8'))
@@ -6539,13 +6571,13 @@ test('T22 context policy', async (t) => {
         const before = await roundAndBudget()
         const startActivation = host.subagents.startActivation
         host.subagents.startActivation = (spec) => {
-          if (spec.label === 'probe/zcode') throw new Error('HTTP 429 quota exceeded (fixture)')
+          if (spec.label === 'probe/worker1') throw new Error('HTTP 429 quota exceeded (fixture)')
           return startActivation(spec)
         }
         await assert.rejects(tool('squad_dispatch').execute(
-          { agent: 'zcode', message: 'retry', phase: 'implement', background: true }, exec,
+          { agent: 'worker1', message: 'retry', phase: 'implement', background: true }, exec,
         ), /background 仅支持 external 执行者/)
-        assert.deepEqual(host.activations.map((row) => row.label), ['probe/opencode'])
+        assert.deepEqual(host.activations.map((row) => row.label), ['probe/worker2'])
         assert.deepEqual(await roundAndBudget(), before, 'rejected business dispatch does not advance budgets')
       },
     )
@@ -6569,7 +6601,7 @@ test('T22 context policy', async (t) => {
       { services: { tokenMeter: meter, toolResultPruner: pruner, compaction } },
       async ({ workspace, dshHome, host, tool, exec, lead }) => {
         await tool('squad_enable').execute({}, exec)
-        const { taskId } = await startContextTask(tool, exec, { agents: ['zcode', 'qoder'] })
+        const { taskId } = await startContextTask(tool, exec, { agents: ['worker1', 'front1'] })
         const statePath = join(workspace, '.agent-squad', taskId, 'STATE.json')
         const readState = async () => JSON.parse(await readFile(statePath, 'utf8'))
         const settingsPath = join(dshHome, 'agent-squad', 'settings.json')
@@ -6580,14 +6612,14 @@ test('T22 context policy', async (t) => {
           await store.save({
             expectedRevision: snapshot.revision,
             agents: snapshot.agents.map((row) =>
-              row.id === 'zcode' ? { ...row, executor, model } : row,
+              row.id === 'worker1' ? { ...row, executor, model } : row,
             ),
             worktree: snapshot.worktree,
           })
         }
 
         // A live, idle local child for this task.
-        await tool('squad_dispatch').execute({ agent: 'zcode', message: 'impl', phase: 'implement' }, exec)
+        await tool('squad_dispatch').execute({ agent: 'worker1', message: 'impl', phase: 'implement' }, exec)
         const localChildId = host.activations.at(-1).childId
         const localLive = host.makeAgent(localChildId, undefined, {
           header: { config: { provider: 'p', model: 'm1' } },
@@ -6599,49 +6631,49 @@ test('T22 context policy', async (t) => {
         // withdraw the local record; status/compact work immediately.
         await switchZcode('team', '')
         const teamOut = await tool('squad_dispatch').execute(
-          { agent: 'zcode', message: 'impl as team', phase: 'implement' },
+          { agent: 'worker1', message: 'impl as team', phase: 'implement' },
           exec,
         )
-        assert.match(teamOut, /已创建 zcode/)
+        assert.match(teamOut, /已创建 worker1/)
         const teamState = await readState()
         assert.equal(teamState.dispatches.at(-1).mode, 'spawned')
-        assert.ok(teamState.members?.zcode?.id)
-        assert.notEqual(teamState.members.zcode.id, localChildId)
-        assert.equal(teamState.children?.zcode, undefined, 'stale local binding withdrawn')
+        assert.ok(teamState.members?.worker1?.id)
+        assert.notEqual(teamState.members.worker1.id, localChildId)
+        assert.equal(teamState.children?.worker1, undefined, 'stale local binding withdrawn')
         const status = await tool('squad_status').execute({}, exec)
         assert.match(status, /成员：[\s\S]*?context: /)
-        const compactOut = await tool('squad_compact').execute({ agent: 'zcode' }, exec)
-        assert.match(compactOut, /已压缩 zcode/)
-        assert.equal(compacted.at(-1), teamState.members.zcode.id)
+        const compactOut = await tool('squad_compact').execute({ agent: 'worker1' }, exec)
+        assert.match(compactOut, /已压缩 worker1/)
+        assert.equal(compacted.at(-1), teamState.members.worker1.id)
 
         // Switching back spawns a fresh local child and withdraws the member.
         await switchZcode('local', 'p/m1')
         const backOut = await tool('squad_dispatch').execute(
-          { agent: 'zcode', message: 'impl as local', phase: 'implement' },
+          { agent: 'worker1', message: 'impl as local', phase: 'implement' },
           exec,
         )
-        assert.match(backOut, /已创建本地子代理 zcode/)
+        assert.match(backOut, /已创建本地子代理 worker1/)
         const backState = await readState()
         assert.equal(backState.dispatches.at(-1).mode, 'local')
-        assert.ok(backState.children?.zcode?.id)
-        assert.equal(backState.members?.zcode, undefined, 'stale team binding withdrawn')
+        assert.ok(backState.children?.worker1?.id)
+        assert.equal(backState.members?.worker1, undefined, 'stale team binding withdrawn')
 
         // Legacy name-only row (no task STATE record): no resume, no rebind,
         // no usage grant.
-        delete backState.children.zcode
+        delete backState.children.worker1
         await writeFile(statePath, JSON.stringify(backState, null, 2), 'utf8')
         const legacyId = 'legacy-name-only-1'
-        const legacyAgent = host.makeAgent(legacyId, { role: 'teammate', name: 'zcode' })
+        const legacyAgent = host.makeAgent(legacyId, { role: 'teammate', name: 'worker1' })
         legacyAgent.__root = lead
-        host.members.push({ id: legacyId, name: 'zcode', status: 'inactive' })
+        host.members.push({ id: legacyId, name: 'worker1', status: 'inactive' })
         const sentBefore = host.sent.length
         const legacyOut = await tool('squad_dispatch').execute(
-          { agent: 'zcode', message: 'legacy', phase: 'implement' },
+          { agent: 'worker1', message: 'legacy', phase: 'implement' },
           exec,
         )
-        assert.match(legacyOut, /已创建本地子代理 zcode/)
+        assert.match(legacyOut, /已创建本地子代理 worker1/)
         const legacyState = await readState()
-        assert.notEqual(legacyState.children.zcode.id, legacyId)
+        assert.notEqual(legacyState.children.worker1.id, legacyId)
         assert.equal(host.sent.length, sentBefore, 'legacy row is never resumed')
         assert.equal(host.sent.filter((item) => item.targetId === legacyId).length, 0)
         const legacyStatus = await tool('squad_status').execute({}, exec)
@@ -6669,7 +6701,7 @@ test('T22 context policy', async (t) => {
       { strictNames: true, services: { tokenMeter: meter, toolResultPruner: pruner, compaction } },
       async ({ workspace, dshHome, host, tool, exec, lead }) => {
         await tool('squad_enable').execute({}, exec)
-        const { taskId } = await startContextTask(tool, exec, { agents: ['zcode', 'qoder'] })
+        const { taskId } = await startContextTask(tool, exec, { agents: ['worker1', 'front1'] })
         const statePath = join(workspace, '.agent-squad', taskId, 'STATE.json')
         const readState = async () => JSON.parse(await readFile(statePath, 'utf8'))
         const settingsPath = join(dshHome, 'agent-squad', 'settings.json')
@@ -6680,7 +6712,7 @@ test('T22 context policy', async (t) => {
           await store.save({
             expectedRevision: snapshot.revision,
             agents: snapshot.agents.map((row) =>
-              row.id === 'zcode' ? { ...row, executor, model } : row,
+              row.id === 'worker1' ? { ...row, executor, model } : row,
             ),
             worktree: snapshot.worktree,
           })
@@ -6694,67 +6726,67 @@ test('T22 context policy', async (t) => {
           return agent
         }
 
-        // 1) local child holds host name `zcode` even while idle.
-        await tool('squad_dispatch').execute({ agent: 'zcode', message: 'local one', phase: 'implement' }, exec)
+        // 1) local child holds host name `worker1` even while idle.
+        await tool('squad_dispatch').execute({ agent: 'worker1', message: 'local one', phase: 'implement' }, exec)
         const firstActivation = host.activations.at(-1)
-        assert.equal(firstActivation.name, 'zcode')
+        assert.equal(firstActivation.name, 'worker1')
         const childOne = firstActivation.childId
-        bindLocal(childOne, 'zcode')
+        bindLocal(childOne, 'worker1')
 
         // 2) switching to team must pick a free legal host name, not reuse it.
         await switchZcode('team', '')
         const teamOut = await tool('squad_dispatch').execute(
-          { agent: 'zcode', message: 'team one', phase: 'implement' },
+          { agent: 'worker1', message: 'team one', phase: 'implement' },
           exec,
         )
-        assert.match(teamOut, /已创建 zcode/)
+        assert.match(teamOut, /已创建 worker1/)
         const teamActivation = host.activations.at(-1)
         assert.ok(teamActivation.name)
-        assert.notEqual(teamActivation.name, 'zcode')
+        assert.notEqual(teamActivation.name, 'worker1')
         const teamState = await readState()
-        const teamId = teamState.members.zcode.id
+        const teamId = teamState.members.worker1.id
         assert.notEqual(teamId, childOne)
-        assert.equal(teamState.children?.zcode, undefined)
+        assert.equal(teamState.children?.worker1, undefined)
 
         // 3) switching back to local must pick yet another free name.
         await switchZcode('local', 'p/m1')
         const localOut = await tool('squad_dispatch').execute(
-          { agent: 'zcode', message: 'local two', phase: 'implement' },
+          { agent: 'worker1', message: 'local two', phase: 'implement' },
           exec,
         )
-        assert.match(localOut, /已创建本地子代理 zcode/)
+        assert.match(localOut, /已创建本地子代理 worker1/)
         const localActivation = host.activations.at(-1)
         assert.ok(localActivation.name)
-        assert.notEqual(localActivation.name, 'zcode')
+        assert.notEqual(localActivation.name, 'worker1')
         assert.notEqual(localActivation.name, teamActivation.name)
         const localState = await readState()
-        const childThree = localState.children.zcode.id
+        const childThree = localState.children.worker1.id
         assert.notEqual(childThree, childOne)
-        assert.equal(localState.members?.zcode, undefined)
+        assert.equal(localState.members?.worker1, undefined)
         bindLocal(childThree, localActivation.name)
         const status = await tool('squad_status').execute({}, exec)
-        assert.ok(status.includes(`- zcode → ${childThree} `))
-        assert.match(await tool('squad_compact').execute({ agent: 'zcode' }, exec), /已压缩 zcode/)
+        assert.ok(status.includes(`- worker1 → ${childThree} `))
+        assert.match(await tool('squad_compact').execute({ agent: 'worker1' }, exec), /已压缩 worker1/)
         assert.equal(compacted.at(-1), childThree)
 
         // 4) an existing same-name legacy row must not block a new creation.
-        delete localState.children.zcode
+        delete localState.children.worker1
         await writeFile(statePath, JSON.stringify(localState, null, 2), 'utf8')
         const legacyId = 'legacy-strict-row-1'
-        const legacyAgent = host.makeAgent(legacyId, { role: 'teammate', name: 'zcode' })
+        const legacyAgent = host.makeAgent(legacyId, { role: 'teammate', name: 'worker1' })
         legacyAgent.__root = lead
-        host.members.push({ id: legacyId, name: 'zcode', status: 'inactive' })
+        host.members.push({ id: legacyId, name: 'worker1', status: 'inactive' })
         const legacyOut = await tool('squad_dispatch').execute(
-          { agent: 'zcode', message: 'legacy strict', phase: 'implement' },
+          { agent: 'worker1', message: 'legacy strict', phase: 'implement' },
           exec,
         )
-        assert.match(legacyOut, /已创建本地子代理 zcode/)
+        assert.match(legacyOut, /已创建本地子代理 worker1/)
         const legacyState = await readState()
-        assert.notEqual(legacyState.children.zcode.id, legacyId)
-        assert.notEqual(host.activations.at(-1).name, 'zcode')
-        bindLocal(legacyState.children.zcode.id, host.activations.at(-1).name)
-        assert.match(await tool('squad_compact').execute({ agent: 'zcode' }, exec), /已压缩 zcode/)
-        assert.equal(compacted.at(-1), legacyState.children.zcode.id)
+        assert.notEqual(legacyState.children.worker1.id, legacyId)
+        assert.notEqual(host.activations.at(-1).name, 'worker1')
+        bindLocal(legacyState.children.worker1.id, host.activations.at(-1).name)
+        assert.match(await tool('squad_compact').execute({ agent: 'worker1' }, exec), /已压缩 worker1/)
+        assert.equal(compacted.at(-1), legacyState.children.worker1.id)
       },
     )
   })
@@ -6779,7 +6811,7 @@ test('T22 context policy', async (t) => {
       },
       async ({ workspace, dshHome, host, tool, exec, lead }) => {
         await tool('squad_enable').execute({}, exec)
-        const { taskId } = await startContextTask(tool, exec, { agents: ['zcode'] })
+        const { taskId } = await startContextTask(tool, exec, { agents: ['worker1'] })
         const statePath = join(workspace, '.agent-squad', taskId, 'STATE.json')
         const settingsPath = join(dshHome, 'agent-squad', 'settings.json')
         const { createSettingsStore } = await import('../settings.js')
@@ -6789,7 +6821,7 @@ test('T22 context policy', async (t) => {
           await store.save({
             expectedRevision: snapshot.revision,
             agents: snapshot.agents.map((row) =>
-              row.id === 'zcode' ? { ...row, executor, model } : row,
+              row.id === 'worker1' ? { ...row, executor, model } : row,
             ),
             worktree: snapshot.worktree,
           })
@@ -6810,7 +6842,7 @@ test('T22 context policy', async (t) => {
             messages: [],
           }))
 
-        await tool('squad_dispatch').execute({ agent: 'zcode', message: 'local', phase: 'implement' }, exec)
+        await tool('squad_dispatch').execute({ agent: 'worker1', message: 'local', phase: 'implement' }, exec)
         const oldId = host.activations.at(-1).childId
         const oldAgent = bindLocal(oldId)
         await preStep(oldAgent)
@@ -6819,7 +6851,7 @@ test('T22 context policy', async (t) => {
         // A failed external switch keeps the still-valid local ownership.
         await switchZcode('external', 'mock-ext')
         await assert.rejects(
-          tool('squad_dispatch').execute({ agent: 'zcode', message: 'failing ext', phase: 'implement' }, exec),
+          tool('squad_dispatch').execute({ agent: 'worker1', message: 'failing ext', phase: 'implement' }, exec),
           /provider down/,
         )
         await preStep(oldAgent)
@@ -6827,13 +6859,13 @@ test('T22 context policy', async (t) => {
 
         // A successful one-shot external switch withdraws the old binding.
         await switchZcode('external', 'p/m9')
-        await tool('squad_dispatch').execute({ agent: 'zcode', message: 'one shot', phase: 'implement' }, exec)
+        await tool('squad_dispatch').execute({ agent: 'worker1', message: 'one shot', phase: 'implement' }, exec)
         await preStep(oldAgent)
         assert.deepEqual(calls, [oldId, oldId], 'withdrawn id no longer triggers compaction')
 
         // A later local child keeps the policy-driven fallback.
         await switchZcode('local', 'p/m1')
-        await tool('squad_dispatch').execute({ agent: 'zcode', message: 'local again', phase: 'implement' }, exec)
+        await tool('squad_dispatch').execute({ agent: 'worker1', message: 'local again', phase: 'implement' }, exec)
         const newId = host.activations.at(-1).childId
         assert.notEqual(newId, oldId)
         const newAgent = bindLocal(newId)
@@ -6845,26 +6877,26 @@ test('T22 context policy', async (t) => {
 
   await t.test('a running base-name substitute is refused before probing or creation', async () => {
     await withSquadHost(
-      { config: { workerProbe: true }, overrides: { opencode: { model: 'p/m1' } } },
+      { config: { workerProbe: true }, overrides: { worker2: { model: 'p/m1' } } },
       async ({ workspace, host, tool, exec }) => {
         await tool('squad_enable').execute({}, exec)
-        const { taskId } = await startContextTask(tool, exec, { agents: ['zcode', 'opencode'] })
+        const { taskId } = await startContextTask(tool, exec, { agents: ['worker1', 'worker2'] })
         const statePath = join(workspace, '.agent-squad', taskId, 'STATE.json')
         const readState = async () => JSON.parse(await readFile(statePath, 'utf8'))
         const before = await readState()
 
         // The substitute has only a running same-base-name tree row; there is
         // no STATE record proving it belongs to this task.
-        const runningRow = { id: 'running-opencode-1', name: 'opencode', status: 'running' }
+        const runningRow = { id: 'running-worker2-1', name: 'worker2', status: 'running' }
         host.members.push(runningRow)
         const startActivation = host.subagents.startActivation
         host.subagents.startActivation = (spec) => {
-          if (spec.label === 'probe/zcode') throw new Error('HTTP 429 quota exceeded (fixture)')
+          if (spec.label === 'probe/worker1') throw new Error('HTTP 429 quota exceeded (fixture)')
           return startActivation(spec)
         }
         await assert.rejects(
-          tool('squad_dispatch').execute({ agent: 'zcode', message: 'impl', phase: 'implement' }, exec),
-          /目标 opencode 仍在运行或创建中/,
+          tool('squad_dispatch').execute({ agent: 'worker1', message: 'impl', phase: 'implement' }, exec),
+          /目标 worker2 仍在运行或创建中/,
         )
         assert.equal(
           host.activations.filter((row) => String(row.label ?? '').includes(`/${taskId}/`) === false).length,
@@ -6872,7 +6904,7 @@ test('T22 context policy', async (t) => {
           'no business activation on refusal',
         )
         assert.equal(
-          host.activations.filter((row) => String(row.label ?? '') === `${taskId}/implement/opencode`).length,
+          host.activations.filter((row) => String(row.label ?? '') === `${taskId}/implement/worker2`).length,
           0,
         )
         const afterReject = await readState()
@@ -6894,14 +6926,14 @@ test('T22 context policy', async (t) => {
         // (the base name is still occupied by the old row).
         runningRow.status = 'inactive'
         const retry = await tool('squad_dispatch').execute(
-          { agent: 'zcode', message: 'retry', phase: 'implement' },
+          { agent: 'worker1', message: 'retry', phase: 'implement' },
           exec,
         )
-        assert.match(retry, /已创建本地子代理 opencode/)
-        assert.notEqual(host.activations.at(-1).name, 'opencode')
+        assert.match(retry, /已创建本地子代理 worker2/)
+        assert.notEqual(host.activations.at(-1).name, 'worker2')
         const afterRetry = await readState()
-        assert.ok(afterRetry.children?.opencode?.id)
-        assert.notEqual(afterRetry.children.opencode.id, runningRow.id)
+        assert.ok(afterRetry.children?.worker2?.id)
+        assert.notEqual(afterRetry.children.worker2.id, runningRow.id)
       },
     )
   })
@@ -6929,7 +6961,7 @@ test('T22 context policy', async (t) => {
       { services: { tokenMeter: meter, toolResultPruner: pruner, compaction } },
       async ({ workspace, dshHome, host, tool, exec, lead }) => {
         await tool('squad_enable').execute({}, exec)
-        const { taskId } = await startContextTask(tool, exec, { agents: ['zcode'] })
+        const { taskId } = await startContextTask(tool, exec, { agents: ['worker1'] })
         const statePath = join(workspace, '.agent-squad', taskId, 'STATE.json')
         const readState = async () => JSON.parse(await readFile(statePath, 'utf8'))
         const settingsPath = join(dshHome, 'agent-squad', 'settings.json')
@@ -6939,7 +6971,7 @@ test('T22 context policy', async (t) => {
           const snapshot = await store.read()
           await store.save({
             expectedRevision: snapshot.revision,
-            agents: snapshot.agents.map((row) => (row.id === 'zcode' ? { ...row, model } : row)),
+            agents: snapshot.agents.map((row) => (row.id === 'worker1' ? { ...row, model } : row)),
             worktree: snapshot.worktree,
           })
         }
@@ -6959,7 +6991,7 @@ test('T22 context policy', async (t) => {
             messages: [],
           }))
 
-        await tool('squad_dispatch').execute({ agent: 'zcode', message: 'impl', phase: 'implement' }, exec)
+        await tool('squad_dispatch').execute({ agent: 'worker1', message: 'impl', phase: 'implement' }, exec)
         const oldId = host.activations.at(-1).childId
         const oldAgent = bindLocal(oldId, host.activations.at(-1).name)
 
@@ -6967,18 +6999,18 @@ test('T22 context policy', async (t) => {
         await switchModel('p/m2')
         const startActivation = host.subagents.startActivation
         host.subagents.startActivation = (spec) => {
-          if (spec.label === `${taskId}/implement/zcode`) throw new Error('model capacity unavailable')
+          if (spec.label === `${taskId}/implement/worker1`) throw new Error('model capacity unavailable')
           return startActivation(spec)
         }
         await assert.rejects(
-          tool('squad_dispatch').execute({ agent: 'zcode', message: 'impl m2', phase: 'implement' }, exec),
+          tool('squad_dispatch').execute({ agent: 'worker1', message: 'impl m2', phase: 'implement' }, exec),
           /model capacity unavailable/,
         )
         const failedState = await readState()
-        assert.equal(failedState.children?.zcode?.id, oldId, 'previous proven binding restored')
+        assert.equal(failedState.children?.worker1?.id, oldId, 'previous proven binding restored')
         const status = await tool('squad_status').execute({}, exec)
-        assert.ok(status.includes(`- zcode → ${oldId} `))
-        assert.match(await tool('squad_compact').execute({ agent: 'zcode' }, exec), /已压缩 zcode/)
+        assert.ok(status.includes(`- worker1 → ${oldId} `))
+        assert.match(await tool('squad_compact').execute({ agent: 'worker1' }, exec), /已压缩 worker1/)
         assert.equal(compacted.at(-1), oldId, 'compact still targets the old proven id')
 
         // The old id keeps the fallback until the retried creation succeeds.
@@ -6987,12 +7019,12 @@ test('T22 context policy', async (t) => {
 
         host.subagents.startActivation = startActivation
         const retry = await tool('squad_dispatch').execute(
-          { agent: 'zcode', message: 'impl m2 retry', phase: 'implement' },
+          { agent: 'worker1', message: 'impl m2 retry', phase: 'implement' },
           exec,
         )
-        assert.match(retry, /已创建本地子代理 zcode/)
+        assert.match(retry, /已创建本地子代理 worker1/)
         const retriedState = await readState()
-        const newId = retriedState.children.zcode.id
+        const newId = retriedState.children.worker1.id
         assert.notEqual(newId, oldId)
         const newAgent = bindLocal(newId, host.activations.at(-1).name)
         await preStep(oldAgent)
@@ -7007,26 +7039,26 @@ test('T22 context policy', async (t) => {
     // idle→running: the substitute becomes running after dispatch entry. The
     // substitute probe must not run and no successful probe may be recorded.
     await withSquadHost(
-      { config: { workerProbe: true }, overrides: { opencode: { model: 'p/m1' } } },
+      { config: { workerProbe: true }, overrides: { worker2: { model: 'p/m1' } } },
       async ({ workspace, host, tool, exec }) => {
         await tool('squad_enable').execute({}, exec)
-        const { taskId } = await startContextTask(tool, exec, { agents: ['zcode', 'opencode'] })
+        const { taskId } = await startContextTask(tool, exec, { agents: ['worker1', 'worker2'] })
         const statePath = join(workspace, '.agent-squad', taskId, 'STATE.json')
         const readState = async () => JSON.parse(await readFile(statePath, 'utf8'))
         const before = await readState()
-        const row = { id: 'substitute-row-1', name: 'opencode', status: 'inactive' }
+        const row = { id: 'substitute-row-1', name: 'worker2', status: 'inactive' }
         host.members.push(row)
         const startActivation = host.subagents.startActivation
         host.subagents.startActivation = (spec) => {
-          if (spec.label === 'probe/zcode') {
+          if (spec.label === 'probe/worker1') {
             row.status = 'running' // transition after the entry snapshot
             throw new Error('HTTP 429 quota exceeded (fixture)')
           }
           return startActivation(spec)
         }
         await assert.rejects(
-          tool('squad_dispatch').execute({ agent: 'zcode', message: 'impl', phase: 'implement' }, exec),
-          /目标 opencode 仍在运行或创建中/,
+          tool('squad_dispatch').execute({ agent: 'worker1', message: 'impl', phase: 'implement' }, exec),
+          /目标 worker2 仍在运行或创建中/,
         )
         assert.equal(
           host.activations.filter((item) => String(item.label ?? '').includes(`/${taskId}/`)).length,
@@ -7034,7 +7066,7 @@ test('T22 context policy', async (t) => {
           'no business activation on refusal',
         )
         assert.equal(
-          host.activations.filter((item) => item.label === 'probe/opencode').length,
+          host.activations.filter((item) => item.label === 'probe/worker2').length,
           0,
           'substitute was not probed from the stale idle snapshot',
         )
@@ -7053,41 +7085,41 @@ test('T22 context policy', async (t) => {
       {
         strictNames: true,
         config: { workerProbe: true },
-        overrides: { opencode: { model: 'p/m1' } },
+        overrides: { worker2: { model: 'p/m1' } },
       },
       async ({ workspace, host, tool, exec }) => {
         await tool('squad_enable').execute({}, exec)
-        const { taskId } = await startContextTask(tool, exec, { agents: ['zcode', 'opencode'] })
-        const row = { id: 'substitute-row-2', name: 'opencode', status: 'running' }
+        const { taskId } = await startContextTask(tool, exec, { agents: ['worker1', 'worker2'] })
+        const row = { id: 'substitute-row-2', name: 'worker2', status: 'running' }
         host.members.push(row)
         const startActivation = host.subagents.startActivation
         host.subagents.startActivation = (spec) => {
-          if (spec.label === 'probe/zcode') {
+          if (spec.label === 'probe/worker1') {
             row.status = 'inactive' // stale snapshot said running
             throw new Error('HTTP 429 quota exceeded (fixture)')
           }
           return startActivation(spec)
         }
         const out = await tool('squad_dispatch').execute(
-          { agent: 'zcode', message: 'impl', phase: 'implement' },
+          { agent: 'worker1', message: 'impl', phase: 'implement' },
           exec,
         )
-        assert.match(out, /已创建本地子代理 opencode/)
+        assert.match(out, /已创建本地子代理 worker2/)
         assert.equal(
-          host.activations.filter((item) => item.label === 'probe/opencode').length,
+          host.activations.filter((item) => item.label === 'probe/worker2').length,
           1,
           'substitute is probed from the refreshed idle state',
         )
         const business = host.activations.filter(
-          (item) => item.label === `${taskId}/implement/opencode`,
+          (item) => item.label === `${taskId}/implement/worker2`,
         )
         assert.equal(business.length, 1)
         assert.ok(business[0].name)
-        assert.notEqual(business[0].name, 'opencode', 'stale host name is not reused')
+        assert.notEqual(business[0].name, 'worker2', 'stale host name is not reused')
         const state = JSON.parse(await readFile(join(workspace, '.agent-squad', taskId, 'STATE.json'), 'utf8'))
-        assert.ok(state.probes?.opencode?.ok === true)
-        assert.ok(state.children?.opencode?.id)
-        assert.notEqual(state.children.opencode.id, row.id)
+        assert.ok(state.probes?.worker2?.ok === true)
+        assert.ok(state.children?.worker2?.id)
+        assert.notEqual(state.children.worker2.id, row.id)
       },
     )
   })
@@ -7095,17 +7127,17 @@ test('T22 context policy', async (t) => {
   await t.test('an exact idle binding wins over a running base-name legacy row', async () => {
     const setupBoundTask = async ({ workspace, host, tool, exec, boundStatus }) => {
       await tool('squad_enable').execute({}, exec)
-      const { taskId } = await startContextTask(tool, exec, { agents: ['zcode'] })
+      const { taskId } = await startContextTask(tool, exec, { agents: ['worker1'] })
       const statePath = join(workspace, '.agent-squad', taskId, 'STATE.json')
       const state = JSON.parse(await readFile(statePath, 'utf8'))
-      state.children = { zcode: { id: 'bound-child-1', model: 'p/m1', status: 'active' } }
+      state.children = { worker1: { id: 'bound-child-1', model: 'p/m1', status: 'active' } }
       await writeFile(statePath, JSON.stringify(state, null, 2), 'utf8')
       host.members.push({
         id: 'bound-child-1',
-        name: 'zcode-2',
+        name: 'worker1-2',
         status: boundStatus === 'running' ? 'running' : 'inactive',
       })
-      host.members.push({ id: 'legacy-base-row', name: 'zcode', status: 'running' })
+      host.members.push({ id: 'legacy-base-row', name: 'worker1', status: 'running' })
       return { taskId, statePath }
     }
 
@@ -7116,13 +7148,13 @@ test('T22 context policy', async (t) => {
       async ({ workspace, host, tool, exec }) => {
         const { taskId } = await setupBoundTask({ workspace, host, tool, exec, boundStatus: 'idle' })
         const out = await tool('squad_dispatch').execute(
-          { agent: 'zcode', message: 'resume exact', phase: 'implement', probe: true },
+          { agent: 'worker1', message: 'resume exact', phase: 'implement', probe: true },
           exec,
         )
-        assert.match(out, /已续跑本地子代理 zcode/)
+        assert.match(out, /已续跑本地子代理 worker1/)
         assert.equal(host.sent.at(-1).targetId, 'bound-child-1')
         const state = JSON.parse(await readFile(join(workspace, '.agent-squad', taskId, 'STATE.json'), 'utf8'))
-        assert.equal(state.children.zcode.id, 'bound-child-1')
+        assert.equal(state.children.worker1.id, 'bound-child-1')
         assert.equal(
           host.activations.filter((item) => String(item.label ?? '').includes(`/${taskId}/`)).length,
           0,
@@ -7135,8 +7167,8 @@ test('T22 context policy', async (t) => {
     await withSquadHost({}, async ({ workspace, host, tool, exec }) => {
       await setupBoundTask({ workspace, host, tool, exec, boundStatus: 'running' })
       await assert.rejects(
-        tool('squad_dispatch').execute({ agent: 'zcode', message: 'blocked', phase: 'implement' }, exec),
-        /目标 zcode 仍在运行或创建中/,
+        tool('squad_dispatch').execute({ agent: 'worker1', message: 'blocked', phase: 'implement' }, exec),
+        /目标 worker1 仍在运行或创建中/,
       )
       assert.equal(host.activations.length, 0)
     })
@@ -7145,15 +7177,15 @@ test('T22 context policy', async (t) => {
     // "cannot dispatch", never a resume right).
     await withSquadHost({ config: { workerProbe: true } }, async ({ workspace, host, tool, exec }) => {
       await tool('squad_enable').execute({}, exec)
-      const { taskId } = await startContextTask(tool, exec, { agents: ['zcode'] })
+      const { taskId } = await startContextTask(tool, exec, { agents: ['worker1'] })
       const statePath = join(workspace, '.agent-squad', taskId, 'STATE.json')
       const state = JSON.parse(await readFile(statePath, 'utf8'))
       delete state.children
       await writeFile(statePath, JSON.stringify(state, null, 2), 'utf8')
-      host.members.push({ id: 'no-record-running', name: 'zcode', status: 'running' })
+      host.members.push({ id: 'no-record-running', name: 'worker1', status: 'running' })
       await assert.rejects(
-        tool('squad_dispatch').execute({ agent: 'zcode', message: 'no record', phase: 'implement' }, exec),
-        /目标 zcode 仍在运行或创建中/,
+        tool('squad_dispatch').execute({ agent: 'worker1', message: 'no record', phase: 'implement' }, exec),
+        /目标 worker1 仍在运行或创建中/,
       )
       assert.equal(host.activations.length, 0)
     })
@@ -7162,23 +7194,23 @@ test('T22 context policy', async (t) => {
   await t.test('both recorded ids participate in the busy gate', async () => {
     const setupMixed = async ({ workspace, host, tool, exec, memberStatus, withBaseRunning }) => {
       await tool('squad_enable').execute({}, exec)
-      const { taskId } = await startContextTask(tool, exec, { agents: ['opencode'] })
+      const { taskId } = await startContextTask(tool, exec, { agents: ['worker2'] })
       const statePath = join(workspace, '.agent-squad', taskId, 'STATE.json')
       const state = JSON.parse(await readFile(statePath, 'utf8'))
       state.children = {
-        opencode: {
+        worker2: {
           id: 'history-child-idle',
           model: 'dsh-opencode-go/deepseek-v4.1-flash',
           status: 'active',
         },
       }
-      state.members = { opencode: { id: 'member-current' } }
+      state.members = { worker2: { id: 'member-current' } }
       await writeFile(statePath, JSON.stringify(state, null, 2), 'utf8')
-      host.members.push({ id: 'history-child-idle', name: 'opencode-old', status: 'inactive' })
+      host.members.push({ id: 'history-child-idle', name: 'worker2-old', status: 'inactive' })
       // Only the unrelated row may own the base name; looking it up must not resolve to the member.
-      host.members.push({ id: 'member-current', name: 'opencode-2', status: memberStatus })
+      host.members.push({ id: 'member-current', name: 'worker2-2', status: memberStatus })
       if (withBaseRunning) {
-        host.members.push({ id: 'unrelated-base-running', name: 'opencode', status: 'running' })
+        host.members.push({ id: 'unrelated-base-running', name: 'worker2', status: 'running' })
       }
       return { taskId, statePath }
     }
@@ -7186,15 +7218,15 @@ test('T22 context policy', async (t) => {
     // Historical idle child + running team member: the exact child row must not
     // mask the running member. Refuse with no send/dispatch/state advance.
     await withSquadHost(
-      { overrides: { opencode: { executor: 'team', model: '' } } },
+      { overrides: { worker2: { executor: 'team', model: '' } } },
       async ({ workspace, host, tool, exec }) => {
         const { taskId, statePath } = await setupMixed({
           workspace, host, tool, exec, memberStatus: 'running', withBaseRunning: false,
         })
         const before = JSON.parse(await readFile(statePath, 'utf8'))
         await assert.rejects(
-          tool('squad_dispatch').execute({ agent: 'opencode', message: 'blocked', phase: 'implement' }, exec),
-          /目标 opencode 仍在运行或创建中/,
+          tool('squad_dispatch').execute({ agent: 'worker2', message: 'blocked', phase: 'implement' }, exec),
+          /目标 worker2 仍在运行或创建中/,
         )
         assert.equal(host.sent.length, 0)
         const after = JSON.parse(await readFile(statePath, 'utf8'))
@@ -7220,24 +7252,24 @@ test('T22 context policy', async (t) => {
     // Both exact rows idle: allow even with an unrelated base-name running row;
     // resume the exact team member id.
     await withSquadHost(
-      { overrides: { opencode: { executor: 'team', model: '' } } },
+      { overrides: { worker2: { executor: 'team', model: '' } } },
       async ({ workspace, host, tool, exec }) => {
         const { statePath } = await setupMixed({
           workspace, host, tool, exec, memberStatus: 'inactive', withBaseRunning: true,
         })
         const before = JSON.parse(await readFile(statePath, 'utf8'))
         const out = await tool('squad_dispatch').execute(
-          { agent: 'opencode', message: 'resume member', phase: 'implement' },
+          { agent: 'worker2', message: 'resume member', phase: 'implement' },
           exec,
         )
-        assert.match(out, /已续跑 opencode/)
+        assert.match(out, /已续跑 worker2/)
         assert.deepEqual(host.sent.map((entry) => entry.targetId), ['member-current'], 'exactly one delivery to the recorded team id')
         assert.equal(host.activations.length, 0, 'reuse the member instead of creating another session')
         const after = JSON.parse(await readFile(statePath, 'utf8'))
         assert.equal(after.dispatches.length, before.dispatches.length + 1)
         assert.equal(after.dispatches.at(-1).mode, 'resumed')
-        assert.equal(after.children?.opencode, undefined, 'stale child record withdrawn')
-        assert.equal(after.members.opencode.id, 'member-current')
+        assert.equal(after.children?.worker2, undefined, 'stale child record withdrawn')
+        assert.equal(after.members.worker2.id, 'member-current')
       },
     )
   })
@@ -7257,7 +7289,7 @@ test('T22 context policy', async (t) => {
       { services: { compaction }, logger: { warn: (text) => warns.push(String(text)) } },
       async ({ host, tool, exec, lead }) => {
         await tool('squad_enable').execute({}, exec)
-        await startContextTask(tool, exec, { agents: ['zcode', 'opencode'] })
+        await startContextTask(tool, exec, { agents: ['worker1', 'worker2'] })
         const handler = host.handlers['agent/pre-step'][0]
         assert.ok(handler)
         const bindChild = (id) => {
@@ -7273,7 +7305,7 @@ test('T22 context policy', async (t) => {
         const warningCount = () =>
           warns.filter((text) => text.includes('补位压缩失败')).length
 
-        await tool('squad_dispatch').execute({ agent: 'zcode', message: 'impl', phase: 'implement' }, exec)
+        await tool('squad_dispatch').execute({ agent: 'worker1', message: 'impl', phase: 'implement' }, exec)
         const zAgent = bindChild(host.activations.at(-1).childId)
         await fire(zAgent) // A
         reason = 'B'
@@ -7284,7 +7316,7 @@ test('T22 context policy', async (t) => {
         assert.equal(warningCount(), 2, 'A/B/A warns only for A and B')
 
         // Another Agent's first A is a separate (Agent, reason) pair.
-        await tool('squad_dispatch').execute({ agent: 'opencode', message: 'impl', phase: 'implement' }, exec)
+        await tool('squad_dispatch').execute({ agent: 'worker2', message: 'impl', phase: 'implement' }, exec)
         const oAgent = bindChild(host.activations.at(-1).childId)
         await fire(oAgent)
         assert.equal(calls, 4)
@@ -7351,12 +7383,12 @@ test('T23 manual compact', async (t) => {
     await settingsStore.save({
       expectedRevision: snapshot.revision,
       agents: snapshot.agents.map((row) =>
-        row.id === 'zcode' ? { ...row, executor: 'team', model: '' } : row,
+        row.id === 'worker1' ? { ...row, executor: 'team', model: '' } : row,
       ),
       worktree: snapshot.worktree,
     })
-    const b = await startContextTask(tool, exec, { agents: ['zcode'] })
-    await tool('squad_dispatch').execute({ agent: 'zcode', message: 'impl', phase: 'implement' }, exec)
+    const b = await startContextTask(tool, exec, { agents: ['worker1'] })
+    await tool('squad_dispatch').execute({ agent: 'worker1', message: 'impl', phase: 'implement' }, exec)
     const memberId = host.members.at(-1).id
     const liveB = host.agentsById.get(memberId)
     assert.ok(liveB)
@@ -7371,12 +7403,12 @@ test('T23 manual compact', async (t) => {
     await settingsStore.save({
       expectedRevision: snapshot.revision,
       agents: snapshot.agents.map((row) =>
-        row.id === 'zcode' ? { ...row, executor: 'local', model: 'p/m1' } : row,
+        row.id === 'worker1' ? { ...row, executor: 'local', model: 'p/m1' } : row,
       ),
       worktree: snapshot.worktree,
     })
-    const a = await startContextTask(tool, exec, { agents: ['zcode'] })
-    await tool('squad_dispatch').execute({ agent: 'zcode', message: 'impl', phase: 'implement' }, exec)
+    const a = await startContextTask(tool, exec, { agents: ['worker1'] })
+    await tool('squad_dispatch').execute({ agent: 'worker1', message: 'impl', phase: 'implement' }, exec)
     const childA = host.activations.at(-1).childId
     const liveA = host.makeAgent(childA, undefined, {
       header: { config: { provider: 'qoder', model: 'qmodel_latest' } },
@@ -7400,8 +7432,8 @@ test('T23 manual compact', async (t) => {
       return listDescendants(leadId, signal)
     }
     order.length = 0
-    const localOut = await tool('squad_compact').execute({ agent: 'zcode' }, exec)
-    assert.match(localOut, new RegExp(`已压缩 zcode（task=${a.taskId}）`))
+    const localOut = await tool('squad_compact').execute({ agent: 'worker1' }, exec)
+    assert.match(localOut, new RegExp(`已压缩 worker1（task=${a.taskId}）`))
     assert.match(localOut, /压缩前 context: model=qoder\/qmodel_latest window=200000 used=172000 ratio=86\.0%/)
     assert.match(localOut, /压缩后 context: model=qoder\/qmodel_latest window=200000 used=96000 ratio=48\.0%/)
     assert.equal(compactCalls.at(-1).agent, liveA)
@@ -7415,10 +7447,10 @@ test('T23 manual compact', async (t) => {
     order.length = 0
     used = 172000
     const teamOut = await tool('squad_compact').execute(
-      { agent: 'zcode', task_id: b.taskId },
+      { agent: 'worker1', task_id: b.taskId },
       exec,
     )
-    assert.match(teamOut, new RegExp(`已压缩 zcode（task=${b.taskId}）`))
+    assert.match(teamOut, new RegExp(`已压缩 worker1（task=${b.taskId}）`))
     assert.match(
       teamOut,
       /压缩前 context: model=unknown window=200000 used=172000 ratio=86\.0% threshold=0\.86/,
@@ -7437,7 +7469,7 @@ test('T23 manual compact', async (t) => {
     // Running target → busy with no host call.
     liveB.status = 'running'
     const invokedBeforeBusy = compactInvoked
-    const busyOut = await tool('squad_compact').execute({ agent: 'zcode', task_id: b.taskId }, exec)
+    const busyOut = await tool('squad_compact').execute({ agent: 'worker1', task_id: b.taskId }, exec)
     assert.equal(busyOut, 'busy：队友运行中，稍后再试')
     assert.equal(compactInvoked, invokedBeforeBusy)
     liveB.status = 'idle'
@@ -7447,7 +7479,7 @@ test('T23 manual compact', async (t) => {
       throw Object.assign(new Error('busy'), { code: 'busy' })
     }
     const invokedBeforeHostBusy = compactInvoked
-    const hostBusyOut = await tool('squad_compact').execute({ agent: 'zcode', task_id: b.taskId }, exec)
+    const hostBusyOut = await tool('squad_compact').execute({ agent: 'worker1', task_id: b.taskId }, exec)
     assert.match(hostBusyOut, /^busy：队友运行中，稍后再试\n已修剪=1，请复查$/)
     assert.equal(compactInvoked, invokedBeforeHostBusy + 1)
 
@@ -7455,14 +7487,14 @@ test('T23 manual compact', async (t) => {
     const savedCompaction = host.services.compaction
     host.services.compaction = { config: { auto: true } }
     const prunesBeforeMissing = pruneCalls.length
-    const missingOut = await tool('squad_compact').execute({ agent: 'zcode', task_id: b.taskId }, exec)
+    const missingOut = await tool('squad_compact').execute({ agent: 'worker1', task_id: b.taskId }, exec)
     assert.equal(missingOut, '不可用：缺少 compaction.compactNow')
     assert.equal(pruneCalls.length, prunesBeforeMissing)
     host.services.compaction = savedCompaction
 
     // null result: no safe range, explicit zero shadow numbers.
     compactImpl = async () => null
-    const nullOut = await tool('squad_compact').execute({ agent: 'zcode', task_id: b.taskId }, exec)
+    const nullOut = await tool('squad_compact').execute({ agent: 'worker1', task_id: b.taskId }, exec)
     assert.match(nullOut, /^无安全可压缩范围\n压缩前 context:/)
     assert.match(nullOut, /shadowedTokens=0 shadowedSeqs=\[\]$/)
 
@@ -7471,7 +7503,7 @@ test('T23 manual compact', async (t) => {
       shadowedTokenCount: 17,
       shadowedSeqs: Array.from({ length: 17 }, (_, index) => index + 1),
     })
-    const manyOut = await tool('squad_compact').execute({ agent: 'zcode', task_id: b.taskId }, exec)
+    const manyOut = await tool('squad_compact').execute({ agent: 'worker1', task_id: b.taskId }, exec)
     assert.match(manyOut, /shadowedSeqs=\[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16\]…（共17个）/)
 
     await t.test('classified failures retain evidence of completed pruning', async () => {
@@ -7486,7 +7518,7 @@ test('T23 manual compact', async (t) => {
       const before = [pruneCalls.length, compactInvoked]
       for (const code of Object.keys(firstLines)) {
         compactImpl = async () => { throw Object.assign(new Error('boom\nstack line two'), { code }) }
-        actual[code] = await tool('squad_compact').execute({ agent: 'zcode', task_id: b.taskId }, exec)
+        actual[code] = await tool('squad_compact').execute({ agent: 'worker1', task_id: b.taskId }, exec)
       }
       assert.deepEqual([pruneCalls.length, compactInvoked], before.map((count) => count + 5))
       assert.deepEqual(actual, Object.fromEntries(Object.entries(firstLines).map(([code, text]) => [
@@ -7498,7 +7530,7 @@ test('T23 manual compact', async (t) => {
       error.name = 'AbortError'
       throw error
     }
-    assert.match(await tool('squad_compact').execute({ agent: 'zcode', task_id: b.taskId }, exec), /^已取消压缩/)
+    assert.match(await tool('squad_compact').execute({ agent: 'worker1', task_id: b.taskId }, exec), /^已取消压缩/)
 
     // The tool-owned 180s budget classifies as a timeout, not a generic abort.
     compactImpl = async () => null
@@ -7513,7 +7545,7 @@ test('T23 manual compact', async (t) => {
     }
     try {
       assert.equal(
-        await tool('squad_compact').execute({ agent: 'zcode', task_id: b.taskId }, exec),
+        await tool('squad_compact').execute({ agent: 'worker1', task_id: b.taskId }, exec),
         '压缩超时（180 秒）',
       )
     } finally {
@@ -7521,7 +7553,7 @@ test('T23 manual compact', async (t) => {
     }
     assert.deepEqual([pruneCalls.length, compactInvoked], [prunesBeforeTimeout, invokedBeforeTimeout])
 
-    const settledArgs = { agent: 'zcode', task_id: b.taskId }
+    const settledArgs = { agent: 'worker1', task_id: b.taskId }
     const cancelled = new AbortController()
     cancelled.abort()
     assert.equal(await tool('squad_compact').execute(settledArgs, { ...exec, signal: cancelled.signal }), '已取消压缩')
@@ -7546,13 +7578,13 @@ test('T23 manual compact', async (t) => {
     compactImpl = async () => ({ shadowedTokenCount: 1234, shadowedSeqs: [7, 9] })
     const savedPruner = host.services.toolResultPruner
     delete host.services.toolResultPruner
-    const noPrunerOut = await tool('squad_compact').execute({ agent: 'zcode', task_id: b.taskId }, exec)
+    const noPrunerOut = await tool('squad_compact').execute({ agent: 'worker1', task_id: b.taskId }, exec)
     assert.match(noPrunerOut, /未修剪：toolResultPruner 不可用/)
     assert.match(noPrunerOut, /shadowedTokens=1234 shadowedSeqs=\[7,9\]/)
     host.services.toolResultPruner = savedPruner
     const savedMaintenance = liveB.runMaintenance
     liveB.runMaintenance = undefined
-    const noMaintenanceOut = await tool('squad_compact').execute({ agent: 'zcode', task_id: b.taskId }, exec)
+    const noMaintenanceOut = await tool('squad_compact').execute({ agent: 'worker1', task_id: b.taskId }, exec)
     assert.match(noMaintenanceOut, /未修剪：缺少安全维护能力/)
     liveB.runMaintenance = savedMaintenance
     // Maintenance admission failure → busy, no summary.
@@ -7561,7 +7593,7 @@ test('T23 manual compact', async (t) => {
     }
     const invokedBeforeAdmission = compactInvoked
     assert.equal(
-      await tool('squad_compact').execute({ agent: 'zcode', task_id: b.taskId }, exec),
+      await tool('squad_compact').execute({ agent: 'worker1', task_id: b.taskId }, exec),
       'busy：队友运行中，稍后再试',
     )
     assert.equal(compactInvoked, invokedBeforeAdmission)
@@ -7574,7 +7606,7 @@ test('T23 manual compact', async (t) => {
     // TECH-02 tightens this: a throwing pruner may have landed earlier
     // replacements, so the reply must state the unknown partial write too.
     assert.equal(
-      await tool('squad_compact').execute({ agent: 'zcode', task_id: b.taskId }, exec),
+      await tool('squad_compact').execute({ agent: 'worker1', task_id: b.taskId }, exec),
       '修剪失败，请复查\n修剪结果未知，请复查',
     )
     assert.equal(compactInvoked, invokedBeforePruneFail)
@@ -7594,33 +7626,33 @@ test('T23 manual compact', async (t) => {
     } finally {
       liveB.__root = savedRoot
     }
-    const noHistoryOut = await tool('squad_compact').execute({ agent: 'qoder' }, exec)
+    const noHistoryOut = await tool('squad_compact').execute({ agent: 'front1' }, exec)
     assert.equal(noHistoryOut, '队友尚无本任务会话')
 
     // External one-shot target refuses; never picks up stale member records.
     await writeFile(join(workspace, '.agent-squad', a.taskId, 'PLAN.md'), '# PLAN A\n', 'utf8')
-    await tool('squad_dispatch').execute({ agent: 'codex', message: 'design', phase: 'design' }, exec)
+    await tool('squad_dispatch').execute({ agent: 'brain', message: 'design', phase: 'design' }, exec)
     assert.equal(
-      await tool('squad_compact').execute({ agent: 'codex' }, exec),
+      await tool('squad_compact').execute({ agent: 'brain' }, exec),
       'external：一次性执行者不可人工压缩',
     )
 
     // Authorization and input boundaries.
     await assert.rejects(
-      tool('squad_compact').execute({ agent: 'zcode', task_id: b.taskId }, { agent: { id: 'lead-x' }, signal: undefined }),
+      tool('squad_compact').execute({ agent: 'worker1', task_id: b.taskId }, { agent: { id: 'lead-x' }, signal: undefined }),
       /仅允许已启用小队的 Lead 调用/,
     )
     await assert.rejects(tool('squad_compact').execute({ agent: 'lead' }, exec), /固定成员 id/)
     await assert.rejects(
-      tool('squad_compact').execute({ agent: 'zcode', extra: 1 }, exec),
+      tool('squad_compact').execute({ agent: 'worker1', extra: 1 }, exec),
       /不接受参数 "extra"/,
     )
     await assert.rejects(
-      tool('squad_compact').execute({ agent: 'zcode', task_id: '   ' }, exec),
+      tool('squad_compact').execute({ agent: 'worker1', task_id: '   ' }, exec),
       /task_id 必须是非空字符串/,
     )
     await assert.rejects(
-      tool('squad_compact').execute({ agent: 'zcode', task_id: 't-missing' }, exec),
+      tool('squad_compact').execute({ agent: 'worker1', task_id: 't-missing' }, exec),
       /未知小队任务/,
     )
     {
@@ -7628,7 +7660,7 @@ test('T23 manual compact', async (t) => {
       host.subagents.rootOf = () => ({ id: 'not-lead' })
       try {
         await assert.rejects(
-          tool('squad_compact').execute({ agent: 'zcode', task_id: b.taskId }, exec),
+          tool('squad_compact').execute({ agent: 'worker1', task_id: b.taskId }, exec),
           /仅允许 Lead 调用/,
         )
       } finally {
@@ -7637,7 +7669,7 @@ test('T23 manual compact', async (t) => {
     }
     // Cold: the record exists but no live Agent; never wake or fake it.
     host.agentsById.delete(memberId)
-    const coldOut = await tool('squad_compact').execute({ agent: 'zcode', task_id: b.taskId }, exec)
+    const coldOut = await tool('squad_compact').execute({ agent: 'worker1', task_id: b.taskId }, exec)
     assert.equal(coldOut, 'cold：会话未驻留，不能人工压缩')
     // Finished task is refused.
     const doneStatePath = join(workspace, '.agent-squad', b.taskId, 'STATE.json')
@@ -7645,7 +7677,7 @@ test('T23 manual compact', async (t) => {
     doneState.phase = 'done'
     await writeFile(doneStatePath, JSON.stringify(doneState, null, 2), 'utf8')
     await assert.rejects(
-      tool('squad_compact').execute({ agent: 'zcode', task_id: b.taskId }, exec),
+      tool('squad_compact').execute({ agent: 'worker1', task_id: b.taskId }, exec),
       /已经收尾/,
     )
     assert.deepEqual([pruneCalls.length, compactInvoked], deniedCounts)
@@ -7656,8 +7688,8 @@ test('T23 manual compact', async (t) => {
     { services: { tokenMeter: meter, toolResultPruner: pruner, compaction: compactionService }, config: { contextPolicy: { showUsage: false } } },
     async ({ tool, exec, host }) => {
       await tool('squad_enable').execute({}, exec)
-      const { taskId } = await startContextTask(tool, exec, { agents: ['zcode'] })
-      await tool('squad_dispatch').execute({ agent: 'zcode', message: 'impl', phase: 'implement' }, exec)
+      const { taskId } = await startContextTask(tool, exec, { agents: ['worker1'] })
+      await tool('squad_dispatch').execute({ agent: 'worker1', message: 'impl', phase: 'implement' }, exec)
       const childId = host.activations.at(-1).childId
       const live = host.makeAgent(childId, undefined, {
         header: { config: { provider: 'qoder', model: 'qmodel_latest' } },
@@ -7665,7 +7697,7 @@ test('T23 manual compact', async (t) => {
       live.__root = { id: 'lead-1' }
       host.members.push({ id: childId, status: 'inactive' })
       // Re-enable the lead record for the executed step guard.
-      const out = await tool('squad_compact').execute({ agent: 'zcode' }, exec)
+      const out = await tool('squad_compact').execute({ agent: 'worker1' }, exec)
       assert.match(out, /压缩前 context: model=qoder\/qmodel_latest window=200000 used=172000/)
       assert.match(out, /压缩后 context:/)
       assert.ok(taskId)
@@ -7695,8 +7727,8 @@ test('T23 manual compact', async (t) => {
       { services: { tokenMeter: meter, toolResultPruner: pruner, compaction } },
       async ({ host, tool, exec, lead }) => {
         await tool('squad_enable').execute({}, exec)
-        await startContextTask(tool, exec, { agents: ['zcode'] })
-        await tool('squad_dispatch').execute({ agent: 'zcode', message: 'impl', phase: 'implement' }, exec)
+        await startContextTask(tool, exec, { agents: ['worker1'] })
+        await tool('squad_dispatch').execute({ agent: 'worker1', message: 'impl', phase: 'implement' }, exec)
         const childId = host.activations.at(-1).childId
         const live = host.makeAgent(childId, undefined, {
           header: { config: { provider: 'p', model: 'm1' } },
@@ -7711,7 +7743,7 @@ test('T23 manual compact', async (t) => {
           controller.abort()
           return task(controller.signal)
         }
-        assert.equal(await tool('squad_compact').execute({ agent: 'zcode' }, exec), '已取消压缩')
+        assert.equal(await tool('squad_compact').execute({ agent: 'worker1' }, exec), '已取消压缩')
         assert.deepEqual(calls, { prune: 0, compact: 0 })
         live.runMaintenance = async (task) => task(new AbortController().signal)
 
@@ -7723,7 +7755,7 @@ test('T23 manual compact', async (t) => {
         AbortSignal.timeout = () => timeout.signal
         try {
           const pending = tool('squad_compact').execute(
-            { agent: 'zcode' },
+            { agent: 'worker1' },
             { agent: exec.agent, signal: user.signal },
           )
           user.abort(new Error('user cancelled'))
@@ -7740,7 +7772,7 @@ test('T23 manual compact', async (t) => {
         AbortSignal.timeout = () => timeoutFirst.signal
         try {
           const pending = tool('squad_compact').execute(
-            { agent: 'zcode' },
+            { agent: 'worker1' },
             { agent: exec.agent, signal: userLate.signal },
           )
           timeoutFirst.abort(new Error('tool budget first'))
@@ -7760,7 +7792,7 @@ test('T23 manual compact', async (t) => {
           throw new Error('partial write exploded')
         }
         assert.equal(
-          await tool('squad_compact').execute({ agent: 'zcode' }, exec),
+          await tool('squad_compact').execute({ agent: 'worker1' }, exec),
           '修剪失败，请复查\n修剪结果未知，请复查',
         )
         assert.deepEqual(calls, { prune: 1, compact: 0 })
@@ -7780,7 +7812,7 @@ test('T23 manual compact', async (t) => {
           return { pruned: [{ originalSeq: 1 }], charsRemoved: 1 }
         }
         assert.equal(
-          await tool('squad_compact').execute({ agent: 'zcode' }, exec),
+          await tool('squad_compact').execute({ agent: 'worker1' }, exec),
           '已取消压缩\n已修剪=1，请复查',
         )
         assert.deepEqual(calls, { prune: 2, compact: 0 })
@@ -7797,7 +7829,7 @@ test('T23 manual compact', async (t) => {
         }
         assert.equal(
           await tool('squad_compact').execute(
-            { agent: 'zcode' },
+            { agent: 'worker1' },
             { agent: exec.agent, signal: userInPrune.signal },
           ),
           '已取消压缩\n修剪结果未知，请复查',
@@ -7815,7 +7847,7 @@ test('T23 manual compact', async (t) => {
             throw new Error('throw after timeout')
           }
           assert.equal(
-            await tool('squad_compact').execute({ agent: 'zcode' }, exec),
+            await tool('squad_compact').execute({ agent: 'worker1' }, exec),
             '压缩超时（180 秒）\n修剪结果未知，请复查',
           )
         } finally {
@@ -7834,7 +7866,7 @@ test('T23 manual compact', async (t) => {
           throw new Error('prune failed after maintenance cancel')
         }
         assert.equal(
-          await tool('squad_compact').execute({ agent: 'zcode' }, exec),
+          await tool('squad_compact').execute({ agent: 'worker1' }, exec),
           '已取消压缩\n修剪结果未知，请复查',
         )
         assert.deepEqual(calls, { prune: 5, compact: 0 })
@@ -7845,10 +7877,10 @@ test('T23 manual compact', async (t) => {
 
 /** T24 — dispatch scope: new-task sections, rework defect packs, BRIEF bounds. */
 test('T24 dispatch scope', async (t) => {
-  await withSquadHost({ overrides: { opencode: { executor: 'external' } } }, async ({ workspace, host, tool, exec }) => {
+  await withSquadHost({ overrides: { worker2: { executor: 'external' } } }, async ({ workspace, host, tool, exec }) => {
     await tool('squad_enable').execute({}, exec)
     const taskA = await startContextTask(tool, exec, {
-      agents: ['codex', 'gpt', 'zcode', 'qoder', 'opencode'],
+      agents: ['brain', 'tester', 'worker1', 'front1', 'worker2'],
     })
     const dirA = join(workspace, '.agent-squad', taskA.taskId)
     const promptOf = (activation) =>
@@ -7861,7 +7893,7 @@ test('T24 dispatch scope', async (t) => {
     await writeFile(join(dirA, 'PLAN.md'), '# PLAN A\n', 'utf8')
     const longMessage = Array.from({ length: 50 }, (_, index) => `第 ${index + 1} 行交办`).join('\n')
     await tool('squad_dispatch').execute({
-      agent: 'codex',
+      agent: 'brain',
       message: longMessage,
       phase: 'design',
       task_id: taskA.taskId,
@@ -7882,13 +7914,13 @@ test('T24 dispatch scope', async (t) => {
     await tool('squad_approve_plan').execute({ task_id: taskA.taskId }, exec)
     await writeFile(join(dirA, 'SPEC.md'), '# SPEC A\n', 'utf8')
     await tool('squad_dispatch').execute({
-      agent: 'codex',
+      agent: 'brain',
       message: 'spec',
       phase: 'spec',
       task_id: taskA.taskId,
     }, exec)
     await tool('squad_dispatch').execute({
-      agent: 'zcode',
+      agent: 'worker1',
       message: 'impl',
       phase: 'implement',
       task_id: taskA.taskId,
@@ -7901,7 +7933,7 @@ test('T24 dispatch scope', async (t) => {
     await assertBrief(dirA)
     // Team activation receives the same strategy block.
     await tool('squad_dispatch').execute({
-      agent: 'qoder',
+      agent: 'front1',
       message: 'impl team',
       phase: 'implement',
       task_id: taskA.taskId,
@@ -7915,7 +7947,7 @@ test('T24 dispatch scope', async (t) => {
 
     // Rework: defect package only, five-field message preserved, no full read.
     await tool('squad_dispatch').execute({
-      agent: 'gpt',
+      agent: 'tester',
       message: 'review tests',
       phase: 'test-review',
       task_id: taskA.taskId,
@@ -7927,11 +7959,11 @@ test('T24 dispatch scope', async (t) => {
     )
     const reworkMessage = 'D2 / AC3 / src/a.js:9 / 改边界 / node --test'
     const reworkOut = await tool('squad_dispatch').execute({
-      agent: 'zcode',
+      agent: 'worker1',
       message: reworkMessage,
       phase: 'rework',
     }, exec)
-    assert.match(reworkOut, /已续跑本地子代理 zcode/)
+    assert.match(reworkOut, /已续跑本地子代理 worker1/)
     const reworkPrompt = sentText()
     assert.ok(reworkPrompt.includes(REWORK_SCOPE_TEXT))
     for (const field of ['D2', 'AC3', 'src/a.js:9', '改边界', 'node --test']) {
@@ -7957,7 +7989,7 @@ test('T24 dispatch scope', async (t) => {
     })
     // A message with missing fields is still deliverable (no new refusal gate).
     await tool('squad_dispatch').execute({
-      agent: 'gpt',
+      agent: 'tester',
       message: 'review tests again',
       phase: 'test-review',
       task_id: taskA.taskId,
@@ -7969,25 +8001,25 @@ test('T24 dispatch scope', async (t) => {
     )
     const sentBefore = host.sent.length
     const sparseOut = await tool('squad_dispatch').execute({
-      agent: 'zcode',
+      agent: 'worker1',
       message: 'D3 只改这个',
       phase: 'rework',
     }, exec)
-    assert.match(sparseOut, /已续跑本地子代理 zcode/)
+    assert.match(sparseOut, /已续跑本地子代理 worker1/)
     assert.equal(host.sent.length, sentBefore + 1)
     assert.ok(sentText().includes('blocked：<缺陷ID或未给编号> 缺<字段>'))
     assert.ok(sentText().includes('D3'))
 
     // Review-family sources differ by phase below.
     await tool('squad_dispatch').execute({
-      agent: 'gpt',
+      agent: 'tester',
       message: 'review tests third',
       phase: 'test-review',
       task_id: taskA.taskId,
     }, exec)
     await writeFile(join(dirA, 'TEST-REVIEW.md'), '# TEST-REVIEW\nVERDICT: APPROVED\n', 'utf8')
     await tool('squad_dispatch').execute({
-      agent: 'codex',
+      agent: 'brain',
       message: 'tech review',
       phase: 'tech-review',
       task_id: taskA.taskId,
@@ -7998,7 +8030,7 @@ test('T24 dispatch scope', async (t) => {
     assertSEM(techPrompt)
     await writeFile(join(dirA, 'TECH-REVIEW.md'), '# TECH-REVIEW\nVERDICT: APPROVED\n', 'utf8')
     await tool('squad_dispatch').execute({
-      agent: 'codex',
+      agent: 'brain',
       message: 'business review',
       phase: 'review',
       task_id: taskA.taskId,
@@ -8011,18 +8043,18 @@ test('T24 dispatch scope', async (t) => {
     assert.ok(readsLine(reviewPrompt).includes('SPEC.md'))
     assertSEM(reviewPrompt)
     await writeFile(join(dirA, 'REVIEW.md'), '# D2\nVERDICT: CHANGES_REQUESTED\n', 'utf8')
-    await tool('squad_dispatch').execute({ agent: 'qoder', message: reworkMessage, phase: 'rework', task_id: taskA.taskId }, exec)
+    await tool('squad_dispatch').execute({ agent: 'front1', message: reworkMessage, phase: 'rework', task_id: taskA.taskId }, exec)
     assert.ok(readsLine(sentText()).includes('REVIEW.md 的失败/缺陷段'))
     assert.doesNotMatch(readsLine(sentText()), /(?:TEST|TECH)-REVIEW\.md/)
     assert.ok(sentText().includes(reworkMessage))
     assertSEM(sentText())
     await assertBrief(dirA)
 
-    await tool('squad_dispatch').execute({ agent: 'gpt', message: 'review current', phase: 'test-review', task_id: taskA.taskId }, exec)
+    await tool('squad_dispatch').execute({ agent: 'tester', message: 'review current', phase: 'test-review', task_id: taskA.taskId }, exec)
     await writeFile(join(dirA, 'TEST-REVIEW.md'), 'VERDICT: APPROVED\n', 'utf8')
-    await tool('squad_dispatch').execute({ agent: 'codex', message: 'technical check', phase: 'tech-review', task_id: taskA.taskId }, exec)
+    await tool('squad_dispatch').execute({ agent: 'brain', message: 'technical check', phase: 'tech-review', task_id: taskA.taskId }, exec)
     await writeFile(join(dirA, 'TECH-REVIEW.md'), '# D2\nVERDICT: CHANGES_REQUESTED\n', 'utf8')
-    await tool('squad_dispatch').execute({ agent: 'opencode', message: reworkMessage, phase: 'rework', task_id: taskA.taskId }, exec)
+    await tool('squad_dispatch').execute({ agent: 'worker2', message: reworkMessage, phase: 'rework', task_id: taskA.taskId }, exec)
     const externalRework = promptOf(host.activations.at(-1))
     assert.ok(readsLine(externalRework).includes('TECH-REVIEW.md 的失败/缺陷段'))
     assert.ok(externalRework.includes(REWORK_SCOPE_TEXT) && externalRework.includes(reworkMessage))
@@ -8032,11 +8064,11 @@ test('T24 dispatch scope', async (t) => {
 
     // Simple flow: no SPEC requirement is invented.
     const simple = await startContextTask(tool, exec, {
-      agents: ['zcode'],
+      agents: ['worker1'],
       flow: 'simple',
     })
     await tool('squad_dispatch').execute({
-      agent: 'zcode',
+      agent: 'worker1',
       message: 'impl',
       phase: 'implement',
       task_id: simple.taskId,
@@ -8046,7 +8078,7 @@ test('T24 dispatch scope', async (t) => {
     assert.ok(!readsLine(simplePrompt).includes('SPEC.md（技术规格）'))
     assertSEM(simplePrompt)
     await writeFile(join(workspace, '.agent-squad', simple.taskId, 'REVIEW.md'), 'VERDICT: CHANGES_REQUESTED\n', 'utf8')
-    await tool('squad_dispatch').execute({ agent: 'zcode', message: reworkMessage, phase: 'rework', task_id: simple.taskId }, exec)
+    await tool('squad_dispatch').execute({ agent: 'worker1', message: reworkMessage, phase: 'rework', task_id: simple.taskId }, exec)
     const simpleRework = readsLine(sentText())
     await t.test('simple rework points to REVIEW and does not require absent plan/spec', () => {
       assert.deepEqual({ review: simpleRework.includes('REVIEW.md 的失败/缺陷段'), gatedRead: /PLAN-APPROVED\.md|SPEC\.md/.test(simpleRework) },
@@ -8055,12 +8087,12 @@ test('T24 dispatch scope', async (t) => {
 
     // Acceptance mode reads only the authority and acceptance reports.
     const accepting = await startContextTask(tool, exec, {
-      agents: ['codex', 'gpt', 'zcode'],
+      agents: ['brain', 'tester', 'worker1'],
       mode: 'acceptance',
       authority: '# 权威方案\n逐条检查。',
     })
     await tool('squad_dispatch').execute({
-      agent: 'gpt',
+      agent: 'tester',
       message: 'technical acceptance',
       phase: 'acceptance',
       task_id: accepting.taskId,
@@ -8072,8 +8104,8 @@ test('T24 dispatch scope', async (t) => {
     assertSEM(acceptancePrompt)
     const accDir = join(workspace, '.agent-squad', accepting.taskId)
     await writeFile(join(accDir, 'ACCEPTANCE-REPORT.md'), '# D2\nVERDICT: CHANGES_REQUESTED\n', 'utf8')
-    await tool('squad_dispatch').execute({ agent: 'codex', message: 'business acceptance', phase: 'acceptance', task_id: accepting.taskId }, exec)
-    await tool('squad_dispatch').execute({ agent: 'zcode', message: reworkMessage, phase: 'rework', task_id: accepting.taskId }, exec)
+    await tool('squad_dispatch').execute({ agent: 'brain', message: 'business acceptance', phase: 'acceptance', task_id: accepting.taskId }, exec)
+    await tool('squad_dispatch').execute({ agent: 'worker1', message: reworkMessage, phase: 'rework', task_id: accepting.taskId }, exec)
     const acceptanceRework = promptOf(host.activations.at(-1))
     assert.ok(acceptanceRework.includes(REWORK_SCOPE_TEXT) && acceptanceRework.includes(reworkMessage))
     assertSEM(acceptanceRework)
@@ -8096,22 +8128,22 @@ test('T24 dispatch scope', async (t) => {
   })
 
   await t.test('multi-repo and substitute keep BRIEF bounded and assignment intact', async () => {
-    await withSquadHost({ config: { workerProbe: true }, overrides: { opencode: { model: 'p/m1' } } },
+    await withSquadHost({ config: { workerProbe: true }, overrides: { worker2: { model: 'p/m1' } } },
       async ({ workspace, host, tool, exec }) => {
         const repos = [
           await makeGitRepo(workspace, 'repo A', 'base A', { 'README.md': 'A' }),
           await makeGitRepo(workspace, 'repo B', 'base B', { 'README.md': 'B' }),
         ]
-        await startContextTask(tool, exec, { agents: ['zcode', 'opencode'], repos })
+        await startContextTask(tool, exec, { agents: ['worker1', 'worker2'], repos })
         const { memoryRoot, taskId } = JSON.parse(await readFile(join(workspace, '.agent-squad', 'current.json'), 'utf8'))
         const originalStart = host.subagents.startActivation
         host.subagents.startActivation = (spec) => {
-          if (spec.label === 'probe/zcode') throw new Error('HTTP 429 quota exceeded (fixture)')
+          if (spec.label === 'probe/worker1') throw new Error('HTTP 429 quota exceeded (fixture)')
           return originalStart(spec)
         }
         const message = Array.from({ length: 50 }, (_, index) => `line-${index}`).join('\n')
-        const out = await tool('squad_dispatch').execute({ agent: 'zcode', message, phase: 'implement', task_id: taskId }, exec)
-        assert.match(out, /自动改由 opencode 执行/)
+        const out = await tool('squad_dispatch').execute({ agent: 'worker1', message, phase: 'implement', task_id: taskId }, exec)
+        assert.match(out, /自动改由 worker2 执行/)
         const prompt = host.activations.at(-1).prompt[0].text
         assert.ok(prompt.includes(message))
         for (const repo of repos) assert.ok(prompt.includes(`仓库：${repo}`))
@@ -8119,7 +8151,7 @@ test('T24 dispatch scope', async (t) => {
         const dir = join(memoryRoot, taskId)
         await assertBrief(dir)
         const brief = await readFile(join(dir, 'BRIEF.md'), 'utf8')
-        assert.match(brief, /^agent=opencode role=worker$/m)
+        assert.match(brief, /^agent=worker2 role=worker$/m)
         assert.ok(!brief.includes('line-49'))
       },
     )
@@ -8135,12 +8167,12 @@ test('T24 dispatch scope', async (t) => {
       // Acceptance first dispatch keeps the TASK entry points and adds the
       // authority note; the tester delivery contract is short but complete.
       const accepting = await startContextTask(tool, exec, {
-        agents: ['codex', 'gpt'],
+        agents: ['brain', 'tester'],
         mode: 'acceptance',
         authority: '# 权威方案\n逐条检查。',
       })
       await tool('squad_dispatch').execute(
-        { agent: 'gpt', message: 'technical acceptance', phase: 'acceptance', task_id: accepting.taskId },
+        { agent: 'tester', message: 'technical acceptance', phase: 'acceptance', task_id: accepting.taskId },
         exec,
       )
       const accPrompt = promptOf(host.activations.at(-1))
@@ -8159,21 +8191,21 @@ test('T24 dispatch scope', async (t) => {
       // Dev pipeline: test/tech/business keep their machine VERDICT contract in
       // both the first activation and a resumed send; BRIEF carries the full
       // read index (not a truncated first-three list).
-      const dev = await startContextTask(tool, exec, { agents: ['codex', 'gpt', 'zcode'] })
+      const dev = await startContextTask(tool, exec, { agents: ['brain', 'tester', 'worker1'] })
       const dir = join(workspace, '.agent-squad', dev.taskId)
       await writeFile(join(dir, 'PLAN.md'), '# PLAN\n', 'utf8')
       await writeFile(join(dir, 'SPEC.md'), '# SPEC\n', 'utf8')
       await tool('squad_approve_plan').execute({ task_id: dev.taskId }, exec)
       await tool('squad_dispatch').execute(
-        { agent: 'codex', message: 'spec', phase: 'spec', task_id: dev.taskId },
+        { agent: 'brain', message: 'spec', phase: 'spec', task_id: dev.taskId },
         exec,
       )
       await tool('squad_dispatch').execute(
-        { agent: 'zcode', message: 'impl', phase: 'implement', task_id: dev.taskId },
+        { agent: 'worker1', message: 'impl', phase: 'implement', task_id: dev.taskId },
         exec,
       )
       await tool('squad_dispatch').execute(
-        { agent: 'gpt', message: 'review tests', phase: 'test-review', task_id: dev.taskId },
+        { agent: 'tester', message: 'review tests', phase: 'test-review', task_id: dev.taskId },
         exec,
       )
       const testPrompt = promptOf(host.activations.at(-1))
@@ -8183,7 +8215,7 @@ test('T24 dispatch scope', async (t) => {
       assert.ok(testBrief.includes('完整索引：'))
       assert.ok(testBrief.includes('TEST-REVIEW.md（已有；存在时）'))
       await tool('squad_dispatch').execute(
-        { agent: 'gpt', message: 'review tests again', phase: 'test-review', task_id: dev.taskId },
+        { agent: 'tester', message: 'review tests again', phase: 'test-review', task_id: dev.taskId },
         exec,
       )
       const testResume = host.sent.at(-1).content.map((block) => block.text).join('')
@@ -8192,7 +8224,7 @@ test('T24 dispatch scope', async (t) => {
 
       await writeFile(join(dir, 'TEST-REVIEW.md'), 'VERDICT: APPROVED\n', 'utf8')
       await tool('squad_dispatch').execute(
-        { agent: 'codex', message: 'tech review', phase: 'tech-review', task_id: dev.taskId },
+        { agent: 'brain', message: 'tech review', phase: 'tech-review', task_id: dev.taskId },
         exec,
       )
       const techPrompt = promptOf(host.activations.at(-1))
@@ -8203,7 +8235,7 @@ test('T24 dispatch scope', async (t) => {
 
       await writeFile(join(dir, 'TECH-REVIEW.md'), 'VERDICT: APPROVED\n', 'utf8')
       await tool('squad_dispatch').execute(
-        { agent: 'codex', message: 'business review', phase: 'review', task_id: dev.taskId },
+        { agent: 'brain', message: 'business review', phase: 'review', task_id: dev.taskId },
         exec,
       )
       const reviewPrompt = promptOf(host.activations.at(-1))
@@ -8223,7 +8255,7 @@ test('T24 dispatch scope', async (t) => {
 
       // 1) Full flow with a tester but no brain snapshot: planRequired=false,
       // specRequired=true, and no PLAN-APPROVED archive exists.
-      const exemptTask = await startContextTask(tool, exec, { agents: ['gpt', 'zcode'] })
+      const exemptTask = await startContextTask(tool, exec, { agents: ['tester', 'worker1'] })
       const exemptDir = join(workspace, '.agent-squad', exemptTask.taskId)
       const exemptStatePath = join(exemptDir, 'STATE.json')
       const exemptState = JSON.parse(await readFile(exemptStatePath, 'utf8'))
@@ -8234,11 +8266,11 @@ test('T24 dispatch scope', async (t) => {
       await writeFile(exemptStatePath, JSON.stringify(exemptState, null, 2), 'utf8')
       await writeFile(join(exemptDir, 'SPEC.md'), '# SPEC\n', 'utf8')
       await tool('squad_dispatch').execute(
-        { agent: 'zcode', message: 'impl', phase: 'implement', task_id: exemptTask.taskId },
+        { agent: 'worker1', message: 'impl', phase: 'implement', task_id: exemptTask.taskId },
         exec,
       )
       await tool('squad_dispatch').execute(
-        { agent: 'gpt', message: 'review tests', phase: 'test-review', task_id: exemptTask.taskId },
+        { agent: 'tester', message: 'review tests', phase: 'test-review', task_id: exemptTask.taskId },
         exec,
       )
       await writeFile(
@@ -8247,7 +8279,7 @@ test('T24 dispatch scope', async (t) => {
         'utf8',
       )
       await tool('squad_dispatch').execute(
-        { agent: 'zcode', message: reworkMessage, phase: 'rework', task_id: exemptTask.taskId },
+        { agent: 'worker1', message: reworkMessage, phase: 'rework', task_id: exemptTask.taskId },
         exec,
       )
       const exemptReads = readsLine(sentText())
@@ -8265,21 +8297,21 @@ test('T24 dispatch scope', async (t) => {
       assert.ok(exemptBrief.includes(authorityLabel), 'fixed authority label is retained')
 
       // 2) Normal full task with an approved archive keeps the required form.
-      const normal = await startContextTask(tool, exec, { agents: ['codex', 'gpt', 'zcode'] })
+      const normal = await startContextTask(tool, exec, { agents: ['brain', 'tester', 'worker1'] })
       const normalDir = join(workspace, '.agent-squad', normal.taskId)
       await writeFile(join(normalDir, 'PLAN.md'), '# PLAN\n', 'utf8')
       await tool('squad_approve_plan').execute({ task_id: normal.taskId }, exec)
       await writeFile(join(normalDir, 'SPEC.md'), '# SPEC\n', 'utf8')
       await tool('squad_dispatch').execute(
-        { agent: 'codex', message: 'spec', phase: 'spec', task_id: normal.taskId },
+        { agent: 'brain', message: 'spec', phase: 'spec', task_id: normal.taskId },
         exec,
       )
       await tool('squad_dispatch').execute(
-        { agent: 'zcode', message: 'impl', phase: 'implement', task_id: normal.taskId },
+        { agent: 'worker1', message: 'impl', phase: 'implement', task_id: normal.taskId },
         exec,
       )
       await tool('squad_dispatch').execute(
-        { agent: 'gpt', message: 'review tests', phase: 'test-review', task_id: normal.taskId },
+        { agent: 'tester', message: 'review tests', phase: 'test-review', task_id: normal.taskId },
         exec,
       )
       await writeFile(
@@ -8288,7 +8320,7 @@ test('T24 dispatch scope', async (t) => {
         'utf8',
       )
       await tool('squad_dispatch').execute(
-        { agent: 'zcode', message: reworkMessage, phase: 'rework' },
+        { agent: 'worker1', message: reworkMessage, phase: 'rework' },
         exec,
       )
       const normalReads = readsLine(sentText())
@@ -8352,7 +8384,7 @@ test('T25 context display', async (t) => {
   await withSquadHost({ services: { tokenMeter: meter, compaction } }, async ({ workspace, host, tool, lead, exec }) => {
     hostRef = host
     await tool('squad_enable').execute({}, exec)
-    const task = await startContextTask(tool, exec, { agents: ['zcode', 'qoder'] })
+    const task = await startContextTask(tool, exec, { agents: ['worker1', 'front1'] })
     const dir = join(workspace, '.agent-squad', task.taskId)
     const reportLine = async (agent) => {
       const receipt = await tool('squad_report').execute(
@@ -8364,7 +8396,7 @@ test('T25 context display', async (t) => {
 
     // A new child never reads the meter and shows numeric unknowns.
     const newChildOut = await tool('squad_dispatch').execute(
-      { agent: 'zcode', message: 'impl', phase: 'implement' },
+      { agent: 'worker1', message: 'impl', phase: 'implement' },
       exec,
     )
     assert.equal(usageAfterTask(newChildOut), `${unknown}（新建/暂无用量）`)
@@ -8378,7 +8410,7 @@ test('T25 context display', async (t) => {
     meter.calls.length = 0
     const sentBefore = host.sent.length
     const resumeOut = await tool('squad_dispatch').execute(
-      { agent: 'zcode', message: 'resume', phase: 'implement' },
+      { agent: 'worker1', message: 'resume', phase: 'implement' },
       exec,
     )
     assert.equal(usageAfterTask(resumeOut), USAGE_SAMPLE_LINE)
@@ -8393,7 +8425,7 @@ test('T25 context display', async (t) => {
     assert.ok(forwarded.endsWith(USAGE_SAMPLE_LINE))
 
     // A team child also reads before resuming, without recreating activation.
-    const spawned = await tool('squad_dispatch').execute({ agent: 'qoder', message: 'impl', phase: 'implement' }, exec)
+    const spawned = await tool('squad_dispatch').execute({ agent: 'front1', message: 'impl', phase: 'implement' }, exec)
     assert.equal(usageAfterTask(spawned), `${unknown}（新建/暂无用量）`)
     const teamId = host.activations.at(-1).childId
     const team = host.agentsById.get(teamId)
@@ -8401,7 +8433,7 @@ test('T25 context display', async (t) => {
     meter.calls.length = 0
     const teamSentBefore = host.sent.length
     const activationCount = host.activations.length
-    const teamResume = await tool('squad_dispatch').execute({ agent: 'qoder', message: 'resume team', phase: 'implement' }, exec)
+    const teamResume = await tool('squad_dispatch').execute({ agent: 'front1', message: 'resume team', phase: 'implement' }, exec)
     assert.equal(usageAfterTask(teamResume), USAGE_SAMPLE_LINE)
     assert.equal(meter.calls.find((call) => call.kind === 'measure').sent, teamSentBefore)
     assert.equal(host.sent.at(-1).targetId, teamId)
@@ -8409,13 +8441,13 @@ test('T25 context display', async (t) => {
 
     // Status: exact matching row in each distinct block; no match across blocks.
     await writeFile(join(dir, 'PLAN.md'), '# PLAN\n', 'utf8')
-    const external = await tool('squad_dispatch').execute({ agent: 'codex', message: 'design', phase: 'design' }, exec)
+    const external = await tool('squad_dispatch').execute({ agent: 'brain', message: 'design', phase: 'design' }, exec)
     assert.equal(usageAfterTask(external), `${unknown}（external）`)
-    const status = (await tool('squad_status').execute({}, exec)).split('\n')
+    const status = (await tool('squad_status').execute({ task_id: task.taskId }, exec)).split('\n')
     const localBlock = status.indexOf('本地子代理：')
     const teamRow = status.slice(status.indexOf('成员：') + 1, localBlock).find((line) => line.startsWith(`- ${team.__name} [`))
     assert.ok(teamRow?.endsWith(` | ${USAGE_SAMPLE_LINE}`))
-    const localRow = status.slice(localBlock + 1).find((line) => line.startsWith(`- zcode → ${childId} `))
+    const localRow = status.slice(localBlock + 1).find((line) => line.startsWith(`- worker1 → ${childId} `))
     assert.ok(localRow?.endsWith(` | ${USAGE_SAMPLE_LINE}`))
     const externalRow = status.slice(status.indexOf('最近派单：') + 1).find((line) => /phase=design round=1 external \|/.test(line))
     assert.ok(externalRow?.endsWith(` | ${unknown}（external）`))
@@ -8423,7 +8455,7 @@ test('T25 context display', async (t) => {
     // Cold child falls back to the exact last report snapshot.
     host.agentsById.delete(childId)
     const coldOut = await tool('squad_dispatch').execute(
-      { agent: 'zcode', message: 'cold resume', phase: 'implement' },
+      { agent: 'worker1', message: 'cold resume', phase: 'implement' },
       exec,
     )
     assert.ok(
@@ -8434,23 +8466,23 @@ test('T25 context display', async (t) => {
 
     // Cross-task / different-id cache misses degrade to cold, never to another
     // task's numbers.
-    const other = await startContextTask(tool, exec, { agents: ['zcode'] })
+    const other = await startContextTask(tool, exec, { agents: ['worker1'] })
     const otherStatePath = join(workspace, '.agent-squad', other.taskId, 'STATE.json')
     const setOtherChild = async (id) => {
       const otherState = JSON.parse(await readFile(otherStatePath, 'utf8'))
-      otherState.children = { zcode: { id, model: 'p/m1', status: 'active' } }
+      otherState.children = { worker1: { id, model: 'p/m1', status: 'active' } }
       await writeFile(otherStatePath, JSON.stringify(otherState, null, 2), 'utf8')
     }
     await setOtherChild('child-dead-other')
     const crossTaskOut = await tool('squad_dispatch').execute(
-      { agent: 'zcode', message: 'cross', phase: 'implement', task_id: other.taskId },
+      { agent: 'worker1', message: 'cross', phase: 'implement', task_id: other.taskId },
       exec,
     )
     assert.ok(crossTaskOut.includes('（cold）'))
     // Same id but a different task id is also a miss.
     await setOtherChild(childId)
     const crossSameId = await tool('squad_dispatch').execute(
-      { agent: 'zcode', message: 'cross same id', phase: 'implement', task_id: other.taskId },
+      { agent: 'worker1', message: 'cross same id', phase: 'implement', task_id: other.taskId },
       exec,
     )
     assert.ok(crossSameId.includes('（cold）'))
@@ -8511,7 +8543,7 @@ test('T25 context display', async (t) => {
         const liveLine = await reportLine(team)
         assert.equal(liveLine, `${USAGE_SAMPLE_LINE} 实际阈值=160000 tokens`)
         host.agentsById.delete(teamId)
-        const coldReceipt = await tool('squad_dispatch').execute({ agent: 'qoder', message: 'cold team', phase: 'implement', task_id: task.taskId }, exec)
+        const coldReceipt = await tool('squad_dispatch').execute({ agent: 'front1', message: 'cold team', phase: 'implement', task_id: task.taskId }, exec)
         host.agentsById.set(teamId, team)
         native.retainTokens = 180000
         const invalidRetentionLine = await reportLine(team)
@@ -8538,7 +8570,7 @@ test('T25 context display', async (t) => {
       Object.defineProperty(compaction, 'config', { get: () => { throw new Error('compaction config unavailable') } })
       try {
         const report = await reportLine(team)
-        const result = await tool('squad_status').execute({}, exec).then(
+        const result = await tool('squad_status').execute({ task_id: task.taskId }, exec).then(
           (text) => ({ status: 'fulfilled', text }),
           (error) => ({ status: 'rejected', text: error.message }),
         )
@@ -8570,9 +8602,9 @@ test('T25 context display', async (t) => {
         for (const [name, overrides, expected] of variants) {
           host.services.tokenMeter = Object.create(meter, Object.getOwnPropertyDescriptors(overrides))
           const report = await reportLine(team)
-          const status = await tool('squad_status').execute({}, exec).catch((error) => `rejected: ${error.message}`)
+          const status = await tool('squad_status').execute({ task_id: task.taskId }, exec).catch((error) => `rejected: ${error.message}`)
           const resume = await tool('squad_dispatch').execute(
-            { agent: 'qoder', message: 'resume with a degraded meter', phase: 'implement', task_id: task.taskId }, exec,
+            { agent: 'front1', message: 'resume with a degraded meter', phase: 'implement', task_id: task.taskId }, exec,
           ).catch((error) => `rejected: ${error.message}`)
           actual[name] = {
             report: report.startsWith(expected),
@@ -8596,15 +8628,15 @@ test('T25 context display', async (t) => {
         const report = await reportLine(team)
         assert.match(report, /（tokenMeter 不可用）/)
         assert.match(report, /原生比例=0\.8；实际阈值未知/)
-        const status = await tool('squad_status').execute({}, exec)
-        const memberLine = status
+        const status = await tool('squad_status').execute({ task_id: task.taskId }, exec)
+        const usageLine = status
           .split('\n')
-          .find((line) => line.includes(team.__name) && line.includes('context:'))
-        assert.ok(memberLine?.includes('（tokenMeter 不可用）'))
-        assert.ok(memberLine?.includes('原生比例=0.8；实际阈值未知'))
+          .find((line) => line.includes('context:') && line.includes('（tokenMeter 不可用）'))
+        assert.ok(usageLine?.includes('（tokenMeter 不可用）'))
+        assert.ok(usageLine?.includes('原生比例=0.8；实际阈值未知'))
         const sentBefore = host.sent.length
         const resume = await tool('squad_dispatch').execute(
-          { agent: 'qoder', message: 'degraded meter', phase: 'implement', task_id: task.taskId },
+          { agent: 'front1', message: 'degraded meter', phase: 'implement', task_id: task.taskId },
           exec,
         )
         assert.equal(host.sent.length, sentBefore + 1)
@@ -8622,14 +8654,14 @@ test('T25 context display', async (t) => {
   await withSquadHost({ services: { tokenMeter: meter, compaction } }, async ({ workspace, host, tool, exec }) => {
     hostRef = host
     await tool('squad_enable').execute({}, exec)
-    const task = await startContextTask(tool, exec, { agents: ['zcode'] })
+    const task = await startContextTask(tool, exec, { agents: ['worker1'] })
     meter.calls.length = 0
     meter.throwMeasure = false
     meter.throwPressure = false
     meter.window = 200000
     meter.used = 172000
     for (let index = 0; index < 129; index += 1) {
-      const agent = host.makeAgent(`cache-${index}`, { role: 'teammate', name: 'zcode' })
+      const agent = host.makeAgent(`cache-${index}`, { role: 'teammate', name: 'worker1' })
       await tool('squad_report').execute(
         { status: 'done', summary: `report ${index}` },
         { agent, signal: undefined },
@@ -8641,18 +8673,18 @@ test('T25 context display', async (t) => {
     const statePath = join(workspace, '.agent-squad', task.taskId, 'STATE.json')
     const setChild = async (id) => {
       const state = JSON.parse(await readFile(statePath, 'utf8'))
-      state.children = { zcode: { id, model: 'p/m1', status: 'active' } }
+      state.children = { worker1: { id, model: 'p/m1', status: 'active' } }
       await writeFile(statePath, JSON.stringify(state, null, 2), 'utf8')
     }
     await setChild('cache-0')
     const evicted = await tool('squad_dispatch').execute(
-      { agent: 'zcode', message: 'old', phase: 'implement' },
+      { agent: 'worker1', message: 'old', phase: 'implement' },
       exec,
     )
     assert.ok(evicted.includes('（cold）'), 'oldest snapshot evicted')
     await setChild('cache-128')
     const kept = await tool('squad_dispatch').execute(
-      { agent: 'zcode', message: 'new', phase: 'implement' },
+      { agent: 'worker1', message: 'new', phase: 'implement' },
       exec,
     )
     assert.ok(kept.includes('（上次汇报）'), 'newest snapshot still cached')
@@ -8667,12 +8699,12 @@ test('T25 context display', async (t) => {
     async ({ host, tool, exec }) => {
       hostRef = host
       await tool('squad_enable').execute({}, exec)
-      await startContextTask(tool, exec, { agents: ['zcode'] })
+      const showTask = await startContextTask(tool, exec, { agents: ['worker1'] })
       meter.calls.length = 0
       meter.throwMeasure = false
       meter.throwPressure = false
       const out = await tool('squad_dispatch').execute(
-        { agent: 'zcode', message: 'impl', phase: 'implement' },
+        { agent: 'worker1', message: 'impl', phase: 'implement' },
         exec,
       )
       assert.ok(!out.includes('context:'))
@@ -8687,18 +8719,18 @@ test('T25 context display', async (t) => {
       )
       assert.ok(!receipt.includes('context:'))
       assert.equal(meter.calls.length, 0, 'no automatic sampling with showUsage:false')
-      const status = await tool('squad_status').execute({}, exec)
+      const status = await tool('squad_status').execute({ task_id: showTask.taskId }, exec)
       assert.ok(!status.includes('context:'))
       assert.equal(meter.calls.length, 0, 'status also does not touch the meter')
     },
   )
 
   await withSquadHost({ externalDelayMs: 40 }, async ({ host, tool, exec }) => {
-    await startContextTask(tool, exec, { agents: ['codex'] })
-    const out = await tool('squad_dispatch').execute({ agent: 'codex', message: 'background context', phase: 'design' }, exec)
+    const bgTask = await startContextTask(tool, exec, { agents: ['brain'] })
+    const out = await tool('squad_dispatch').execute({ agent: 'brain', message: 'background context', phase: 'design' }, exec)
     assert.equal(host.activations.at(-1).delivery, 'parent')
     assert.equal(usageAfterTask(out), `${unknown}（external）`)
-    const status = await tool('squad_status').execute({}, exec)
+    const status = await tool('squad_status').execute({ task_id: bgTask.taskId }, exec)
     assert.ok(status.includes(`external-background | ${unknown}（external）`))
   })
 })
@@ -8707,13 +8739,13 @@ test('T25 context display', async (t) => {
 test('T26 context discipline', async () => {
   await withSquadHost({}, async ({ workspace, host, tool, exec }) => {
     await tool('squad_enable').execute({}, exec)
-    const localTask = await startContextTask(tool, exec, { agents: ['zcode', 'qoder'] })
+    const localTask = await startContextTask(tool, exec, { agents: ['worker1', 'front1'] })
     const localDir = join(workspace, '.agent-squad', localTask.taskId)
     const promptOf = (activation) => activation.prompt.map((block) => block.text).join('')
     const sentText = () => host.sent.at(-1).content.map((block) => block.text).join('')
 
     // Local first dispatch: full discipline in the message and the BRIEF.
-    await tool('squad_dispatch').execute({ agent: 'zcode', message: 'impl', phase: 'implement' }, exec)
+    await tool('squad_dispatch').execute({ agent: 'worker1', message: 'impl', phase: 'implement' }, exec)
     const localPrompt = promptOf(host.activations.at(-1))
     assert.ok(localPrompt.includes(CONTEXT_DISCIPLINE_TEXT))
     assert.ok(localPrompt.includes('并行默认'))
@@ -8724,14 +8756,14 @@ test('T26 context discipline', async () => {
 
     // Team first dispatch: full discipline and the same text in the installed
     // teammate system section.
-    await tool('squad_dispatch').execute({ agent: 'qoder', message: 'impl', phase: 'implement' }, exec)
+    await tool('squad_dispatch').execute({ agent: 'front1', message: 'impl', phase: 'implement' }, exec)
     const teamPrompt = promptOf(host.activations.at(-1))
     assert.ok(teamPrompt.includes(CONTEXT_DISCIPLINE_TEXT))
     assertSEM(teamPrompt)
     const systemSection = host.sections.find((section) => section.includes(CONTEXT_DISCIPLINE_TEXT))
     assert.ok(systemSection, 'teammate system prompt carries the discipline text')
     assertSEM(systemSection)
-    await tool('squad_dispatch').execute({ agent: 'qoder', message: 'impl again team', phase: 'implement' }, exec)
+    await tool('squad_dispatch').execute({ agent: 'front1', message: 'impl again team', phase: 'implement' }, exec)
     const teamResume = sentText()
     assert.ok(teamResume.includes('按 BRIEF 的上下文纪律'))
     assert.ok(!teamResume.includes(CONTEXT_DISCIPLINE_TEXT) && !teamResume.includes(WORKER_ITEMS[1]))
@@ -8739,11 +8771,11 @@ test('T26 context discipline', async () => {
     assertSEM(teamResume)
 
     // External every time: role, self-contained assignment and full discipline.
-    const externalTask = await startContextTask(tool, exec, { agents: ['codex'] })
+    const externalTask = await startContextTask(tool, exec, { agents: ['brain'] })
     const externalDir = join(workspace, '.agent-squad', externalTask.taskId)
     await writeFile(join(externalDir, 'PLAN.md'), '# PLAN\n', 'utf8')
     await tool('squad_dispatch').execute({
-      agent: 'codex',
+      agent: 'brain',
       message: 'design one',
       phase: 'design',
       task_id: externalTask.taskId,
@@ -8753,7 +8785,7 @@ test('T26 context discipline', async () => {
     assert.ok(externalOne.includes('角色章程：'))
     assert.ok(!externalOne.includes('调用 squad_report'))
     await tool('squad_dispatch').execute({
-      agent: 'codex',
+      agent: 'brain',
       message: 'design two',
       phase: 'design',
       task_id: externalTask.taskId,
@@ -8766,7 +8798,7 @@ test('T26 context discipline', async () => {
     // Resume of the same local child: no charter, no full discipline, only the
     // short BRIEF reminder plus this round's strategy.
     await tool('squad_dispatch').execute({
-      agent: 'zcode',
+      agent: 'worker1',
       message: 'impl again',
       phase: 'implement',
       task_id: localTask.taskId,
@@ -8780,7 +8812,7 @@ test('T26 context discipline', async () => {
     assertSEM(resumeText)
     // Rework always states the defect-only scope.
     await tool('squad_dispatch').execute({
-      agent: 'zcode',
+      agent: 'worker1',
       message: 'D9 只改这个',
       phase: 'rework',
       task_id: localTask.taskId,
@@ -8796,9 +8828,9 @@ test('T26 context discipline', async () => {
   // baseline teammate identity section (no new discipline on spawn/rebind).
   await withSquadHost({ config: { contextPolicy: false } }, async ({ workspace, host, tool, exec }) => {
     await tool('squad_enable').execute({}, exec)
-    const task = await startContextTask(tool, exec, { agents: ['zcode', 'qoder'] })
+    const task = await startContextTask(tool, exec, { agents: ['worker1', 'front1'] })
     const out = await tool('squad_dispatch').execute(
-      { agent: 'zcode', message: 'impl', phase: 'implement' },
+      { agent: 'worker1', message: 'impl', phase: 'implement' },
       exec,
     )
     const prompt = host.activations.at(-1).prompt.map((block) => block.text).join('')
@@ -8808,7 +8840,7 @@ test('T26 context discipline', async () => {
     const baselineIdentity = '先读 TASK.md；PLAN.md、SPEC.md'
     // Team spawn installs the baseline identity section.
     const teamOut = await tool('squad_dispatch').execute(
-      { agent: 'qoder', message: 'team impl', phase: 'implement' },
+      { agent: 'front1', message: 'team impl', phase: 'implement' },
       exec,
     )
     const teamPrompt = host.activations.at(-1).prompt.map((block) => block.text).join('')
@@ -8820,7 +8852,7 @@ test('T26 context discipline', async () => {
     assert.ok(!teamOut.includes('context:'))
     // Resume/rebind the same id keeps the baseline too.
     await tool('squad_dispatch').execute(
-      { agent: 'qoder', message: 'team impl again', phase: 'implement' },
+      { agent: 'front1', message: 'team impl again', phase: 'implement' },
       exec,
     )
     const reboundSection = host.sections.at(-1)
@@ -8842,8 +8874,8 @@ test('T27 context docs', async () => {
     assert.ok(readme.includes(field), `README documents ${field}`)
   }
   // Manual examples and the two caps.
-  assert.ok(readme.includes('squad_compact({ agent: "zcode" })'))
-  assert.ok(readme.includes('squad_compact({ agent: "qoder", task_id: "t-example" })'))
+  assert.ok(readme.includes('squad_compact({ agent: "worker1" })'))
+  assert.ok(readme.includes('squad_compact({ agent: "front1", task_id: "t-example" })'))
   assert.ok(readme.includes('8192'), 'summary generation cap')
   assert.ok(readme.includes('16384'), 'request output cap')
   // The formula and the small-window counterexample.

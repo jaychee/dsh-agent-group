@@ -14,11 +14,36 @@ import { copyFile, mkdir, readFile, rename, rm, stat, writeFile } from 'node:fs/
 import { homedir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 
-/** On-disk schema version. v1: three agents; v2: +gpt architect; v3: +opencode worker. */
-export const SETTINGS_VERSION = 3
+/** On-disk schema version. v1: three agents; v2: +gpt architect; v3: +opencode worker;
+ * v4: role ids renamed (codex→brain, gpt→tester, zcode→worker1, qoder→front1,
+ * opencode→worker2) without changing roles/executors/models/reasoning/worker. */
+export const SETTINGS_VERSION = 4
 
 /** Fixed, read-only agent ids in display order. */
-export const FIXED_IDS = ['codex', 'gpt', 'zcode', 'qoder', 'opencode']
+export const FIXED_IDS = ['brain', 'tester', 'worker1', 'front1', 'worker2']
+
+/** v3 ids mapped to their v4 replacements (order preserved). */
+export const LEGACY_IDS = {
+  codex: 'brain',
+  gpt: 'tester',
+  zcode: 'worker1',
+  qoder: 'front1',
+  opencode: 'worker2',
+}
+
+/** Default display names for the v4 fixed ids. */
+export const DEFAULT_DISPLAY_NAMES = {
+  brain: '大脑',
+  tester: '测试者',
+  worker1: '后端开发者1',
+  front1: '前端开发者1',
+  worker2: '后端开发者2',
+}
+
+/** Reverse legacy mapping: v4 id → v3 id, for loading older files. */
+const LEGACY_ID_BY_NEW = Object.fromEntries(
+  Object.entries(LEGACY_IDS).map(([legacy, current]) => [current, legacy]),
+)
 
 export const EXECUTORS = ['external', 'local', 'team']
 
@@ -28,13 +53,13 @@ export const EXECUTORS = ['external', 'local', 'team']
  * 'tester' on load. */
 export const ROLES = ['brain', 'tester', 'worker']
 
-/** Factory defaults: the squad the user pinned — codex/gpt/zcode/qoder on
- * local models, opencode on OpenCode Go; worker is fixed to zcode (primary
- * backend), opencode (backup backend) and qoder (frontend-only). */
+/** Factory defaults: the squad the user pinned — brain/tester/worker1/front1 on
+ * local models, worker2 on OpenCode Go; worker is fixed to worker1 (primary
+ * backend), worker2 (backup backend) and front1 (frontend-only). */
 export const DEFAULT_AGENTS = [
   {
-    id: 'codex',
-    displayName: 'codex',
+    id: 'brain',
+    displayName: '大脑',
     role: 'brain',
     executor: 'local',
     model: 'openai-codex/gpt-6.2-astra',
@@ -43,8 +68,8 @@ export const DEFAULT_AGENTS = [
     description: '业务设计与验收：给出业务方案、对外行为与验收标准，并做业务验收（本地 OpenAI Codex GPT-6.2-Astra，xhigh）。',
   },
   {
-    id: 'gpt',
-    displayName: 'gpt',
+    id: 'tester',
+    displayName: '测试者',
     role: 'tester',
     executor: 'local',
     model: 'openai/gpt-6.2-sol',
@@ -52,8 +77,8 @@ export const DEFAULT_AGENTS = [
     description: '测试验收者：依据 brain 的技术实现规格与验收方案审核 worker 的测试用例，不合格时补充测试用例并完整测试（默认不参与实现）。',
   },
   {
-    id: 'zcode',
-    displayName: 'zcode',
+    id: 'worker1',
+    displayName: '后端开发者1',
     role: 'worker',
     executor: 'local',
     model: 'zai-coding-cn/glm-5.3',
@@ -62,8 +87,8 @@ export const DEFAULT_AGENTS = [
     description: '主力后端 worker：后端任务优先派发；实现后端代码并自测，自测通过后才交付（本地 GLM-5.3，max）。',
   },
   {
-    id: 'qoder',
-    displayName: 'qoder',
+    id: 'front1',
+    displayName: '前端开发者1',
     role: 'worker',
     executor: 'local',
     model: 'qoder/qmodel_latest',
@@ -72,14 +97,14 @@ export const DEFAULT_AGENTS = [
     description: '前端 worker：固定负责前端页面交互设计、实现与自测，不做后端（本地 Qwen4-Max，xhigh）。',
   },
   {
-    id: 'opencode',
-    displayName: 'opencode',
+    id: 'worker2',
+    displayName: '后端开发者2',
     role: 'worker',
     executor: 'local',
     model: 'dsh-opencode-go/deepseek-v4.1-flash',
     reasoning: 'max',
     worker: true,
-    description: '备份后端 worker：zcode 不可用时接手后端实现与自测（OpenCode Go DeepSeek V4.1 Flash，max，可续跑）。',
+    description: '备份后端 worker：worker1 不可用时接手后端实现与自测（OpenCode Go DeepSeek V4.1 Flash，max，可续跑）。',
   },
 ]
 
@@ -248,6 +273,7 @@ export function seedFromBundle(bundleAgents, worktreeDir) {
   for (const entry of Array.isArray(bundleAgents) ? bundleAgents : []) {
     if (isPlainObject(entry) && FIXED_IDS.includes(entry.name)) {
       rows.set(entry.name, {
+        displayName: isNonEmptyString(entry.displayName) ? entry.displayName.trim() : undefined,
         role: ROLES.includes(entry.role) ? entry.role : 'worker',
         worker: typeof entry.worker === 'boolean' ? entry.worker : undefined,
         description: typeof entry.description === 'string' ? entry.description : '',
@@ -267,7 +293,9 @@ export function seedFromBundle(bundleAgents, worktreeDir) {
     const external = !pinned && row.provider !== '' && row.provider !== 'spawn' && row.provider !== 'fork'
     return {
       id,
-      displayName: id,
+      displayName: isNonEmptyString(row.displayName)
+        ? row.displayName
+        : DEFAULT_DISPLAY_NAMES[id] ?? id,
       role: row.role,
       executor: pinned ? 'local' : external ? 'external' : 'team',
       model: pinned ? row.model : external ? row.provider : '',
@@ -291,10 +319,13 @@ export function seedFromBundle(bundleAgents, worktreeDir) {
 }
 
 /**
- * Migrate a parsed v1 file (three agents: codex/zcode/qoder) to the v2 shape
- * by inserting the architect row (from the effective defaults) at its fixed
- * slot. Everything else — including the user's edits and the revision — is
- * preserved byte-for-byte in meaning.
+ * Migrate a parsed v1/v2/v3 file to the v4 shape: map the old fixed ids to
+ * their v4 names, restore the display name for migrated rows (the user asked
+ * for the new labels), insert any missing fixed rows from the defaults, and
+ * preserve every other user edit and the revision.
+ *
+ * v1 omitted tester, v2 added it as the architect, v3 added worker2. The same
+ * id map covers all three generations, so one pass rebuilds the fixed order.
  */
 export function migrateSettings(parsed, defaults) {
   const byId = new Map(
@@ -302,8 +333,22 @@ export function migrateSettings(parsed, defaults) {
       .filter((entry) => isPlainObject(entry))
       .map((entry) => [entry.id, entry]),
   )
-  const agents = FIXED_IDS.map((id) => byId.get(id) ?? { ...defaults?.agents?.find((agent) => agent?.id === id) })
-    .filter((entry) => entry !== undefined)
+  const defaultAgent = (id) => defaults?.agents?.find((agent) => agent?.id === id)
+  const agents = FIXED_IDS.map((id) => {
+    const direct = byId.get(id)
+    if (direct !== undefined) {
+      // A v4-shaped row already carries the current id: keep its display name
+      // (tests and hand-authored files may use custom labels). Legacy rows
+      // below get the renamed default label.
+      return { ...direct, displayName: isNonEmptyString(direct.displayName) ? direct.displayName : DEFAULT_DISPLAY_NAMES[id] ?? id }
+    }
+    const legacyId = LEGACY_ID_BY_NEW[id]
+    const legacy = legacyId === undefined ? undefined : byId.get(legacyId)
+    if (legacy !== undefined) {
+      return { ...legacy, id, displayName: DEFAULT_DISPLAY_NAMES[id] ?? legacy.displayName ?? id }
+    }
+    return { ...defaultAgent(id) }
+  }).filter((entry) => entry !== undefined)
   if (agents.length !== FIXED_IDS.length) return undefined
   return { ...parsed, version: SETTINGS_VERSION, agents }
 }
@@ -460,8 +505,8 @@ export function createSettingsStore(options = {}) {
       )
     }
     // Role migration: the architect role retired (its spec/tech-review duties
-    // moved to brain); gpt is now the tester. Normalize in memory so old
-    // files keep validating; the next save persists 'tester'.
+    // moved to brain); the tester agent now owns it. Normalize in memory so
+    // old files keep validating; the next save persists 'tester'.
     if (Array.isArray(parsed.agents)) {
       let roleChanged = false
       const agents = parsed.agents.map((agent) => {
@@ -474,10 +519,10 @@ export function createSettingsStore(options = {}) {
       if (roleChanged) parsed = { ...parsed, agents }
     }
     if (parsed.version !== SETTINGS_VERSION) {
-      // Older files migrate in place: insert any missing fixed rows (gpt in
-      // v2, opencode in v3), keep every user edit and the revision, then
+      // Older files migrate in place: map the renamed fixed ids, insert any
+      // missing fixed rows, keep every user edit and the revision, then
       // converge the file to the current version.
-      if (![1, 2].includes(parsed.version)) {
+      if (![1, 2, 3].includes(parsed.version)) {
         throw new SettingsError(
           'UNKNOWN_VERSION',
           `settings version ${String(parsed?.version)} is not supported; file left untouched`,
@@ -496,7 +541,7 @@ export function createSettingsStore(options = {}) {
         leaderWorker: effectiveDefaults.leaderWorker,
       }
       await writeAtomic(saved)
-      warn(`settings v${parsed.version} migrated to v${SETTINGS_VERSION}: inserted the missing fixed rows`)
+      warn(`settings v${parsed.version} migrated to v${SETTINGS_VERSION}: renamed fixed ids and inserted missing rows`)
       return saved
     }
     const checked = validateAgentsAndWorktree(parsed.agents, parsed.worktree, parsed.leaderWorker)

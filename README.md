@@ -2,20 +2,20 @@
 
 给 DeepSeek Harness 加一个**按角色分工、显式启用（opt-in）的本地多智能体小队**：Lead 负责组织与分配，brain 负责业务方案、技术规格与双验收，tester 负责测试验收，worker 负责实现与自测；返工复用同一个队友会话，而不是每次新建对话。
 
-**默认不启用**：普通会话就是普通会话，看不到任何 squad 工具或章程。只有用户明确说"用小队实现 / 用智能体小队"时，Lead 才调用 `squad_enable` 进入小队；**仅提到队友名字（codex/gpt/zcode/qoder）不算启用**。插件重载后若会话失去 Lead 身份，再次 `squad_enable` 即可恢复。
+**默认不启用**：普通会话就是普通会话，看不到任何 squad 工具或章程。只有用户明确说"用小队实现 / 用智能体小队"时，Lead 才调用 `squad_enable` 进入小队；**仅提到队友名字（brain/tester/worker1/front1）不算启用**。插件重载后若会话失去 Lead 身份，再次 `squad_enable` 即可恢复。
 
 ```text
 用户 ──▶ Lead (DSH 当前会话)
-             ├─ codex  [brain]      业务方案 / 验收标准 / 业务验收
-             ├─ gpt    [tester]     测试验收：审核/补充测试用例并完整测试
-             ├─ zcode  [worker]     主力后端：后端开发 / 后端自测（优先派发）
-             ├─ opencode[worker]    备份后端：zcode 不可用时接手（DeepSeek V4.1 Flash, max）
-             └─ qoder  [worker]     固定前端：页面交互设计 / 实现 / 自测
+             ├─ 大脑  (brain) [brain]   业务方案 / 验收标准 / 业务验收
+             ├─ 测试者 (tester) [tester] 测试验收：审核/补充测试用例并完整测试
+             ├─ 后端开发者1 (worker1) [worker] 主力后端：后端开发 / 后端自测（优先派发）
+             ├─ 后端开发者2 (worker2) [worker] 备份后端：worker1 不可用时接手（DeepSeek V4.1 Flash, max）
+             └─ 前端开发者1 (front1) [worker] 固定前端：页面交互设计 / 实现 / 自测
 ```
 
 插件本身很薄：它挂在 DSH 0.2.x 内置的标准 **subagent 运行时**（`ctx.subagents`：`startActivation`/`sendMessage`/`listDescendants`/`rootOf`）上，补上 DSH 缺的几件事：
 
-1. **命名 + 角色**：五个固定 teammate（codex / gpt / zcode / qoder / opencode），角色决定系统提示里的职责章程与可见工具；
+1. **命名 + 角色**：五个固定 teammate（brain / tester / worker1 / front1 / worker2），角色决定系统提示里的职责章程与可见工具；
 2. **共享记忆**：每个任务一个 `.agent-squad/<task>/` 目录，TASK / PLAN / SPEC / TECH-REVIEW / REVIEW / REPORT / JOURNAL 承载任务、业务方案、技术规格、技术验收、业务验收、交付证据与历史，所有成员读写同一份；
 3. **会话复用**：队友是 Lead 的持久、可续跑子会话；重复 `squad_dispatch` 同一个队友 = 往同一会话追加消息，返工天然复用上一轮上下文。
 
@@ -24,11 +24,11 @@
 | 角色 | 谁 | 职责 | 工具 |
 | --- | --- | --- | --- |
 | `lead` | 当前 DSH 会话（启用后） | 拆解流程、审核并批准业务方案、决定派单顺序、汇总交付、按需人工压缩单个队友；不写业务代码 | `squad_enable` / `squad_start` / `squad_dispatch` / `squad_approve_plan` / `squad_extend` / `squad_status` / `squad_compact` / `squad_wait` / `squad_finish` |
-| `brain` | codex | 业务方案（PLAN.md）、技术规格（SPEC.md）、技术验收（TECH-REVIEW.md）与业务验收（REVIEW.md）；可澄清方案，改业务行为必须先请用户决策 | `squad_report` |
-| `tester` | gpt（本地固定模型 `openai/gpt-6.2-sol`） | 测试验收（TEST-REVIEW.md）：依据 brain 的技术实现规格与验收方案审核 worker 的测试用例，不合格时补充测试用例并完整测试；brain 本人实现过代码时代签技术验收 | `squad_report` |
-| `worker` | zcode / qoder / opencode | **worker 固定为这三名**。zcode 主力后端（后端任务优先派发，实现后端代码并自测，自测通过后才交付）；opencode 备份后端（zcode 不可用时接手；OpenCode Go 的 DeepSeek V4.1 Flash，max 思考强度，本地可续跑）；qoder 固定前端（页面交互设计、实现与自测，不做后端）。三者都依据 PLAN-APPROVED.md 验收方案 + SPEC.md 技术实现规格开发、编写测试用例并自测，自测通过后才交付 | `squad_report` |
+| `brain` | 大脑（brain） | 业务方案（PLAN.md）、技术规格（SPEC.md）、技术验收（TECH-REVIEW.md）与业务验收（REVIEW.md）；可澄清方案，改业务行为必须先请用户决策 | `squad_report` |
+| `tester` | 测试者（tester，本地固定模型 `openai/gpt-6.2-sol`） | 测试验收（TEST-REVIEW.md）：依据 brain 的技术实现规格与验收方案审核 worker 的测试用例，不合格时补充测试用例并完整测试；brain 本人实现过代码时代签技术验收 | `squad_report` |
+| `worker` | 后端开发者1（worker1）/ 前端开发者1（front1）/ 后端开发者2（worker2） | **worker 固定为这三名**。worker1 主力后端（后端任务优先派发，实现后端代码并自测，自测通过后才交付）；worker2 备份后端（worker1 不可用时接手；OpenCode Go 的 DeepSeek V4.1 Flash，max 思考强度，本地可续跑）；front1 固定前端（页面交互设计、实现与自测，不做后端）。三者都依据 PLAN-APPROVED.md 验收方案 + SPEC.md 技术实现规格开发、编写测试用例并自测，自测通过后才交付 | `squad_report` |
 
-任何角色（含 brain、tester 与 Lead）都保留 `agents[].worker` 与顶层 `leaderWorker`（Lead 默认关）两个运行时开关：开启后该角色可接 implement/rework 派单，实现过代码的角色不能签署自己实现的技术验收。**默认只有 zcode / opencode / qoder 三名 worker 开启**（brain 与 tester 默认关，须用户同意并显式开启后才能接手实现）。**设置页不再暴露这两个开关**（worker 能力属高级配置，直接编辑 `$DSH_HOME/agent-squad/settings.json` 或经 `PUT /agent-squad/settings` 修改，保存其它字段不会改动已有值）。
+任何角色（含 brain、tester 与 Lead）都保留 `agents[].worker` 与顶层 `leaderWorker`（Lead 默认关）两个运行时开关：开启后该角色可接 implement/rework 派单，实现过代码的角色不能签署自己实现的技术验收。**默认只有 worker1 / worker2 / front1 三名 worker 开启**（brain 与 tester 默认关，须用户同意并显式开启后才能接手实现）。**设置页不再暴露这两个开关**（worker 能力属高级配置，直接编辑 `$DSH_HOME/agent-squad/settings.json` 或经 `PUT /agent-squad/settings` 修改，保存其它字段不会改动已有值）。
 
 角色章程可以在插件配置里整段替换（`brainCharter` / `testerCharter` / `workerCharter`），单个 agent 也可以用 `charter` 覆盖。默认章程为中文；Lead 策略额外要求**面向用户始终使用用户的语言**，章程语言不影响回复语言。
 
@@ -44,7 +44,7 @@
 - 规格有问题时按 worker/tester 的上报修订并发布新版本（更新 SPEC.md，版本号以派单为准）；单纯澄清规格不扣返工额度，也不重置已用额度。
 - 技术验收轮（tech-review）以当前 SPEC.md 为唯一权威技术规格：做代码审查、亲自运行验证测试，在 TECH-REVIEW.md 逐条记录需求/AC 编号、命令、退出码、关键输出与可执行的编号缺陷清单；技术验收前必须已有一份仍然新鲜的 APPROVED 测试验收（TEST-REVIEW.md）。
 - 业务验收轮以 PLAN-APPROVED.md 为唯一权威业务规格，逐条核对 AC 并在 REVIEW.md 写明 AC 编号、验证命令、退出码、关键输出与结论；亲自运行或检查，不接受没有证据的声明。测试结论对照 TEST-REVIEW.md，技术结论对照 SPEC.md 与 TECH-REVIEW.md。
-- 当你本人接手实现过代码时，不能再签署自己改动的技术验收：技术验收改由 tester（gpt）对照 SPEC.md 代签；你的业务验收仍单独签署，两份验收独立记录。
+- 当你本人接手实现过代码时，不能再签署自己改动的技术验收：技术验收改由 tester 对照 SPEC.md 代签；你的业务验收仍单独签署，两份验收独立记录。
 - tester 挂起（额度耗尽容错交接）时代行测试验收职责：按 tester 章程写 TEST-REVIEW.md；技术/业务验收仍按本章程单独签署，记录独立。tester 恢复后交还职责。
 
 ### tester 章程（要点）
@@ -61,7 +61,7 @@
 
 - 动手前先读 TASK.md、PLAN-APPROVED.md（业务方案）与 SPEC.md（技术规格）。PLAN-APPROVED.md 是业务方案与业务验收的唯一权威规格；SPEC.md 是技术实现、返工与技术验收的唯一权威规格；PLAN.md 只用于设计，不能覆盖批准归档。仅任务快照豁免方案门禁且无批准归档时，按 TASK.md 与 Lead 本轮派单执行；仍须逐条 AC 留证。
 - 只做规格定义的最小改动；不得引入规格未定义的接口、文件或依赖，不重新设计、不改名、不扩大范围。
-- 规格缺失、矛盾或明显错误时立即停止实现，报 "blocked"，引用 PLAN-APPROVED.md/SPEC.md 的具体章节与编号，并列出缺失项或冲突原文；需要归档而文件缺失时明确引用文件名；豁免任务引用 TASK.md 章节或 Lead 派单条目。规格有问题上报 Lead 转 brain（codex）修订发布，不自行偏离或改用 PLAN.md。
+- 规格缺失、矛盾或明显错误时立即停止实现，报 "blocked"，引用 PLAN-APPROVED.md/SPEC.md 的具体章节与编号，并列出缺失项或冲突原文；需要归档而文件缺失时明确引用文件名；豁免任务引用 TASK.md 章节或 Lead 派单条目。规格有问题上报 Lead 转 brain 修订发布，不自行偏离或改用 PLAN.md。
 - 按 SPEC.md 指定的测试名、输入与期望输出写或更新测试，并亲自运行每条 AC 的验收命令；豁免任务按 TASK.md 与 Lead 本轮派单执行。
 - 在 REPORT.md 逐条 AC 给证据：AC 编号、改动文件路径、测试名、实际命令、退出码、关键输出与结论；失败或未执行必须如实标注，不得只写“测试通过”。
 - AC 映射：沿用 TASK.md 的 AC 编号；未编号时按条目顺序从 AC1 开始编号。PLAN.md/SPEC.md 为每条 AC 指定改动文件、测试名、验证命令与期望值；REPORT.md/TECH-REVIEW.md/REVIEW.md 按对应规格逐条记录 AC 编号、文件路径、测试名、命令、退出码、关键输出与结论。
@@ -73,9 +73,9 @@
 - **研发模式（默认，`mode="dev"`）**：设计 → 开发 → 验收的完整流程（先审方案再实现），即下文「使用」一节的 1–12 步，行为不变。
 - **验收模式（`mode="acceptance"`）**：不做设计，以**指定的权威方案**为准，做技术与业务双维度验收并交付验收报告；适用于对既有实现按权威方案验收的场景。要求：
   - `authority`（必填）：权威方案——文件路径（相对会话目录或绝对路径）或方案全文；创建任务时固化为任务记忆里的 `AUTHORITY.md`，之后一切验收标准从它推导，brain 不再产出 PLAN/SPEC，design/spec/implement 等研发阶段被拒绝。
-  - **双验收顺序（强制）**：先派 gpt（`phase="acceptance"`，技术维度：亲自运行测试/构建、逐项核对实现与方案一致性），再派 codex（`phase="acceptance"`，业务维度：对外行为与用户可见结果，并**定稿验收报告**）。
+  - **双验收顺序（强制）**：先派 tester（`phase="acceptance"`，技术维度：亲自运行测试/构建、逐项核对实现与方案一致性），再派 brain（`phase="acceptance"`，业务维度：对外行为与用户可见结果，并**定稿验收报告**）。
   - **验收报告 `ACCEPTANCE-REPORT.md` 五要素**（缺一不可）：① 验收方案与标准（从 AUTHORITY.md 推导）② 上一轮验收报告修复情况（第 2 轮起逐条核对编号问题：已修复/部分修复/未修复 + 证据）③ 本轮发现的问题（编号、维度、证据、严重度）④ 本轮发现问题的修复建议 ⑤ 结论（最后一行 `VERDICT: APPROVED|CHANGES_REQUESTED`）。每轮归档为 `ACCEPTANCE-REPORT-R<n>.md`。
-  - **修复由 worker 承担**：`CHANGES_REQUESTED` 的编号问题与修复建议由 Lead 以 `phase="rework"` 派给 worker（后端优先 zcode，备份 opencode；前端 qoder）；修复计入验收返工预算（默认 3 轮，与技术返工同一额度，扩展用 `squad_extend(kind="tech", …)`）；修复使本轮验收失效，需重走 gpt → codex 双验收。
+  - **修复由 worker 承担**：`CHANGES_REQUESTED` 的编号问题与修复建议由 Lead 以 `phase="rework"` 派给 worker（后端优先 worker1，备份 worker2；前端 front1）；修复计入验收返工预算（默认 3 轮，与技术返工同一额度，扩展用 `squad_extend(kind="tech", …)`）；修复使本轮验收失效，需重走 tester → brain 双验收。
   - `VERDICT: APPROVED` 且仍然新鲜（修复未再改动代码）→ `squad_finish` 收尾交付。
 
 ## 使用
@@ -83,15 +83,15 @@
 对任意会话说"**用智能体小队把这个需求做掉：……**"。Lead 会先 `squad_enable`，然后按固定流程推进（**先审方案再实现**，完整流程为默认）：
 
 1. `squad_start` 建任务与共享记忆（可选 `flow="simple"` 走简化流程，适合非代码任务）；**默认同时创建 worktree + 新分支，并把会话切过去**；
-2. `squad_dispatch(codex, phase="design")` → brain 写业务方案 `PLAN.md`；
+2. `squad_dispatch(brain, phase="design")` → brain 写业务方案 `PLAN.md`；
 3. **Lead 审核 `PLAN.md`**：假装自己是没有上下文的实现者，无法只靠 PLAN 拍板技术设计的点一律按 D1 起连续编号，写明章节、缺失或矛盾、最小补全要求，再派回 brain。有问题就把编号缺陷派回 brain（`phase="design"` 返工）；设计预算默认 4 次，未扩展时第 5 次暂停——先向用户说明阻塞点并等待决策，用户同意后用 `squad_extend(kind="design", rounds=3, reason="用户批准的追加理由", confirmed=true)` 追加轮次再派。方案合格后调用 **`squad_approve_plan`** 批准（归档 `PLAN-APPROVED.md`）；
-4. `squad_dispatch(codex, phase="spec")` → brain 发布技术规格 `SPEC.md`（可多轮修订，不占返工额度）；**规格交付后即可派工，不需要 Lead 再审批**；
-5. `squad_dispatch(zcode, phase="implement")` → 后端任务**优先派 zcode**（zcode 不可用自动改派备份 opencode）；前端任务固定派 qoder（页面交互设计、实现、自测）。worker 按 PLAN-APPROVED.md + SPEC.md 在 worktree 里实现并自测，写 `REPORT.md`，逐条 AC 给证据，自测全部通过后才交付；
-6. `squad_dispatch(gpt, phase="test-review")` → tester 测试验收：依据 brain 的 SPEC.md 与 PLAN-APPROVED.md 审核 worker 的测试用例，不合格由 gpt 补充测试用例并完整测试，写 `TEST-REVIEW.md`（`VERDICT: APPROVED|CHANGES_REQUESTED`）；
+4. `squad_dispatch(brain, phase="spec")` → brain 发布技术规格 `SPEC.md`（可多轮修订，不占返工额度）；**规格交付后即可派工，不需要 Lead 再审批**；
+5. `squad_dispatch(worker1, phase="implement")` → 后端任务**优先派 worker1**（worker1 不可用自动改派备份 worker2）；前端任务固定派 front1（页面交互设计、实现、自测）。worker 按 PLAN-APPROVED.md + SPEC.md 在 worktree 里实现并自测，写 `REPORT.md`，逐条 AC 给证据，自测全部通过后才交付；
+6. `squad_dispatch(tester, phase="test-review")` → tester 测试验收：依据 brain 的 SPEC.md 与 PLAN-APPROVED.md 审核 worker 的测试用例，不合格由 tester 补充测试用例并完整测试，写 `TEST-REVIEW.md`（`VERDICT: APPROVED|CHANGES_REQUESTED`）；
 7. 测试验收不通过 → 把编号缺陷派回对应 worker（`phase="rework"`，计入技术返工预算）；返工后测试验收失效，重走 test-review；
-8. 测试验收通过 → `squad_dispatch(codex, phase="tech-review")` → brain 技术验收（若 codex 本任务写过代码，改派 gpt 代签），写 `TECH-REVIEW.md`（`VERDICT: APPROVED|CHANGES_REQUESTED`）；
+8. 测试验收通过 → `squad_dispatch(brain, phase="tech-review")` → brain 技术验收（若 brain 本任务写过代码，改派 tester 代签），写 `TECH-REVIEW.md`（`VERDICT: APPROVED|CHANGES_REQUESTED`）；
 9. 技术验收不通过 → 把编号缺陷派回对应 worker（`phase="rework"`，技术返工预算 3 轮，前后端共享；未扩展时第 4 轮暂停——先向用户说明阻塞点并等待决策，用户同意后用 `squad_extend(kind="tech", rounds=3, reason="用户批准的追加理由", confirmed=true)` 追加轮次再派；
-10. 技术验收通过 → `squad_dispatch(codex, phase="review")` → 业务验收，写 `REVIEW.md`；
+10. 技术验收通过 → `squad_dispatch(brain, phase="review")` → 业务验收，写 `REVIEW.md`；
 11. 业务验收不通过 → `phase="rework"`（业务返工预算 3 轮，与技术额度独立；**业务返工改了代码后必须重新通过测试验收与技术验收**）；未扩展时第 4 轮暂停——先向用户说明阻塞点并等待决策，用户同意后用 `squad_extend(kind="business", rounds=3, reason="用户批准的追加理由", confirmed=true)` 追加轮次再派；
 12. 三份验收（测试/技术/业务）都 `approved` 且仍然新鲜 → `squad_finish`：逐仓提交 worktree 改动、切回主仓库源目录、给出每仓分支与合并命令。
 
@@ -99,30 +99,30 @@
 
 ### 接手实现与代签
 
-- 对应 worker 不可用时，Lead 可以派 gpt（tester）接手实现（`phase="implement"/"rework"`，须先显式开启其 worker 能力）；
-- 三轮技术返工仍未通过时，Lead 先向用户说明阻塞点并等待决策；用户同意继续后直接派 gpt 接手，**不需要再次确认选人**；
-- 实现者不签自己的技术验收：gpt 接手写代码后，tech-review 仍由 codex（未写代码时）签署；codex 本人接手实现时，tech-review 改派 gpt 对照 SPEC.md 代签，业务验收仍由 codex 按业务方案单独签署，两份验收独立记录。
+- 对应 worker 不可用时，Lead 可以派 tester接手实现（`phase="implement"/"rework"`，须先显式开启其 worker 能力）；
+- 三轮技术返工仍未通过时，Lead 先向用户说明阻塞点并等待决策；用户同意继续后直接派 tester 接手，**不需要再次确认选人**；
+- 实现者不签自己的技术验收：tester 接手写代码后，tech-review 仍由 brain（未写代码时）签署；brain 本人接手实现时，tech-review 改派 tester 对照 SPEC.md 代签，业务验收仍由 brain 按业务方案单独签署，两份验收独立记录。
 
 ### 测试者容错（failover，额度耗尽自动交接）
 
-gpt（测试验收者）因**额度耗尽**等原因不可用时，插件把 gpt **挂起**并把测试验收职责（TEST-REVIEW.md）交给 **codex（brain）代行**，完成剩下的任务；gpt 挂起直到恢复：
+tester（测试验收者）因**额度耗尽**等原因不可用时，插件把 tester **挂起**并把测试验收职责（TEST-REVIEW.md）交给 **brain代行**，完成剩下的任务；tester 挂起直到恢复：
 
-- **自动触发**：① 对 gpt 的派单失败且错误匹配额度特征（额度/余额/欠费/限流/quota/insufficient/balance/exceeded/429/rate limit）→ 自动挂起，报错附交接指引；② gpt 以 `squad_report` 上报 `blocked` 且摘要匹配额度特征 → 自动挂起。
-- **手动触发/恢复**（Lead 工具 `squad_failover`）：挂起 `squad_failover({ agent: "gpt", reason: "原因" })`；用户确认额度恢复后 `squad_failover({ agent: "gpt", recover: true })` 交还职责。
-- **挂起期间**：对 gpt 的任何派单被拒绝（提示改派 codex）；`test-review` 阶段放行 codex（代行测试验收，派单提示注明"代行测试验收职责"）；`spec`/`tech-review` 本就是 codex 的职责。非额度类派单错误**不会**触发挂起。
-- **持久化**：挂起状态存 `~/.dsh/agent-squad/failover.json`，插件重载/DSH 重启后仍生效，直到显式恢复；`squad_status` 显示"挂起：gpt（自 …；自动/手动；原因 …）"。
-- 代行期间 codex 产出的 TEST-REVIEW.md 是正式记录；验收新鲜度规则不变（代行产生的测试验收同样绑定 codeEpoch/specVersion）。
+- **自动触发**：① 对 tester 的派单失败且错误匹配额度特征（额度/余额/欠费/限流/quota/insufficient/balance/exceeded/429/rate limit）→ 自动挂起，报错附交接指引；② tester 以 `squad_report` 上报 `blocked` 且摘要匹配额度特征 → 自动挂起。
+- **手动触发/恢复**（Lead 工具 `squad_failover`）：挂起 `squad_failover({ agent: "tester", reason: "原因" })`；用户确认额度恢复后 `squad_failover({ agent: "tester", recover: true })` 交还职责。
+- **挂起期间**：对 tester 的任何派单被拒绝（提示改派 brain）；`test-review` 阶段放行 brain（代行测试验收，派单提示注明"代行测试验收职责"）；`spec`/`tech-review` 本就是 brain 的职责。非额度类派单错误**不会**触发挂起。
+- **持久化**：挂起状态存 `~/.dsh/agent-squad/failover.json`，插件重载/DSH 重启后仍生效，直到显式恢复；`squad_status` 显示"挂起：tester（自 …；自动/手动；原因 …）"。
+- 代行期间 brain 产出的 TEST-REVIEW.md 是正式记录；验收新鲜度规则不变（代行产生的测试验收同样绑定 codeEpoch/specVersion）。
 
 ### 并行开发（默认运行方式，两层并行）
 
-- **worker 能力属运行时高级配置**：每个成员有 `agents[].worker`，另有顶层 `leaderWorker`——brain（codex）、tester（gpt）与 Lead 开启后都能作为 Worker 参与并行实现（实现者不参与自签验收）。这两个开关**不在设置页显示**，直接编辑 settings.json 或经 HTTP API 修改。
+- **worker 能力属运行时高级配置**：每个成员有 `agents[].worker`，另有顶层 `leaderWorker`——brain、tester与 Lead 开启后都能作为 Worker 参与并行实现（实现者不参与自签验收）。这两个开关**不在设置页显示**，直接编辑 settings.json 或经 HTTP API 修改。
 - **worker 内部并行（默认）**：ZCode CLI 自带 subagent 体系（Task/Agent 工具），Qoder CLI 亦有 subagent（默认启用的实验设置）与 Workflow parallel/pipeline 编排；ACP/CLI 通道均不过滤工具、权限自动放行。worker 章程与 implement/rework 派单提示内置"并行默认"引导：交办包含多个独立文件/模块时，worker 默认用自己的子代理同时开发；不独立的部分串行完成；边界不变（只改规格内文件、逐条 AC 留证、汇总写 REPORT.md）。
-- **小队级并行（默认）**：external 执行者的 `implement`/`rework` 派单**默认后台派发**（`delivery: 'parent'`）——工具调用立即返回、结果完成时以后台消息送达 Lead，因此 Lead **默认可以连续并发派多个 worker**（如 zcode 后端 + qoder 前端同时跑）。需要在本回合同步拿到结果时传 `background: false` 恢复阻塞式；`design/spec/test-review/tech-review/review` 始终同步（需读取交付物）；local/team 执行者本就不阻塞。
+- **小队级并行（默认）**：external 执行者的 `implement`/`rework` 派单**默认后台派发**（`delivery: 'parent'`）——工具调用立即返回、结果完成时以后台消息送达 Lead，因此 Lead **默认可以连续并发派多个 worker**（如 worker1 后端 + front1 前端同时跑）。需要在本回合同步拿到结果时传 `background: false` 恢复阻塞式；`design/spec/test-review/tech-review/review` 始终同步（需读取交付物）；local/team 执行者本就不阻塞。
 - `squad_status` 显示"后台执行器运行中：N 个"；`squad_finish` 会等所有后台执行器结束。同一队友运行中的重复派单仍受 R07 守卫限制。
 
 ### 不阻塞主会话（所有 external 阶段默认后台）
 
-所有 external 派单——包括 codex 的 `design`/`review`、gpt 的 `spec`/`tech-review`、worker 的 `implement`/`rework`——**默认后台派发**（`delivery: 'parent'`）：工具调用立即返回，Lead 结束本回合，用户可继续操作；结果完成时以后台消息送达，下一次工具调用会把待记账结果落盘（design → `PLAN-R<n>.md`；spec → `SPEC-V<n>.md`；review/tech-review → verdict + `REVIEW-R<n>.md`）。验收绑定（codeEpoch/specVersion）在派单时即记录，保证"验收对应哪版代码"不错位。
+所有 external 派单——包括 brain 的 `design`/`review`、tester 的 `spec`/`tech-review`、worker 的 `implement`/`rework`——**默认后台派发**（`delivery: 'parent'`）：工具调用立即返回，Lead 结束本回合，用户可继续操作；结果完成时以后台消息送达，下一次工具调用会把待记账结果落盘（design → `PLAN-R<n>.md`；spec → `SPEC-V<n>.md`；review/tech-review → verdict + `REVIEW-R<n>.md`）。验收绑定（codeEpoch/specVersion）在派单时即记录，保证"验收对应哪版代码"不错位。
 
 - 后台任务在跑时，`squad_approve_plan` / `squad_deliver` / `squad_finish` 会拒绝并提示"后台任务仍在运行：…"，`squad_status` 进度里显示"后台运行中：…"；
 - 需要在本回合同步拿结果（脚本化、必须立刻读交付物）时传 `background: false` 恢复阻塞式；
@@ -136,7 +136,7 @@ gpt（测试验收者）因**额度耗尽**等原因不可用时，插件把 gpt
 
 - `squad_start` 可以连续创建多个任务；除"原地开发"任务外，不再因为上一个任务还有队友在跑而被拒绝；
 - 所有任务工具（`squad_dispatch` / `squad_status` / `squad_approve_plan` / `squad_deliver` / `squad_finish` / `squad_extend` / `squad_parallel_start`）都接受 `task_id`，按注册表直接定位，与当前 cwd 无关；未知 id 会明确报错；
-- **队友按任务隔离**：同时存在多个活动任务时，子代理以 `<taskId>-<name>` 命名（如 `t-mw...-zcode`，符合运行时 1–32 位小写字母/数字/连字符的限制），每个任务各自拥有 `zcode` 会话；重新派单只续跑本任务的子代理；单活动任务时仍用裸名 `zcode`（保持既有行为）；
+- **队友按任务隔离**：同时存在多个活动任务时，子代理以 `<taskId>-<name>` 命名（如 `t-mw...-worker1`，符合运行时 1–32 位小写字母/数字/连字符的限制），每个任务各自拥有 `worker1` 会话；重新派单只续跑本任务的子代理；单活动任务时仍用裸名 `worker1`（保持既有行为）；
 - 队友 `squad_report` 通过派单时记录的 `taskId` 绑定回到自己的任务，不会串到别的任务；
 - `squad_status` 增加"其他活动任务（用 task_id 寻址）"清单；收尾的任务自动从活动列表移除；
 - **每个任务独立 worktree**：即使会话已经停在某个任务的 worktree 里，新任务的 `squad_start` 也会从**主仓库**重新拉一个 `squad-<taskId>` checkout（不会复用、也不会嵌套创建），任务之间文件互不可见；
@@ -165,10 +165,10 @@ gpt（测试验收者）因**额度耗尽**等原因不可用时，插件把 gpt
 
 每次 `implement`/`rework` 派单前，插件先对目标 worker 做一轮**轻量可用性探测**（同一任务同一 worker 探测成功即缓存；`probe: true` 强制重探、`probe: false` 跳过；`config.workerProbe: false` 全局关闭）。若探测返回**额度类错误**（limit/quota/429/余额/欠费/限流…）：
 
-- 立即把该 worker 记为不可用（`failover.json`，跨重载持久），并在派单反馈里明示：`[可用性门禁] zcode 不可用（可用性探测失败：HTTP 429 …）→ 已上报，并自动改由 opencode 执行本轮任务。`；
-- **自动改派**另一个可用 worker 执行本轮：**后端配对优先**——zcode 不可用改派备份 opencode，opencode 不可用改派 zcode；其余情形按 worker 角色顺序补位（qoder 无固定备份，由其余可用 worker 补位；qoder 固定前端，一般不反向承接后端任务）。tester 不参与 worker 替代，其容错走测试者交接。STATE 的派单记录带 `substitutedFrom` / `substitutionReason`，JOURNAL 留痕；
-- 此后对该 worker 的派单也会被自动绕开；`squad_status` 显示"挂起：zcode（…自动…）→ 派单将自动改由其他 worker 执行"；
-- 用户确认额度恢复后 `squad_failover({ agent: "zcode", recover: true })` 解除；
+- 立即把该 worker 记为不可用（`failover.json`，跨重载持久），并在派单反馈里明示：`[可用性门禁] worker1 不可用（可用性探测失败：HTTP 429 …）→ 已上报，并自动改由 worker2 执行本轮任务。`；
+- **自动改派**另一个可用 worker 执行本轮：**后端配对优先**——worker1 不可用改派备份 worker2，worker2 不可用改派 worker1；其余情形按 worker 角色顺序补位（front1 无固定备份，由其余可用 worker 补位；front1 固定前端，一般不反向承接后端任务）。tester 不参与 worker 替代，其容错走测试者交接。STATE 的派单记录带 `substitutedFrom` / `substitutionReason`，JOURNAL 留痕；
+- 此后对该 worker 的派单也会被自动绕开；`squad_status` 显示"挂起：worker1（…自动…）→ 派单将自动改由其他 worker 执行"；
+- 用户确认额度恢复后 `squad_failover({ agent: "worker1", recover: true })` 解除；
 - 非额度类探测异常只提示（`[可用性门禁] … 探测异常（非额度类）…继续按计划派发`），不改变执行者；
 - 没有可用替代者时派单被拒绝并说明原因（不会静默失败）。
 
@@ -216,7 +216,7 @@ gpt（测试验收者）因**额度耗尽**等原因不可用时，插件把 gpt
     └── <taskId>/                                  # TASK/JOURNAL/STATE 与方案、规格、验收、报告
 ```
 
-每个 worktree 的分支均为 `squad-<taskId>`；子目录名由输入序号与小写仓库名组成，非 ASCII 字母数字连续段替换为 `-`，去掉首尾 `-`，空名用 `repo`。STATE 按顺序记录 `{repo, path, branch, baseCommit}`。主仓库源目录和调用源目录也保存 current 指针，其他源仓库不写入。单仓仍以 worktree 为 cwd，记忆放在 worktree 内；多仓的 local、external、team 执行器统一以 taskRoot 为 cwd，qoder 无需 `--add-dir` 即可访问全部子目录。
+每个 worktree 的分支均为 `squad-<taskId>`；子目录名由输入序号与小写仓库名组成，非 ASCII 字母数字连续段替换为 `-`，去掉首尾 `-`，空名用 `repo`。STATE 按顺序记录 `{repo, path, branch, baseCommit}`。主仓库源目录和调用源目录也保存 current 指针，其他源仓库不写入。单仓仍以 worktree 为 cwd，记忆放在 worktree 内；多仓的 local、external、team 执行器统一以 taskRoot 为 cwd，front1 无需 `--add-dir` 即可访问全部子目录。
 
 - **显式 repos 严格模式**：拒绝空列表、不存在、非 Git、bare、重复仓库，以及目标路径或分支冲突；不退回原地开发。显式单仓校验后沿用原单仓创建逻辑。多仓先完成全部预检，再创建；创建、初始化或发布指针失败时恢复源端文件原字节并回滚本次拥有的 worktree/分支，清理失败标为 fatal 并报告详情。
 - **省略 repos 兼容模式**：保持当前仓库默认行为，已在 linked checkout 时复用；非 fatal 创建失败仍退回原地开发并说明原因，旧 STATE 仍可读取。单仓 cwd 切换失败保留已有 Git 产物，恢复源目录也失败时停止。
@@ -229,7 +229,7 @@ node --test dsh-agent-squad/test/settings.test.js
 ASQ_LIVE_QODER=1 node --test --test-name-pattern='^T09 ' dsh-agent-squad/test/settings.test.js
 ```
 
-测试保持二十个顶层用例（T01–T20；T11 完整流程与双验收，T12 测试者容错交接，T13 后台并行派发，T14 角色 worker 能力与 leaderWorker，T15 worker 可用性门禁与自动替代，T16 阶段化并行与 Base 分支合并，T17 分层进度与自动同步，T18 外部阶段非阻塞与延迟记账，T19 同会话多任务隔离与寻址，T20 多任务独立 worktree 与运行时合法子代理名）；实机模式由 qoder 一次派单修改两个临时仓库，各新增一次提交，并输出 `AC7 task=... cwd=... repo=... commit=... repo=... commit=...`。普通单测不能代替该证据。
+测试保持二十个顶层用例（T01–T20；T11 完整流程与双验收，T12 测试者容错交接，T13 后台并行派发，T14 角色 worker 能力与 leaderWorker，T15 worker 可用性门禁与自动替代，T16 阶段化并行与 Base 分支合并，T17 分层进度与自动同步，T18 外部阶段非阻塞与延迟记账，T19 同会话多任务隔离与寻址，T20 多任务独立 worktree 与运行时合法子代理名）；实机模式由 front1 一次派单修改两个临时仓库，各新增一次提交，并输出 `AC7 task=... cwd=... repo=... commit=... repo=... commit=...`。普通单测不能代替该证据。
 
 ## B 模式：外部 provider（一次性）
 
@@ -239,7 +239,7 @@ ASQ_LIVE_QODER=1 node --test --test-name-pattern='^T09 ' dsh-agent-squad/test/se
 - 每次派发前生成 `BRIEF.md`（≤30 行）；外部 agent 只读共享文件，且每次 external 派发都重发身份/角色、上下文纪律、工作区与共享文件路径（外部每次都是首次）。
 - 只有**非返工**新任务给完整任务入口（TASK 目标/验收/约束三节、本轮交办、阶段必读与交付物）；**返工**只给编号缺陷（缺陷ID/受影响 AC/文件:行或章节/最小修复建议/复验命令）及对应失败报告的相关段落，按编号定位，不重读整份任务；acceptance 任务以 AUTHORITY.md 为唯一判据；
 - 外部 agent 的 cwd 为任务工作区：单仓是 worktree，多仓是包含所有 worktree 的 taskRoot；共享记忆位于该 cwd 下的 `.agent-squad/`（沙箱可写）；
-- 已适配 Codex：`provider: codex`，需先安装 `@deepseek-ai/dsh-subagent-codex`（bundle）；
+- 已适配 Codex：`provider: brain`，需先安装 `@deepseek-ai/dsh-subagent-brain`（bundle）；
 - ZCode 需要 `@deepseek-ai/dsh-subagent-acp`（不是 bundle，要单独插入 provider 行）；本 pilot 用直连 ACP 桥测量；
 - **内置 `qoder-cli` 外部 provider**：插件自带适配器，封装已安装的 `qoderclicn`（npm 全局，由宿主 PATH 找到且需已完成登录；可用 `qoderCommand` 指定可执行文件绝对路径）。**headless 审批**：`-p` 一次性运行没有 TTY 应答 CLI 自己的审批提问，未预先放行的动作会被自动拒绝（典型报错 `Error: Allow reading /opt/homebrew/bin/mvn?`、`Allow Bash to run: mvn -v?`）。适配器因此默认追加 `--add-dir`（`/opt/homebrew`、`/usr/local`、`JAVA_HOME`、`/Library/Java/JavaVirtualMachines`、`~/.m2`、`~/.gradle`、`~/.npm`、`~/.pnpm-store`，仅添加实际存在的目录）与 `--allowed-tools`（`Bash(mvn:*)`、`Bash(./mvnw:*)`、`Bash(gradle:*)`、`Bash(./gradlew:*)`、`Bash(java:*)`、`Bash(javac:*)`、`Bash(node:*)`、`Bash(npm:*)`、`Bash(pnpm:*)`、`Bash(npx:*)`、`Bash(git:*)`、`Bash(ls/cat/head/tail:*)`），让构建与测试在无交互环境下可跑；`qoderAddDirs` / `qoderAllowedTools` 可整表覆盖，`qoderPermissionMode` 也可设为 `bypass_permissions` 完全跳过审批（风险自担）。插件不附带二进制本体。每次执行 `qoderclicn -p <prompt> -w <cwd> --permission-mode <mode>`（`qoderModel` 非空时追加 `-m <model>`），stdout 作为一次性结果返回；非 0 退出码按 error 返回 diagnostic，`dispose` 以 SIGTERM（1 秒后升级 SIGKILL）终止子进程。权限模式默认 `accept_edits`（`qoderPermissionMode` 可改写），`qoderModel` 默认空（不传 `-m`）。外部执行**一次性、不可续跑**，也不能 `squad_report`：每次派发都重发身份与纪律，但只有非返工新任务给完整任务入口；返工按编号缺陷与对应报告定位，不重发整套任务。
 
@@ -256,14 +256,14 @@ ASQ_LIVE_QODER=1 node --test --test-name-pattern='^T09 ' dsh-agent-squad/test/se
 
 结论：ZCode 单轮约是 Codex 的 **50 倍**（缓存读占大头），不适合常规 B 流程；Codex 单轮约 2 万 token，可接受。
 
-## 混合模型：Lead DeepSeek + gpt/zcode/qoder 本地固定模型（可续跑）
+## 混合模型：Lead DeepSeek + tester/worker1/front1 本地固定模型（可续跑）
 
 `agents[].model` 写成 `provider/model`（如 `zai-coding-cn/glm-5.3`、`openai/gpt-6.2-sol`）时，该 agent 走**本地固定模型子代理**：
 
 - `ctx.subagents.startActivation({ provider: 'spawn', childId, request: { agentOptions: { provider, model } }, delivery: 'parent' })`；
 - 子代理是可持续跑的本地 child，返工用 `ctx.subagents.sendMessage(childId)` 续跑同一会话；
 - 角色章程通过 childId → 配置映射挂到子会话上；
-- Lead 仍用 DeepSeek；codex 走外部一次性（B 模式），gpt 默认 `openai/gpt-6.2-sol`。
+- Lead 仍用 DeepSeek；brain 走外部一次性（B 模式），tester 默认 `openai/gpt-6.2-sol`。
 
 前提：`llm-pi-ai` 的路由要注册成功。手工声明的 provider **必须写 `api`**（如 `openai-completions`），否则 pi-ai 会跳过整条路由。
 
@@ -275,8 +275,8 @@ ASQ_LIVE_QODER=1 node --test --test-name-pattern='^T09 ' dsh-agent-squad/test/se
 | --- | --- | --- | --- | --- | --- |
 | implement | glm-5.3 | 18,949 | 241 | 148 | 18,560 |
 | rework（同一 child id） | glm-5.3 | 20,105 | 257 | 136 | 19,712 |
-| Codex review（对照，一次性） | codex | 20,880 | — | — | — |
-| ZCode review（对照，一次性） | zcode cli | 1,121,088 | 17,304 | 5,992 | 1,097,792 |
+| Codex review（对照，一次性） | brain | 20,880 | — | — | — |
+| ZCode review（对照，一次性） | worker1 cli | 1,121,088 | 17,304 | 5,992 | 1,097,792 |
 
 返工续跑只增加约 **1.1k tokens**（上下文命中缓存），这就是“同会话返工”的价值。
 
@@ -286,9 +286,9 @@ ASQ_LIVE_QODER=1 node --test --test-name-pattern='^T09 ' dsh-agent-squad/test/se
 
 | 阶段 | 执行者 | 模式 | totalTokens |
 | --- | --- | --- | --- |
-| design | codex | 外部一次性 | 不可观测（直连代理 ~20,880） |
+| design | brain | 外部一次性 | 不可观测（直连代理 ~20,880） |
 | implement | glm-5.3 | 本地子代理 | **28,763**（fresh 1,271 / output 228 / cache 27,264） |
-| review | codex | 外部一次性 | 不可观测（直连代理 ~20,880） |
+| review | brain | 外部一次性 | 不可观测（直连代理 ~20,880） |
 | rework | — | 未触发（一次通过） | — |
 
 整条流水线约 **7 万 tokens**（Codex 按直连代理估算）；同样三轮若走 ZCode，仅单轮就 112 万。
@@ -299,10 +299,10 @@ ASQ_LIVE_QODER=1 node --test --test-name-pattern='^T09 ' dsh-agent-squad/test/se
 
 | 步骤 | 结果 |
 | --- | --- |
-| round-1 codex review | `VERDICT: CHANGES_REQUESTED`（3 测试失败），归档 `REVIEW-R1.md` |
+| round-1 brain review | `VERDICT: CHANGES_REQUESTED`（3 测试失败），归档 `REVIEW-R1.md` |
 | `squad_finish` | 正确拒绝：lastVerdict ≠ APPROVED |
-| 返工 zcode | 同一 child `a4b54075-…`，补 `result.push(end)`，7/7 通过 |
-| round-2 codex review | `VERDICT: APPROVED`，归档 `REVIEW-R2.md` |
+| 返工 worker1 | 同一 child `a4b54075-…`，补 `result.push(end)`，7/7 通过 |
+| round-2 brain review | `VERDICT: APPROVED`，归档 `REVIEW-R2.md` |
 | `squad_finish` | 通过并提交 |
 
 token：GLM implement 26,295 / rework 26,459（cache 主导）；Codex 设计 + 两轮验收约 3×20k；整轮闭环约 **11.5 万**。同样 5 次调用若走 ZCode 约 560 万。
@@ -317,26 +317,26 @@ token：GLM implement 26,295 / rework 26,459（cache 主导）；Codex 设计 + 
 
 ```text
 ~/.dsh/agent-squad/settings.json     # $DSH_HOME 可覆盖
-{ "version": 3, "revision": 3,
+{ "version": 4, "revision": 3,
   "agents": [
-    { "id": "codex", "displayName": "codex", "role": "brain",
+    { "id": "brain", "displayName": "大脑", "role": "brain",
       "executor": "external", "model": "codex", "description": "…" },
-    { "id": "gpt", "displayName": "gpt", "role": "tester",
+    { "id": "tester", "displayName": "测试者", "role": "tester",
       "executor": "local", "model": "openai/gpt-6.2-sol", "description": "…" },
-    { "id": "zcode", "displayName": "zcode", "role": "worker",
+    { "id": "worker1", "displayName": "后端开发者1", "role": "worker",
       "executor": "local", "model": "zai-coding-cn/glm-5.3", "description": "…" },
-    { "id": "qoder", "displayName": "qoder", "role": "worker",
+    { "id": "front1", "displayName": "前端开发者1", "role": "worker",
       "executor": "team", "model": "", "description": "…" },
-    { "id": "opencode", "displayName": "opencode", "role": "worker",
+    { "id": "worker2", "displayName": "后端开发者2", "role": "worker",
       "executor": "local", "model": "dsh-opencode-go/deepseek-v4.1-flash",
       "reasoning": "max", "description": "…" } ],
   "worktree": { "directory": ".agents/worktrees" } }
 ```
 
-- **字段**：五个成员固定 id（codex/gpt/zcode/qoder/opencode，只读），可编辑 `displayName/role/executor/model/reasoning/description`；worktree 只有 `directory`（仓库相对路径，拒绝绝对路径与 `..`）。`reasoning`（思考强度，''/low/high/xhigh/max）仅对固定模型执行者生效（local，或 `provider/model` 形式的外部一次性），派发时作为 `reasoningEffort` 传给子代理；纯外部 provider（codex-cli 等）不显示该控件。`agents[].worker` 与顶层 `leaderWorker` 不在页面暴露（见上）。
+- **字段**：五个成员固定 id（brain/tester/worker1/front1/worker2，只读），可编辑 `displayName/role/executor/model/reasoning/description`；worktree 只有 `directory`（仓库相对路径，拒绝绝对路径与 `..`）。`reasoning`（思考强度，''/low/high/xhigh/max）仅对固定模型执行者生效（local，或 `provider/model` 形式的外部一次性），派发时作为 `reasoningEffort` 传给子代理；纯外部 provider（codex-cli 等）不显示该控件。`agents[].worker` 与顶层 `leaderWorker` 不在页面暴露（见上）。
 - **role 三态**：`brain`（业务+技术设计与双验收）| `tester`（测试验收者）| `worker`（实现与自测）。
 - **executor 三态**：`external`（外部 provider，一次性派发）、`local`（`provider/model` 固定模型本地子代理，可续跑）、`team`（进程内队友，可续跑）。校验：名称唯一、至少一个 brain、local 模型必须在模型目录内、external provider 必须已注册。
-- **迁移**：v1（三成员）自动补 gpt，v2（四成员）自动补 opencode，均升为 v3，用户既有编辑与 revision 全部保留。
+- **迁移**：v1（三成员）自动补 tester，v2（四成员）自动补 worker2；v3→v4 把固定 id 改为 brain/tester/worker1/front1/worker2 并使用新显示名，角色/执行方式/模型/思考强度/worker 能力/描述与 revision 全部保留。
 - **读写**：页面经 Host 的 loopback 同源 HTTP（`GET/PUT /agent-squad/settings`、`GET /agent-squad/models`）读写；非 loopback socket、非本地 Host（如 `127.attacker.example`）或跨源/异协议 Origin 一律 403。保存走 revision 乐观锁：并发写第二笔返回 **409 REVISION_CONFLICT** 并附服务器当前 settings；页面显示冲突横幅并保留草稿，点"改用服务器版本"经确认才替换。恢复出厂默认只写入草稿，保存才落盘。未保存的草稿在切换设置页后保留（工厂级会话），保存期间编辑冻结，无字段错误的服务器故障（IO/模型目录 503）显示整体错误提示。
 - **生效时机**：`squad_start`/`squad_dispatch` 每次都重读设置，保存立即影响下一次派单；运行中的 child 不追溯（local 改绑模型须等其空闲）。
 - **持久化**：原子写（同目录临时文件 + rename）；损坏文件先备份 `settings.json.corrupt-<ts>`，备份成功才恢复默认（出厂默认 = 有效 bundle seed），备份失败返回 IO 错误并保留原文件。首次从 bundle 配置 seed，已有合法文件不会被 bundle 覆盖。
@@ -345,7 +345,7 @@ token：GLM implement 26,295 / rework 26,459（cache 主导）；Codex 设计 + 
 ### 验证步骤
 
 1. 隔离 profile 安装本插件，打开设置 → Agent Squad：页面出现，四张卡片 id 只读，SVG 标签随草稿变化，中英切换正常。
-2. `GET /agent-squad/models`（或在页面下拉）确认 groups 同时含 `deepseek-account` 与 `zai-coding-cn`（gpt 需要 `openai` 组）。
+2. `GET /agent-squad/models`（或在页面下拉）确认 groups 同时含 `deepseek-account` 与 `zai-coding-cn`（tester 需要 `openai` 组）。
 3. 修改名称并保存，重开页面核对 `settings.json`（revision +1）。
 4. 提交重复名称：字段级错误出现且文件不变（服务端二次校验）。
 5. 两个页面同 revision 依次保存：第二笔收到 409，磁盘只含第一笔结果。
@@ -370,23 +370,23 @@ token：GLM implement 26,295 / rework 26,459（cache 主导）；Codex 设计 + 
     qoderPermissionMode: accept_edits  # 传给 --permission-mode 的权限模式（默认 accept_edits）
     qoderModel: ''                 # qoder-cli 模型；默认空 = 不传 -m
     agents:                        # 仅作首次 seed；已有合法 settings.json 不会被覆盖
-      - name: codex
+      - name: brain
         role: brain
-        provider: codex      # 外部 provider（一次性）
-      - name: gpt
+        provider: brain      # 外部 provider（一次性）
+      - name: tester
         role: tester         # 测试验收者
         provider: ''
         model: openai/gpt-6.2-sol    # 本地固定模型（可续跑）
-      - name: zcode
+      - name: worker1
         role: worker
         provider: ''
         model: zai-coding-cn/glm-5.3   # provider/model → 本地固定模型（可续跑）
-      - name: opencode
+      - name: worker2
         role: worker
         provider: ''
         model: dsh-opencode-go/deepseek-v4.1-flash   # 本地固定模型（可续跑）
         reasoning: max
-      - name: qoder
+      - name: front1
         role: worker
         provider: ''         # 空 = team 队友（可续跑）
 ```
@@ -400,13 +400,13 @@ token：GLM implement 26,295 / rework 26,459（cache 主导）；Codex 设计 + 
 - `provider`：DSH subagent provider 名。留空时 `fork → fork`、`fresh → spawn`（进程内 DeepSeek 智能体）。装了 `@deepseek-ai/dsh-subagent-acp` 之类的 provider 后，可把各队友分别指到真实的本地 CLI：
 
 ```yaml
-      - name: zcode
+      - name: worker1
         role: worker
         provider: zcode-bm
         context: fresh
 ```
 
-> 真实 CLI 的 provider 大多需要单独安装并注册（例如 ACP 桥），插件只负责按名字选择 provider，不内置任何厂商二进制。唯一例外是内置的 **qoder-cli 适配器**：适配器本身随插件提供，但 `qoderclicn` 可执行文件仍须自行安装并登录。要启用 qoder 外部执行，在设置页把 qoder 的 `executor` 设为 `external`、`model` 选 `qoder-cli` 并保存（已有合法 settings.json 不会因 bundle 更新被覆盖，升级后须手动改一次并保存）。
+> 真实 CLI 的 provider 大多需要单独安装并注册（例如 ACP 桥），插件只负责按名字选择 provider，不内置任何厂商二进制。唯一例外是内置的 **qoder-cli 适配器**：适配器本身随插件提供，但 `qoderclicn` 可执行文件仍须自行安装并登录。要启用 front1 外部执行，在设置页把 front1 的 `executor` 设为 `external`、`model` 选 `qoder-cli` 并保存（已有合法 settings.json 不会因 bundle 更新被覆盖，升级后须手动改一次并保存）。
 
 ## 共享记忆布局
 
@@ -519,11 +519,11 @@ retain = floor((W - O) * retainRatio)   # 必须 < T
 - **人工**：Lead 用 `squad_compact`，默认当前任务、可指定 `task_id`；先修剪工具输出（有安全维护能力时），退出维护后再 `compactNow`，返回压缩前后用量。示例：
 
 ```text
-squad_compact({ agent: "zcode" })
-squad_compact({ agent: "qoder", task_id: "t-example" })
+squad_compact({ agent: "worker1" })
+squad_compact({ agent: "front1", task_id: "t-example" })
 ```
 
-- `squad_compact` 接受固定成员 id（codex/gpt/zcode/qoder/opencode），拒绝 `lead`、任意 session id 与额外键；目标 external 返回 `external：一次性执行者不可人工压缩`；有记录但无 live Agent 返回 `cold：会话未驻留，不能人工压缩`（不唤醒）；运行中返回 `busy：队友运行中，稍后再试`；缺 `compaction.compactNow` 返回 `不可用：缺少 compaction.compactNow`。整个操作共享 180 秒取消预算，不自动重试。
+- `squad_compact` 接受固定成员 id（brain/tester/worker1/front1/worker2），拒绝 `lead`、任意 session id 与额外键；目标 external 返回 `external：一次性执行者不可人工压缩`；有记录但无 live Agent 返回 `cold：会话未驻留，不能人工压缩`（不唤醒）；运行中返回 `busy：队友运行中，稍后再试`；缺 `compaction.compactNow` 返回 `不可用：缺少 compaction.compactNow`。整个操作共享 180 秒取消预算，不自动重试。
 - 成功回执含 `压缩前 <context行>`、`压缩后 <context行>`、`shadowedTokens=… shadowedSeqs=[…]`；`shadowedSeqs` 是被遮盖的**原序号**，不是节约的 tokens。超过 16 个时只列前 16 个并以 `…（共N个）` 结尾。
 - `/compact`（`dsh-command-compact`）保持原样：只压缩命令所属会话（即 Lead 自己），没有队友参数；要压队友用 `squad_compact`。
 
@@ -558,7 +558,7 @@ context: model=qoder/qmodel_latest window=200000 used=172000 ratio=86.0% thresho
 | --- | --- | --- |
 | `squad_enable` | 任意会话根（未启用时） | 显式启用小队：仅当用户明确要求"用小队"时调用；仅提到队友名字不算启用。启用后本会话成为 Squad Lead |
 | `squad_start` | Lead | 可选 `repos: string[]`（默认当前仓库，首项为主仓）、`flow: "full"\|"simple"`（研发模式流程，默认 full；无 tester 参与者自动降级为简化规则并警告）、`mode: "dev"\|"acceptance"`（默认 dev 研发模式）与 `authority`（验收模式必填：权威方案路径或全文，固化为 AUTHORITY.md）；建 worktree 集合、写 TASK/JOURNAL/STATE 和门禁快照，最后发布 current |
-| `squad_dispatch` | Lead | 首次创建 / 之后续跑指定队友，推进 phase（研发模式 design/spec/implement/test-review/tech-review/review/rework；验收模式 acceptance/rework）与 round；design 受设计预算与已批准限制，spec 限 brain，implement/rework 受 PLAN 批准与规格交付门禁且 external 执行者默认后台派发（background: false 恢复阻塞），test-review 限 tester（挂起时 brain 代行），tech-review 默认 brain 且要求新鲜的 APPROVED 测试验收、禁止自签，review（完整流程）要求技术验收新鲜通过；验收模式 acceptance 强制 gpt（技术维度）→ codex（业务维度）顺序并定稿 ACCEPTANCE-REPORT.md，rework 需要新鲜的 CHANGES_REQUESTED 验收结论；到预算上限时暂停并提示先问用户 |
+| `squad_dispatch` | Lead | 首次创建 / 之后续跑指定队友，推进 phase（研发模式 design/spec/implement/test-review/tech-review/review/rework；验收模式 acceptance/rework）与 round；design 受设计预算与已批准限制，spec 限 brain，implement/rework 受 PLAN 批准与规格交付门禁且 external 执行者默认后台派发（background: false 恢复阻塞），test-review 限 tester（挂起时 brain 代行），tech-review 默认 brain 且要求新鲜的 APPROVED 测试验收、禁止自签，review（完整流程）要求技术验收新鲜通过；验收模式 acceptance 强制 tester（技术维度）→ brain（业务维度）顺序并定稿 ACCEPTANCE-REPORT.md，rework 需要新鲜的 CHANGES_REQUESTED 验收结论；到预算上限时暂停并提示先问用户 |
 | `squad_approve_plan` | Lead（仅 Lead 可见） | 审核通过 PLAN.md：补归档当前轮次 `PLAN-R<n>.md`，写 `PLAN-APPROVED.md` 与 `planApproved`/`planApprovedAt`；缺 PLAN、已收尾或已批准时拒绝 |
 | `squad_extend` | Lead（仅 Lead 可见） | 用户决策门禁：仅当对应预算（完整流程 `kind` = design/tech/business；简化/兼容 `kind` = design/implement）已到上限且用户明确同意后调用（`confirmed=true` 必填，`rounds` 正整数默认 3，`reason` 必填），提高该类上限并追加一条扩展记录；未到上限、未确认或非 Lead 一律拒绝；可重复扩展，不自动续跑 |
 | `squad_status` | Lead | 任务、阶段/轮次、流程（flow/specPublished/specVersion/codeEpoch/implementers）、双验收绑定与结论、全部仓库/worktree/分支/基线、PLAN 门禁、各类预算与最近 6 条扩展记录、成员状态、记忆文件、最近派单 |
@@ -580,11 +580,11 @@ plugin_manager install_bundle  <本目录绝对路径>
 plugin_manager remove_bundle   dsh-agent-squad
 ```
 
-DSH 0.2.x 已把 Agent Teams 并入标准 subagent 运行时，本插件的 patch 不再挂载已移除的 `@deepseek-ai/dsh-experimental-agent-team`；改为挂载 `@deepseek-ai/dsh-subagent-codex` 提供 codex 外部执行者。
+DSH 0.2.x 已把 Agent Teams 并入标准 subagent 运行时，本插件的 patch 不再挂载已移除的 `@deepseek-ai/dsh-experimental-agent-team`；改为挂载 `@deepseek-ai/dsh-subagent-brain` 提供 brain 外部执行者。
 
 ### zcode-bm：BigModel ACP 桥（随 bundle 挂载）
 
-本 bundle 的 patch 同时挂载 `@deepseek-ai/dsh-subagent-acp`（provider 名 `zcode-bm`），通过本地 `zcode-acp-server` 桥以 ACP/stdio 驱动 ZCode CLI（BigModel 个人编码套餐，GLM-5.3），并注册 `subagent_zcode_bm` 工具行与 collab 技能约定对齐。把 zcode 的 executor 设为 `external`、model 选 `zcode-bm` 即走此通道；该包须作为 profile 直接依赖安装（`link:` bundle 的自身依赖不会进 profile 的 node_modules）：
+本 bundle 的 patch 同时挂载 `@deepseek-ai/dsh-subagent-acp`（provider 名 `zcode-bm`），通过本地 `worker1-acp-server` 桥以 ACP/stdio 驱动 ZCode CLI（BigModel 个人编码套餐，GLM-5.3），并注册 `subagent_zcode_bm` 工具行与 collab 技能约定对齐。把 worker1 的 executor 设为 `external`、model 选 `zcode-bm` 即走此通道；该包须作为 profile 直接依赖安装（`link:` bundle 的自身依赖不会进 profile 的 node_modules）：
 
 ```sh
 cd ~/.dsh/profiles/<profile> && pnpm add @deepseek-ai/dsh-subagent-acp@<运行时版本>
@@ -594,7 +594,7 @@ cd ~/.dsh/profiles/<profile> && pnpm add @deepseek-ai/dsh-subagent-acp@<运行�
 
 ## 升级与重载
 
-本插件挂载的 Team 运行时与工具都归属于插件上下文。修改 `index.js` 后，用插件管理器禁用再启用 `agent-squad` 即可干净重载（工具全局注册、按 `when` 对 agent 可见；章程分区由插件上下文持有并随重载销毁）。重载会清空"已启用小队"的会话集合：正在带任务的会话需要再调一次 `squad_enable` 恢复 Lead 身份（任务数据不受影响）。内置的 qoder-cli provider 也随插件上下文注册/注销：重载后它出现在 `GET /agent-squad/models` 的 `externalProviders`（id `qoder-cli`）。实机验证：在设置页把 qoder 的 `executor` 设为 `external`、`model` 选 `qoder-cli` 并保存（前提是宿主 PATH 上已安装并登录 `qoderclicn`），随后给 qoder 派一个小任务，确认派单结果带 `provider=qoder-cli` 且产物落盘。如果旧版本曾在会话里留下作用域注册，升级后需要重启一次 DSH 清除。从三成员旧版本升级时，settings.json 读取时自动迁移为 v2（插入 gpt 行），既有编辑保留。
+本插件挂载的 Team 运行时与工具都归属于插件上下文。修改 `index.js` 后，用插件管理器禁用再启用 `agent-squad` 即可干净重载（工具全局注册、按 `when` 对 agent 可见；章程分区由插件上下文持有并随重载销毁）。重载会清空"已启用小队"的会话集合：正在带任务的会话需要再调一次 `squad_enable` 恢复 Lead 身份（任务数据不受影响）。内置的 qoder-cli provider 也随插件上下文注册/注销：重载后它出现在 `GET /agent-squad/models` 的 `externalProviders`（id `qoder-cli`）。实机验证：在设置页把 front1 的 `executor` 设为 `external`、`model` 选 `qoder-cli` 并保存（前提是宿主 PATH 上已安装并登录 `qoderclicn`），随后给 front1 派一个小任务，确认派单结果带 `provider=qoder-cli` 且产物落盘。如果旧版本曾在会话里留下作用域注册，升级后需要重启一次 DSH 清除。从三成员旧版本升级时，settings.json 读取时自动迁移为 v2（插入 tester 行），既有编辑保留。
 
 ## 验证记录（2026-11-09，端到端）
 
@@ -602,11 +602,11 @@ cd ~/.dsh/profiles/<profile> && pnpm add @deepseek-ai/dsh-subagent-acp@<运行�
 
 | 阶段 | 执行者 | 结果 |
 | --- | --- | --- |
-| 设计 | codex（brain） | `PLAN.md` 283 行：接口契约、D1–D19 决策表、22 个测试、AC1–AC7 可执行命令 |
-| 实现 | zcode（worker） | 仅新增 `.squad-verify/` 两个文件；`node --test` → **22 pass / 0 fail** |
-| 验收 | codex（brain，续跑同一会话） | `REVIEW.md` 187 行，AC1–AC7 逐条 PASS，裁定 2 处 PLAN 算术错误并修订，**approved** |
+| 设计 | brain | `PLAN.md` 283 行：接口契约、D1–D19 决策表、22 个测试、AC1–AC7 可执行命令 |
+| 实现 | worker1（worker） | 仅新增 `.squad-verify/` 两个文件；`node --test` → **22 pass / 0 fail** |
+| 验收 | brain（brain，续跑同一会话） | `REVIEW.md` 187 行，AC1–AC7 逐条 PASS，裁定 2 处 PLAN 算术错误并修订，**approved** |
 
-- **会话复用证据**：codex 设计时 `session=23ed8a18-…`，验收时同一 `session=23ed8a18-…`（`mode=resumed`）。
+- **会话复用证据**：brain 设计时 `session=23ed8a18-…`，验收时同一 `session=23ed8a18-…`（`mode=resumed`）。
 - **返工路径**：本轮一次通过未触发 rework；rework 与 review 走同一条 `sendMessage` 分支（同一会话续跑）。
 - **共享记忆**：`.agent-squad/t-mw8pxuue-o8my/{TASK,PLAN,REVIEW,REPORT,JOURNAL}.md`，跨 agent 传递方案/证据/结论。
 - 验证产物 `.squad-verify/` 是一次性夹具，可随时 `rm -rf .squad-verify` 删除，不属于插件。
@@ -614,7 +614,7 @@ cd ~/.dsh/profiles/<profile> && pnpm add @deepseek-ai/dsh-subagent-acp@<运行�
 ### worktree 验证（2026-11-09）
 
 - `squad_start` 自动创建分支 `squad-t-mw8u3ayq-mvut` 与 checkout `.agents/worktrees/…`，并把会话目录切过去；
-- zcode 在该 worktree 内完成改动（报告附 `pwd` 证据），源 checkout 没有该文件、状态与基线一致；
+- worker1 在该 worktree 内完成改动（报告附 `pwd` 证据），源 checkout 没有该文件、状态与基线一致；
 - `squad_finish` 自动提交 `e648ac3`、打印 `1 file changed` 与合并命令、把会话切回源目录；
 - 验证后已删除测试 worktree 与分支，源仓库只保留原有未提交改动。
 
