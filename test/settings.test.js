@@ -2012,6 +2012,9 @@ test('T07 plan gate: lead review, design budget, squad_approve_plan, archives an
     assert.ok(readme.includes('临时辅助队员纪律'), 'README aux discipline missing')
     assert.ok(readme.includes('ask_user_question'), 'README aux approval missing')
     assert.ok(readme.includes('executor: "team"'), 'README aux team preference missing')
+    assert.ok(readme.includes('任务执行效率纪律'), 'README execution discipline missing')
+    assert.ok(readme.includes('受影响单测'), 'README scoped tests missing')
+    assert.ok(readme.includes('--require-full-coverage'), 'README full-coverage gate missing')
     assert.match(readme, /第 4 轮/)
     assert.ok(!/6 轮返工|第 7 次/.test(readme))
     // --- PLAN §6: verbatim S/E/M and charter items in the changed sections ---
@@ -2050,6 +2053,9 @@ test('T07 plan gate: lead review, design budget, squad_approve_plan, archives an
     assert.ok(leadSeg.includes('临时辅助队员纪律'), 'LEAD aux discipline missing')
     assert.ok(leadSeg.includes('ask_user_question'), 'LEAD aux approval tool missing')
     assert.ok(leadSeg.includes('executor="team"'), 'LEAD aux team preference missing')
+    assert.ok(leadSeg.includes('执行效率纪律'), 'LEAD execution discipline missing')
+    assert.ok(indexSource.includes('编码轮只跑 compile'), 'LEAD compile/test scoping missing')
+    assert.ok(leadSeg.includes('squad_deliver'), 'LEAD full-suite gate missing')
     assert.ok(
       leadSeg.includes('5. 派 brain，phase="spec"：读取 PLAN-APPROVED.md，发布技术规格 SPEC.md'),
       'LEAD step 5 sentence missing',
@@ -8772,6 +8778,8 @@ test('T26 context discipline', async () => {
     assertSEM(systemSection)
     assert.ok(systemSection.includes('临时辅助队员'), 'teammate aux discipline missing')
     assert.ok(systemSection.includes('blocked'), 'teammate aux blocked path missing')
+    assert.ok(systemSection.includes('执行效率纪律'), 'teammate execution discipline missing')
+    assert.ok(systemSection.includes('受影响单测'), 'teammate scoped tests missing')
     await tool('squad_dispatch').execute({ agent: 'front1', message: 'impl again team', phase: 'implement' }, exec)
     const teamResume = sentText()
     assert.ok(teamResume.includes('按 BRIEF 的上下文纪律'))

@@ -75,7 +75,7 @@ const MAX_TECH_REWORK_ROUNDS = 3
 const MAX_BUSINESS_REWORK_ROUNDS = 3
 
 /** Liveness marker surfaced by squad_status; changes whenever behavior changes. */
-const PLUGIN_MARKER = 'agent-squad/zh-v12'
+const PLUGIN_MARKER = 'agent-squad/zh-v13'
 
 /** Defaults for the opt-in context policy (S1); `false` keeps the legacy path. */
 const CONTEXT_POLICY_DEFAULTS = Object.freeze({
@@ -96,6 +96,14 @@ const CONTEXT_POLICY_KEYS = new Set([
 /** Verbatim context discipline shared by prompts and every BRIEF version (S8). */
 const CONTEXT_DISCIPLINE =
   '先 grep 定位，再 read 指定行段；不 cat 大文件。测试/构建输出重定向到文件，只读摘要；长日志不回贴。只回复 ≤150 字摘要 + 文件路径；返工只改编号缺陷。'
+
+/** Task-execution discipline: test scoping, batching, JAR reuse and parallelism. */
+const EXECUTION_DISCIPLINE =
+  '编码轮只跑 compile + 受影响单测；每轮 implement/rework 结束只跑一次受影响 IT，不跑全量；全量只在测试验收、合并 Base（squad_deliver）与最终交付（squad_finish）三处跑。返工按批次一次修完再跑全量，禁止修一条跑一次全量；同一 IT 类的正向场景复用同一 JAR 生命周期/Flow，反例再独立启动，保留真实入口、不降低断言。独立包的单测/IT 可并行写，共享 schema/主题/JAR 的测试仍串行，避免资源冲突。worker 只读 REPORT 对应段 + SPEC 相关章节，不通读大文件；派单短、带文件路径/编号。仅 Base 合并 HEAD 跑一次 full --require-full-coverage。'
+
+/** Short form for per-dispatch/BRIEF repetition. */
+const EXECUTION_DISCIPLINE_SHORT =
+  '编码轮 compile+受影响单测；轮末一次受影响 IT；全量只在测试验收/合并 Base/最终交付；返工批量修完再全量；共享 schema/主题/JAR 的测试串行。'
 
 /** Verbatim rework scope line (S7); rework never re-reads passed work. */
 const REWORK_SCOPE =
@@ -255,6 +263,7 @@ const LEAD_POLICY = `Agent Squad 已启用：你是 Lead，小队里有按角色
 - 三种批准相互独立：squad_approve_plan 批准的是「业务方案」，TECH-REVIEW.md 的 VERDICT: APPROVED 批准的是「技术」，REVIEW.md 的 VERDICT: APPROVED 批准的是「业务」；任何一个不能替代另一个。代码、规格或方案变动后旧结论失效，不能用旧批准收尾。
 - worker 选人与替补：后端任务优先派 worker1（主力后端）；worker1 不可用（挂起/额度类错误）时插件自动改派、或由你手动改派备份 worker2（DeepSeek V4.1 Flash，max 思考强度，可续跑）。front1 固定前端（页面交互设计、实现与自测），不承接后端任务。${MAX_TECH_REWORK_ROUNDS} 轮技术返工仍未通过时先问用户是否继续，获准继续后可派 tester 接手实现（须先显式开启其 worker 能力），不需要再次确认选人。tester 接手写代码后，技术验收仍由 brain（未写代码时）签署；若 brain 也写过代码，两份验收按代签规则交叉签署，实现者不签自己的验收。
 - 一个角色一个 agent。worker 固定为三名：worker1（主力后端）、worker2（备份后端）、front1（固定前端）；tester 是测试验收者（tester），不默认写实现代码。
+- 执行效率纪律：${EXECUTION_DISCIPLINE}
 - 临时辅助队员纪律：任务进行中禁止自行添加计划外临时辅助队员 aux（包括用内置 subagent/subagent_* 创建计划外子代理、fork/spawn 临时成员，或让普通子代理承担小队成员职责/验收）。确实需要额外人手时，必须先用 ask_user_question 向用户说明原因、人数与工作范围并取得明确同意；获准后应优先使用已配置的 team 模式成员（executor="team"）；确需新增成员时也必须把新成员配置为 team 模式，不得以一次性 aux 绕过小队编制。未获同意不得添加。
 - 每次派单后结束当前回合，等队友的 squad_report 唤醒你；查看状态用 squad_status，只有必须在本回合阻塞时才用 squad_wait。
 - 信息同步：插件在每个派单、squad_approve_plan、squad_parallel_start、squad_deliver、squad_finish 以及收到 squad_report 时自动刷新 PROGRESS.md；squad_status 顶部即分层进度（任务总览→阶段进度→队员进度→并行特性）。每个阶段完成、收到关键报告、交付与收尾时，用最新分层进度向用户简报一次（不要只报"进行中"）。
@@ -962,7 +971,8 @@ function teammatePrompt(agent, config) {
     config.contextPolicy === false
       ? '共享记忆：每次派单都会给出共享目录。先读 TASK.md；PLAN.md、SPEC.md、TECH-REVIEW.md、REVIEW.md、REPORT.md、JOURNAL.md 分别承载业务方案、技术规格、技术验收、业务验收、交付证据与历史。保持这些文件最新，队友才能不靠复述对话协作。'
       : `共享记忆：每次派单都会给出共享目录。TASK.md、PLAN.md、SPEC.md、TECH-REVIEW.md、REVIEW.md、REPORT.md、JOURNAL.md 分别承载任务、业务方案、技术规格、技术验收、业务验收、交付证据与历史。保持这些文件最新，队友才能不靠复述对话协作。
-上下文纪律：${CONTEXT_DISCIPLINE}`
+上下文纪律：${CONTEXT_DISCIPLINE}
+执行效率纪律：${EXECUTION_DISCIPLINE}`
   return `你是 "${agent.name}"，DSH Agent Squad 里的 ${agent.role} 角色。Team Lead 的代号是 "lead"。
 
 ${charterFor(agent, config)}
@@ -1333,8 +1343,8 @@ function renderDispatch({
     ? `本轮范围：${strategy.scopeLine}\n必读：${strategy.reads.join('；')}`
     : readHint
   const discipline = includeCharter
-    ? `上下文纪律：${CONTEXT_DISCIPLINE}`
-    : '上下文纪律：按 BRIEF 的上下文纪律。'
+    ? `上下文纪律：${CONTEXT_DISCIPLINE}\n执行效率纪律：${EXECUTION_DISCIPLINE_SHORT}`
+    : '上下文纪律：按 BRIEF 的上下文纪律。\n执行效率纪律：按 BRIEF 的执行效率纪律。'
   const parallelHint =
     phase === 'implement' || phase === 'rework'
       ? '并行默认：本轮交办包含多个独立文件/模块时，用你的子代理/并行能力同时开发；不独立的部分串行完成；只改规格内文件，逐条 AC 留证。'
@@ -1448,6 +1458,7 @@ async function writeBrief({ taskDir, state, agent, phase, round, strategy = null
           '## 交付',
           `- ${strategy.deliveryHint}`,
           `- 上下文纪律：${CONTEXT_DISCIPLINE}`,
+          `- 执行效率纪律：${EXECUTION_DISCIPLINE_SHORT}`,
           '- 只回复 ≤150 字摘要 + 文件路径，不回贴正文',
         ]
       : [
@@ -1471,6 +1482,7 @@ async function writeBrief({ taskDir, state, agent, phase, round, strategy = null
           '## 交付',
           `- ${strategy.deliveryHint}`,
           `- 上下文纪律：${CONTEXT_DISCIPLINE}`,
+          `- 执行效率纪律：${EXECUTION_DISCIPLINE_SHORT}`,
           '- 只回复 ≤150 字摘要 + 文件路径，不回贴正文',
         ]
     : legacyLines
@@ -1510,8 +1522,8 @@ function dispatchPrompt({
     ? `本轮范围：${strategy.scopeLine}\n必读：${strategy.reads.join('；')}`
     : '先读 BRIEF.md 与 TASK.md；设计轮读取 PLAN.md（存在时），spec 轮读取 PLAN-APPROVED.md 与既有 SPEC.md，实现、返工与验收读取 PLAN-APPROVED.md + SPEC.md；按需读取 TECH-REVIEW.md / REVIEW.md / REPORT.md。'
   const discipline = includeCharter
-    ? `上下文纪律：${CONTEXT_DISCIPLINE}`
-    : '上下文纪律：按 BRIEF 的上下文纪律。'
+    ? `上下文纪律：${CONTEXT_DISCIPLINE}\n执行效率纪律：${EXECUTION_DISCIPLINE_SHORT}`
+    : '上下文纪律：按 BRIEF 的上下文纪律。\n执行效率纪律：按 BRIEF 的执行效率纪律。'
   const actingNote =
     (phase === 'tech-review' && agent.role === 'tester') || (phase === 'test-review' && agent.role === 'brain')
       ? '\n注：本阶段由你代行/代签，按上述规格交付。\n'
@@ -2053,7 +2065,7 @@ function createTools(ctx, config, runtime, store) {
   const start = defineTool({
     name: 'squad_start',
     description:
-      '创建 Agent Squad 任务：建立共享记忆目录（.agent-squad/<task>/ 下的 TASK.md、JOURNAL.md）并设为当前任务。每个任务先调用一次。任务中禁止自行增编临时辅助队员 aux；确需额外人手，先取得用户明确同意并优先使用 team 模式成员。',
+      '创建 Agent Squad 任务：建立共享记忆目录（.agent-squad/<task>/ 下的 TASK.md、JOURNAL.md）并设为当前任务。每个任务先调用一次。任务中禁止自行增编临时辅助队员 aux；确需额外人手，先取得用户明确同意并优先使用 team 模式成员。执行测试遵循执行效率纪律：编码轮 compile+受影响单测，轮末一次受影响 IT，全量只在测试验收/合并 Base/最终交付。',
     parameters: {
       type: 'object',
       additionalProperties: false,
@@ -5410,6 +5422,7 @@ ${String(args.summary).trim()}
           'Agent Squad 已为当前会话启用：你是 Squad Lead。',
           '小队角色：brain（大脑）业务方案 + 技术规格（SPEC.md）+ 技术/业务双验收；tester（测试者）测试验收者（依据 brain 的规格与验收方案审核 worker 测试用例，不合格则补充测试用例并完整测试）；worker1（后端开发者1）主力后端实现与自测；worker2（后端开发者2）备份后端；front1（前端开发者1）固定前端（页面交互设计、实现与自测）。',
           '纪律：任务中禁止自行添加临时辅助队员 aux；确需额外人手，先取得用户明确同意，并优先使用 team 模式成员。',
+          '执行效率纪律：编码轮只跑 compile + 受影响单测；轮末只跑一次受影响 IT；全量只在测试验收/合并 Base/最终交付；返工批量修完再全量；共享 schema/主题/JAR 的测试串行。',
           '研发模式（默认）：squad_start → brain design（业务方案）→ Lead 审核后 squad_approve_plan → brain spec（技术规格）→ worker implement → tester test-review（测试验收）→ brain tech-review（技术验收）→ brain review（业务验收）→ squad_finish。非代码任务可在 squad_start 时传 flow="simple"。',
           '验收模式：squad_start 传 mode="acceptance" 与 authority（权威方案）→ tester acceptance（技术维度）→ brain acceptance（业务维度，定稿 ACCEPTANCE-REPORT.md：验收方案与标准/上一轮修复情况/本轮问题/修复建议/结论）→ CHANGES_REQUESTED 则 worker rework 修复后重走双验收 → APPROVED 后 squad_finish。',
           '用户没有明确要求时不要启用小队；提到队友名字也不算启用。',
