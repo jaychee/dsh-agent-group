@@ -2009,6 +2009,9 @@ test('T07 plan gate: lead review, design budget, squad_approve_plan, archives an
     assert.match(clientSource, /asq-\$\{agent\.id\}-reasoning/)
     assert.match(clientSource, /update\(\{ reasoning: event\.target\.value \}\)/)
     assert.match(readme, /先审方案再实现|Lead 审核 PLAN/)
+    assert.ok(readme.includes('临时辅助队员纪律'), 'README aux discipline missing')
+    assert.ok(readme.includes('ask_user_question'), 'README aux approval missing')
+    assert.ok(readme.includes('executor: "team"'), 'README aux team preference missing')
     assert.match(readme, /第 4 轮/)
     assert.ok(!/6 轮返工|第 7 次/.test(readme))
     // --- PLAN §6: verbatim S/E/M and charter items in the changed sections ---
@@ -2043,6 +2046,10 @@ test('T07 plan gate: lead review, design budget, squad_approve_plan, archives an
       leadSeg.includes('4. 方案合格后调用 squad_approve_plan 批准（归档 PLAN-APPROVED.md）。'),
       'LEAD step 4 sentence missing',
     )
+    // 临时辅助队员纪律：禁止自行增编 aux；确需时先征得用户同意并优先 team 模式。
+    assert.ok(leadSeg.includes('临时辅助队员纪律'), 'LEAD aux discipline missing')
+    assert.ok(leadSeg.includes('ask_user_question'), 'LEAD aux approval tool missing')
+    assert.ok(leadSeg.includes('executor="team"'), 'LEAD aux team preference missing')
     assert.ok(
       leadSeg.includes('5. 派 brain，phase="spec"：读取 PLAN-APPROVED.md，发布技术规格 SPEC.md'),
       'LEAD step 5 sentence missing',
@@ -8763,6 +8770,8 @@ test('T26 context discipline', async () => {
     const systemSection = host.sections.find((section) => section.includes(CONTEXT_DISCIPLINE_TEXT))
     assert.ok(systemSection, 'teammate system prompt carries the discipline text')
     assertSEM(systemSection)
+    assert.ok(systemSection.includes('临时辅助队员'), 'teammate aux discipline missing')
+    assert.ok(systemSection.includes('blocked'), 'teammate aux blocked path missing')
     await tool('squad_dispatch').execute({ agent: 'front1', message: 'impl again team', phase: 'implement' }, exec)
     const teamResume = sentText()
     assert.ok(teamResume.includes('按 BRIEF 的上下文纪律'))
