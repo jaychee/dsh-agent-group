@@ -1,16 +1,16 @@
 # dsh-agent-squad
 
-给 DeepSeek Harness 加一个**按角色分工、显式启用（opt-in）的本地多智能体小队**：Lead 负责组织与分配，brain 负责业务方案与业务验收，architect 负责技术规格与技术验收，worker 负责实现与自测；返工复用同一个队友会话，而不是每次新建对话。
+给 DeepSeek Harness 加一个**按角色分工、显式启用（opt-in）的本地多智能体小队**：Lead 负责组织与分配，brain 负责业务方案、技术规格与双验收，tester 负责测试验收，worker 负责实现与自测；返工复用同一个队友会话，而不是每次新建对话。
 
 **默认不启用**：普通会话就是普通会话，看不到任何 squad 工具或章程。只有用户明确说"用小队实现 / 用智能体小队"时，Lead 才调用 `squad_enable` 进入小队；**仅提到队友名字（codex/gpt/zcode/qoder）不算启用**。插件重载后若会话失去 Lead 身份，再次 `squad_enable` 即可恢复。
 
 ```text
 用户 ──▶ Lead (DSH 当前会话)
              ├─ codex  [brain]      业务方案 / 验收标准 / 业务验收
-             ├─ gpt    [architect]  技术规格 / 技术验收 / 必要时接手实现
-             ├─ zcode  [worker]     后端开发 / 后端自测
-             ├─ opencode[worker]    后端开发 / 后端自测（DeepSeek V4.1 Flash, max）
-             └─ qoder  [worker]     前端产品开发 / 前端自测
+             ├─ gpt    [tester]     测试验收：审核/补充测试用例并完整测试
+             ├─ zcode  [worker]     主力后端：后端开发 / 后端自测（优先派发）
+             ├─ opencode[worker]    备份后端：zcode 不可用时接手（DeepSeek V4.1 Flash, max）
+             └─ qoder  [worker]     固定前端：页面交互设计 / 实现 / 自测
 ```
 
 插件本身很薄：它挂在 DSH 0.2.x 内置的标准 **subagent 运行时**（`ctx.subagents`：`startActivation`/`sendMessage`/`listDescendants`/`rootOf`）上，补上 DSH 缺的几件事：
@@ -24,42 +24,59 @@
 | 角色 | 谁 | 职责 | 工具 |
 | --- | --- | --- | --- |
 | `lead` | 当前 DSH 会话（启用后） | 拆解流程、审核并批准业务方案、决定派单顺序、汇总交付；不写业务代码 | `squad_enable` / `squad_start` / `squad_dispatch` / `squad_approve_plan` / `squad_extend` / `squad_status` / `squad_wait` / `squad_finish` |
-| `brain` | codex | 业务方案（PLAN.md）与业务验收（REVIEW.md）；可澄清方案，改业务行为必须先请用户决策 | `squad_report` |
-| `architect` | gpt（本地固定模型 `openai/gpt-6.2-sol`） | 技术规格（SPEC.md）与技术验收（TECH-REVIEW.md）；worker 不可用或技术返工到限时接手实现，但不能自签自己改动的技术验收 | `squad_report` |
-| `worker` | zcode / qoder / opencode | zcode 与 opencode 后端实现自测（opencode = OpenCode Go 的 DeepSeek V4.1 Flash，max 思考强度，本地可续跑）；qoder **主责前端产品开发与自测，兼做后端代码开发** | `squad_report` |
+| `brain` | codex | 业务方案（PLAN.md）、技术规格（SPEC.md）、技术验收（TECH-REVIEW.md）与业务验收（REVIEW.md）；可澄清方案，改业务行为必须先请用户决策 | `squad_report` |
+| `tester` | gpt（本地固定模型 `openai/gpt-6.2-sol`） | 测试验收（TEST-REVIEW.md）：依据 brain 的技术实现规格与验收方案审核 worker 的测试用例，不合格时补充测试用例并完整测试；brain 本人实现过代码时代签技术验收 | `squad_report` |
+| `worker` | zcode / qoder / opencode | **worker 固定为这三名**。zcode 主力后端（后端任务优先派发，实现后端代码并自测，自测通过后才交付）；opencode 备份后端（zcode 不可用时接手；OpenCode Go 的 DeepSeek V4.1 Flash，max 思考强度，本地可续跑）；qoder 固定前端（页面交互设计、实现与自测，不做后端）。三者都依据 PLAN-APPROVED.md 验收方案 + SPEC.md 技术实现规格开发、编写测试用例并自测，自测通过后才交付 | `squad_report` |
 
-任何角色（含 brain、architect 与 Lead）都可以通过设置里的 **worker 能力开关**以 worker 身份并行实现代码：`agents[].worker`（brain 默认关、architect/worker 默认开）与顶层 `leaderWorker`（Lead 默认关）。开启后该角色可接 implement/rework 派单；实现过代码的角色不能签署自己实现的技术验收。
+任何角色（含 brain、tester 与 Lead）都保留 `agents[].worker` 与顶层 `leaderWorker`（Lead 默认关）两个运行时开关：开启后该角色可接 implement/rework 派单，实现过代码的角色不能签署自己实现的技术验收。**默认只有 zcode / opencode / qoder 三名 worker 开启**（brain 与 tester 默认关，须用户同意并显式开启后才能接手实现）。**设置页不再暴露这两个开关**（worker 能力属高级配置，直接编辑 `$DSH_HOME/agent-squad/settings.json` 或经 `PUT /agent-squad/settings` 修改，保存其它字段不会改动已有值）。
 
-角色章程可以在插件配置里整段替换（`brainCharter` / `architectCharter` / `workerCharter`），单个 agent 也可以用 `charter` 覆盖。默认章程为中文；Lead 策略额外要求**面向用户始终使用用户的语言**，章程语言不影响回复语言。
+角色章程可以在插件配置里整段替换（`brainCharter` / `testerCharter` / `workerCharter`），单个 agent 也可以用 `charter` 覆盖。默认章程为中文；Lead 策略额外要求**面向用户始终使用用户的语言**，章程语言不影响回复语言。
 
 ### brain 章程（要点）
 
 - 把业务目标写成可执行业务方案，存入 PLAN.md：对外行为、用户可见结果、边界场景与编号验收标准（AC）。
 - 涉及对外接口时逐项写明接口契约与错误行为；没有接口变更时明确写“无接口变更”，并列出须保留的对外行为。
 - 列出边界输入与精确期望值；每条 AC 必须给出可直接执行的验收命令、执行目录、退出码与通过条件。
-- 在“假设与待确认”中显式列出假设及影响；未确定且影响交付的事项标为待确认，不能让架构师或 worker 猜测。禁止使用“适当”“合理”“类似”“等等”“参考现有实现”替代具体规格。
+- 在“假设与待确认”中显式列出假设及影响；未确定且影响交付的事项标为待确认，不能让测试验收者或 worker 猜测。禁止使用“适当”“合理”“类似”“等等”“参考现有实现”替代具体规格。
 - 你可以澄清方案；但要改变原有业务功能、对外结果或验收标准，必须先请用户决策，不得擅自变更。
-- 写完后自检“一个没有上下文的架构师能否只靠 PLAN 拍板技术设计”，把结论写入 PLAN.md；不能时补全方案，或列入“假设与待确认”并标明阻塞项，不得宣称方案可执行。
-- 业务验收轮以 PLAN-APPROVED.md 为唯一权威业务规格，逐条核对 AC 并在 REVIEW.md 写明 AC 编号、验证命令、退出码、关键输出与结论；亲自运行或检查，不接受没有证据的声明。技术结论对照 SPEC.md 与 TECH-REVIEW.md，不替技术验收背书。
-- 当架构师接手实现时，由你对照 SPEC.md 亲自运行验证测试并代签技术验收：在 TECH-REVIEW.md 记录命令、退出码、关键输出与编号缺陷，最后一行同样是「VERDICT: APPROVED」或「VERDICT: CHANGES_REQUESTED」；之后再按业务方案单独签署业务验收，两份验收独立记录。
+- 写完后自检“一个没有上下文的实现者能否只靠 PLAN 拍板技术设计”，把结论写入 PLAN.md；不能时补全方案，或列入“假设与待确认”并标明阻塞项，不得宣称方案可执行。
+- 设计轮（spec）读取已批准的 PLAN-APPROVED.md，把技术规格写入 SPEC.md，至少覆盖适用的：代码结构、文件与模块职责、数据库表与迁移、领域模型及其依赖、对外接口与错误行为、各模块实现、可执行验证用例；对不适用的部分逐项明确说明“不适用”。技术实现可以调整，但不能擅改业务行为；若必须改业务预期，暂停受影响工作并在报告中交 Lead 转用户决策。
+- 规格有问题时按 worker/tester 的上报修订并发布新版本（更新 SPEC.md，版本号以派单为准）；单纯澄清规格不扣返工额度，也不重置已用额度。
+- 技术验收轮（tech-review）以当前 SPEC.md 为唯一权威技术规格：做代码审查、亲自运行验证测试，在 TECH-REVIEW.md 逐条记录需求/AC 编号、命令、退出码、关键输出与可执行的编号缺陷清单；技术验收前必须已有一份仍然新鲜的 APPROVED 测试验收（TEST-REVIEW.md）。
+- 业务验收轮以 PLAN-APPROVED.md 为唯一权威业务规格，逐条核对 AC 并在 REVIEW.md 写明 AC 编号、验证命令、退出码、关键输出与结论；亲自运行或检查，不接受没有证据的声明。测试结论对照 TEST-REVIEW.md，技术结论对照 SPEC.md 与 TECH-REVIEW.md。
+- 当你本人接手实现过代码时，不能再签署自己改动的技术验收：技术验收改由 tester（gpt）对照 SPEC.md 代签；你的业务验收仍单独签署，两份验收独立记录。
+- tester 挂起（额度耗尽容错交接）时代行测试验收职责：按 tester 章程写 TEST-REVIEW.md；技术/业务验收仍按本章程单独签署，记录独立。tester 恢复后交还职责。
 
-### architect 章程（要点）
+### tester 章程（要点）
 
-- 设计轮（spec）读取已批准的业务方案 PLAN-APPROVED.md；对缺失的技术设计拍板，对已有设计审核、补充。
-- 把技术规格写入 SPEC.md，至少覆盖适用的：代码结构、文件与模块职责、数据库表与迁移、领域模型及其依赖、对外接口与错误行为、各模块实现、可执行验证用例；对不适用的部分逐项明确说明“不适用”。
-- 技术实现可以调整，但不能擅改业务行为；若必须改业务预期，暂停受影响工作并在报告中交 Lead 转用户决策。
-- 规格有问题时按 worker 的上报修订并发布新版本（更新 SPEC.md，版本号以派单为准）；单纯澄清规格不扣返工额度，也不重置已用额度。
-- 技术验收轮（tech-review）以当前 SPEC.md 为唯一权威技术规格：做代码审查、亲自运行验证测试，在 TECH-REVIEW.md 逐条记录需求/AC 编号、命令、退出码、关键输出与可执行的编号缺陷清单。
-- 接手实现时按 worker 章程执行并自测，但你不能签署自己改动的技术验收：插件会拒绝对你派 tech-review；交由 brain（codex）对照 SPEC.md 独立代签技术验收。
+- 测试验收轮（test-review）读取 brain 的 SPEC.md（技术实现规格）与 PLAN-APPROVED.md（验收方案），逐条 AC 审核 worker 在 REPORT.md 中提交的测试用例：是否覆盖每条 AC、测试名/输入/期望值是否与规格一致、命令是否可直接执行、证据是否真实完整。
+- worker 的测试用例不合格（缺失、覆盖不足、与规格不符、证据不实）时，由你补充测试用例并进行完整测试：补齐缺失用例、亲自运行完整测试套件、记录真实结果，不得只指出问题不补齐。
+- 把测试验收结论写入 TEST-REVIEW.md：逐条 AC 记录审核结论、你补充的测试用例、完整测试的命令/退出码/关键输出；最后一行必须是机器可读的「VERDICT: APPROVED」（用例合格或已补齐且完整测试通过）或「VERDICT: CHANGES_REQUESTED」（存在测试无法覆盖的实现缺陷，给出编号缺陷清单与每项最小修复方案）。
+- CHANGES_REQUESTED 的编号缺陷由 Lead 派回 worker 返工；返工后代码变化会使你的结论失效，需要重新测试验收。
+- brain 本人接手实现过代码时，由你对照 SPEC.md 代签技术验收（TECH-REVIEW.md）：代码审查、亲自运行验证测试、逐条记录命令/退出码/关键输出与编号缺陷，最后一行同样是「VERDICT: APPROVED」或「VERDICT: CHANGES_REQUESTED」。
+- 不写生产代码：只补测试用例与测试脚本，不改实现逻辑；发现实现缺陷报 CHANGES_REQUESTED 转 worker 修复，不代改。
+- 规格（SPEC.md/PLAN-APPROVED.md）缺失、矛盾或明显错误时停止审核，报 "blocked" 并引用具体章节与编号；不确定的预期交 Lead 转 brain 澄清，不要猜。
 
 ### worker 章程（要点）
 
 - 动手前先读 TASK.md、PLAN-APPROVED.md（业务方案）与 SPEC.md（技术规格）。PLAN-APPROVED.md 是业务方案与业务验收的唯一权威规格；SPEC.md 是技术实现、返工与技术验收的唯一权威规格；PLAN.md 只用于设计，不能覆盖批准归档。仅任务快照豁免方案门禁且无批准归档时，按 TASK.md 与 Lead 本轮派单执行；仍须逐条 AC 留证。
 - 只做规格定义的最小改动；不得引入规格未定义的接口、文件或依赖，不重新设计、不改名、不扩大范围。
-- 规格缺失、矛盾或明显错误时立即停止实现，报 "blocked"，引用 PLAN-APPROVED.md/SPEC.md 的具体章节与编号，并列出缺失项或冲突原文；需要归档而文件缺失时明确引用文件名；豁免任务引用 TASK.md 章节或 Lead 派单条目。规格有问题上报 Lead 转 gpt 修订发布，不自行偏离或改用 PLAN.md。
+- 规格缺失、矛盾或明显错误时立即停止实现，报 "blocked"，引用 PLAN-APPROVED.md/SPEC.md 的具体章节与编号，并列出缺失项或冲突原文；需要归档而文件缺失时明确引用文件名；豁免任务引用 TASK.md 章节或 Lead 派单条目。规格有问题上报 Lead 转 brain（codex）修订发布，不自行偏离或改用 PLAN.md。
 - 按 SPEC.md 指定的测试名、输入与期望输出写或更新测试，并亲自运行每条 AC 的验收命令；豁免任务按 TASK.md 与 Lead 本轮派单执行。
 - 在 REPORT.md 逐条 AC 给证据：AC 编号、改动文件路径、测试名、实际命令、退出码、关键输出与结论；失败或未执行必须如实标注，不得只写“测试通过”。
 - AC 映射：沿用 TASK.md 的 AC 编号；未编号时按条目顺序从 AC1 开始编号。PLAN.md/SPEC.md 为每条 AC 指定改动文件、测试名、验证命令与期望值；REPORT.md/TECH-REVIEW.md/REVIEW.md 按对应规格逐条记录 AC 编号、文件路径、测试名、命令、退出码、关键输出与结论。
+
+## 调用模式
+
+小队有两种调用模式，在 `squad_start` 时选择：
+
+- **研发模式（默认，`mode="dev"`）**：设计 → 开发 → 验收的完整流程（先审方案再实现），即下文「使用」一节的 1–12 步，行为不变。
+- **验收模式（`mode="acceptance"`）**：不做设计，以**指定的权威方案**为准，做技术与业务双维度验收并交付验收报告；适用于对既有实现按权威方案验收的场景。要求：
+  - `authority`（必填）：权威方案——文件路径（相对会话目录或绝对路径）或方案全文；创建任务时固化为任务记忆里的 `AUTHORITY.md`，之后一切验收标准从它推导，brain 不再产出 PLAN/SPEC，design/spec/implement 等研发阶段被拒绝。
+  - **双验收顺序（强制）**：先派 gpt（`phase="acceptance"`，技术维度：亲自运行测试/构建、逐项核对实现与方案一致性），再派 codex（`phase="acceptance"`，业务维度：对外行为与用户可见结果，并**定稿验收报告**）。
+  - **验收报告 `ACCEPTANCE-REPORT.md` 五要素**（缺一不可）：① 验收方案与标准（从 AUTHORITY.md 推导）② 上一轮验收报告修复情况（第 2 轮起逐条核对编号问题：已修复/部分修复/未修复 + 证据）③ 本轮发现的问题（编号、维度、证据、严重度）④ 本轮发现问题的修复建议 ⑤ 结论（最后一行 `VERDICT: APPROVED|CHANGES_REQUESTED`）。每轮归档为 `ACCEPTANCE-REPORT-R<n>.md`。
+  - **修复由 worker 承担**：`CHANGES_REQUESTED` 的编号问题与修复建议由 Lead 以 `phase="rework"` 派给 worker（后端优先 zcode，备份 opencode；前端 qoder）；修复计入验收返工预算（默认 3 轮，与技术返工同一额度，扩展用 `squad_extend(kind="tech", …)`）；修复使本轮验收失效，需重走 gpt → codex 双验收。
+  - `VERDICT: APPROVED` 且仍然新鲜（修复未再改动代码）→ `squad_finish` 收尾交付。
 
 ## 使用
 
@@ -67,38 +84,40 @@
 
 1. `squad_start` 建任务与共享记忆（可选 `flow="simple"` 走简化流程，适合非代码任务）；**默认同时创建 worktree + 新分支，并把会话切过去**；
 2. `squad_dispatch(codex, phase="design")` → brain 写业务方案 `PLAN.md`；
-3. **Lead 审核 `PLAN.md`**：假装自己是没有上下文的架构师，无法只靠 PLAN 拍板技术设计的点一律按 D1 起连续编号，写明章节、缺失或矛盾、最小补全要求，再派回 brain。有问题就把编号缺陷派回 brain（`phase="design"` 返工）；设计预算默认 4 次，未扩展时第 5 次暂停——先向用户说明阻塞点并等待决策，用户同意后用 `squad_extend(kind="design", rounds=3, reason="用户批准的追加理由", confirmed=true)` 追加轮次再派。方案合格后调用 **`squad_approve_plan`** 批准（归档 `PLAN-APPROVED.md`）；
-4. `squad_dispatch(gpt, phase="spec")` → architect 发布技术规格 `SPEC.md`（可多轮修订，不占返工额度）；**规格交付后即可派工，不需要 Lead 再审批**；
-5. `squad_dispatch(zcode 或 qoder, phase="implement")` → worker 按 PLAN-APPROVED.md + SPEC.md 在 worktree 里实现并自测，写 `REPORT.md`，逐条 AC 给证据；
-6. `squad_dispatch(gpt, phase="tech-review")` → 技术验收，写 `TECH-REVIEW.md`（`VERDICT: APPROVED|CHANGES_REQUESTED`）；
-7. 技术验收不通过 → 把编号缺陷派回对应 worker（`phase="rework"`，技术返工预算 3 轮，前后端共享；未扩展时第 4 轮暂停——先向用户说明阻塞点并等待决策，用户同意后用 `squad_extend(kind="tech", rounds=3, reason="用户批准的追加理由", confirmed=true)` 追加轮次再派；
-8. 技术验收通过 → `squad_dispatch(codex, phase="review")` → 业务验收，写 `REVIEW.md`；
-9. 业务验收不通过 → `phase="rework"`（业务返工预算 3 轮，与技术额度独立；**业务返工改了代码后必须重新通过技术验收**）；未扩展时第 4 轮暂停——先向用户说明阻塞点并等待决策，用户同意后用 `squad_extend(kind="business", rounds=3, reason="用户批准的追加理由", confirmed=true)` 追加轮次再派；
-10. 两份验收都 `approved` 且仍然新鲜 → `squad_finish`：逐仓提交 worktree 改动、切回主仓库源目录、给出每仓分支与合并命令。
+3. **Lead 审核 `PLAN.md`**：假装自己是没有上下文的实现者，无法只靠 PLAN 拍板技术设计的点一律按 D1 起连续编号，写明章节、缺失或矛盾、最小补全要求，再派回 brain。有问题就把编号缺陷派回 brain（`phase="design"` 返工）；设计预算默认 4 次，未扩展时第 5 次暂停——先向用户说明阻塞点并等待决策，用户同意后用 `squad_extend(kind="design", rounds=3, reason="用户批准的追加理由", confirmed=true)` 追加轮次再派。方案合格后调用 **`squad_approve_plan`** 批准（归档 `PLAN-APPROVED.md`）；
+4. `squad_dispatch(codex, phase="spec")` → brain 发布技术规格 `SPEC.md`（可多轮修订，不占返工额度）；**规格交付后即可派工，不需要 Lead 再审批**；
+5. `squad_dispatch(zcode, phase="implement")` → 后端任务**优先派 zcode**（zcode 不可用自动改派备份 opencode）；前端任务固定派 qoder（页面交互设计、实现、自测）。worker 按 PLAN-APPROVED.md + SPEC.md 在 worktree 里实现并自测，写 `REPORT.md`，逐条 AC 给证据，自测全部通过后才交付；
+6. `squad_dispatch(gpt, phase="test-review")` → tester 测试验收：依据 brain 的 SPEC.md 与 PLAN-APPROVED.md 审核 worker 的测试用例，不合格由 gpt 补充测试用例并完整测试，写 `TEST-REVIEW.md`（`VERDICT: APPROVED|CHANGES_REQUESTED`）；
+7. 测试验收不通过 → 把编号缺陷派回对应 worker（`phase="rework"`，计入技术返工预算）；返工后测试验收失效，重走 test-review；
+8. 测试验收通过 → `squad_dispatch(codex, phase="tech-review")` → brain 技术验收（若 codex 本任务写过代码，改派 gpt 代签），写 `TECH-REVIEW.md`（`VERDICT: APPROVED|CHANGES_REQUESTED`）；
+9. 技术验收不通过 → 把编号缺陷派回对应 worker（`phase="rework"`，技术返工预算 3 轮，前后端共享；未扩展时第 4 轮暂停——先向用户说明阻塞点并等待决策，用户同意后用 `squad_extend(kind="tech", rounds=3, reason="用户批准的追加理由", confirmed=true)` 追加轮次再派；
+10. 技术验收通过 → `squad_dispatch(codex, phase="review")` → 业务验收，写 `REVIEW.md`；
+11. 业务验收不通过 → `phase="rework"`（业务返工预算 3 轮，与技术额度独立；**业务返工改了代码后必须重新通过测试验收与技术验收**）；未扩展时第 4 轮暂停——先向用户说明阻塞点并等待决策，用户同意后用 `squad_extend(kind="business", rounds=3, reason="用户批准的追加理由", confirmed=true)` 追加轮次再派；
+12. 三份验收（测试/技术/业务）都 `approved` 且仍然新鲜 → `squad_finish`：逐仓提交 worktree 改动、切回主仓库源目录、给出每仓分支与合并命令。
 
-> 三种批准相互独立：`squad_approve_plan`（Lead）批准的是**业务方案**，`TECH-REVIEW.md` 的 `VERDICT: APPROVED`（技术验收）与 `REVIEW.md` 的 `VERDICT: APPROVED`（业务验收）各自独立签署；任何一个不能替代另一个。**两份验收必须对应同一版候选代码、业务方案与技术规格**：任一变化（代码轮次 codeEpoch、规格版本 specVersion 变动）使旧结论失效，不能用旧批准收尾。
+> 各批准相互独立：`squad_approve_plan`（Lead）批准的是**业务方案**，`TEST-REVIEW.md` 的 `VERDICT: APPROVED`（测试验收）、`TECH-REVIEW.md` 的 `VERDICT: APPROVED`（技术验收）与 `REVIEW.md` 的 `VERDICT: APPROVED`（业务验收）各自独立签署；任何一个不能替代另一个。**测试/技术/业务验收必须对应同一版候选代码、业务方案与技术规格**：任一变化（代码轮次 codeEpoch、规格版本 specVersion 变动）使旧结论失效，不能用旧批准收尾。
 
 ### 接手实现与代签
 
-- 对应 worker 不可用时，Lead 可以直接派 gpt 接手实现（`phase="implement"/"rework"`）；
+- 对应 worker 不可用时，Lead 可以派 gpt（tester）接手实现（`phase="implement"/"rework"`，须先显式开启其 worker 能力）；
 - 三轮技术返工仍未通过时，Lead 先向用户说明阻塞点并等待决策；用户同意继续后直接派 gpt 接手，**不需要再次确认选人**；
-- gpt 接手写代码后可以自测，但**不能签署自己改动的技术验收**（插件会拒绝）：tech-review 改派 codex 对照 SPEC.md 独立代签技术验收，业务验收仍由 codex 按业务方案单独签署，两份验收独立记录。
+- 实现者不签自己的技术验收：gpt 接手写代码后，tech-review 仍由 codex（未写代码时）签署；codex 本人接手实现时，tech-review 改派 gpt 对照 SPEC.md 代签，业务验收仍由 codex 按业务方案单独签署，两份验收独立记录。
 
-### 架构师容错（failover，额度耗尽自动交接）
+### 测试者容错（failover，额度耗尽自动交接）
 
-gpt（架构师）因**额度耗尽**等原因不可用时，插件把 gpt **挂起**并把架构师职责（SPEC.md 技术规格、TECH-REVIEW.md 技术验收）交给 **codex（brain）代行**，完成剩下的任务；gpt 挂起直到恢复：
+gpt（测试验收者）因**额度耗尽**等原因不可用时，插件把 gpt **挂起**并把测试验收职责（TEST-REVIEW.md）交给 **codex（brain）代行**，完成剩下的任务；gpt 挂起直到恢复：
 
 - **自动触发**：① 对 gpt 的派单失败且错误匹配额度特征（额度/余额/欠费/限流/quota/insufficient/balance/exceeded/429/rate limit）→ 自动挂起，报错附交接指引；② gpt 以 `squad_report` 上报 `blocked` 且摘要匹配额度特征 → 自动挂起。
 - **手动触发/恢复**（Lead 工具 `squad_failover`）：挂起 `squad_failover({ agent: "gpt", reason: "原因" })`；用户确认额度恢复后 `squad_failover({ agent: "gpt", recover: true })` 交还职责。
-- **挂起期间**：对 gpt 的任何派单被拒绝（提示改派 codex）；`spec` 阶段放行 codex（代行架构师，派单提示注明"代行架构师职责"）；`tech-review` 本就允许 codex。非额度类派单错误**不会**触发挂起。
+- **挂起期间**：对 gpt 的任何派单被拒绝（提示改派 codex）；`test-review` 阶段放行 codex（代行测试验收，派单提示注明"代行测试验收职责"）；`spec`/`tech-review` 本就是 codex 的职责。非额度类派单错误**不会**触发挂起。
 - **持久化**：挂起状态存 `~/.dsh/agent-squad/failover.json`，插件重载/DSH 重启后仍生效，直到显式恢复；`squad_status` 显示"挂起：gpt（自 …；自动/手动；原因 …）"。
-- 代行期间 codex 产出的 SPEC.md 与 TECH-REVIEW.md 是正式记录；验收新鲜度规则不变（代行产生的技术验收同样绑定 codeEpoch/specVersion）。
+- 代行期间 codex 产出的 TEST-REVIEW.md 是正式记录；验收新鲜度规则不变（代行产生的测试验收同样绑定 codeEpoch/specVersion）。
 
 ### 并行开发（默认运行方式，两层并行）
 
-- **任何角色都可当 worker**：设置页每个成员有 worker 能力开关（`agents[].worker`），另有顶层 `leaderWorker` 开关——brain（codex）、architect（gpt）与 Lead 开启后都能作为 Worker 参与并行实现（实现者不参与自签验收）。
+- **worker 能力属运行时高级配置**：每个成员有 `agents[].worker`，另有顶层 `leaderWorker`——brain（codex）、tester（gpt）与 Lead 开启后都能作为 Worker 参与并行实现（实现者不参与自签验收）。这两个开关**不在设置页显示**，直接编辑 settings.json 或经 HTTP API 修改。
 - **worker 内部并行（默认）**：ZCode CLI 自带 subagent 体系（Task/Agent 工具），Qoder CLI 亦有 subagent（默认启用的实验设置）与 Workflow parallel/pipeline 编排；ACP/CLI 通道均不过滤工具、权限自动放行。worker 章程与 implement/rework 派单提示内置"并行默认"引导：交办包含多个独立文件/模块时，worker 默认用自己的子代理同时开发；不独立的部分串行完成；边界不变（只改规格内文件、逐条 AC 留证、汇总写 REPORT.md）。
-- **小队级并行（默认）**：external 执行者的 `implement`/`rework` 派单**默认后台派发**（`delivery: 'parent'`）——工具调用立即返回、结果完成时以后台消息送达 Lead，因此 Lead **默认可以连续并发派多个 worker**（如 zcode 后端 + qoder 前端同时跑）。需要在本回合同步拿到结果时传 `background: false` 恢复阻塞式；`design/spec/review/tech-review` 始终同步（需读取交付物）；local/team 执行者本就不阻塞。
+- **小队级并行（默认）**：external 执行者的 `implement`/`rework` 派单**默认后台派发**（`delivery: 'parent'`）——工具调用立即返回、结果完成时以后台消息送达 Lead，因此 Lead **默认可以连续并发派多个 worker**（如 zcode 后端 + qoder 前端同时跑）。需要在本回合同步拿到结果时传 `background: false` 恢复阻塞式；`design/spec/test-review/tech-review/review` 始终同步（需读取交付物）；local/team 执行者本就不阻塞。
 - `squad_status` 显示"后台执行器运行中：N 个"；`squad_finish` 会等所有后台执行器结束。同一队友运行中的重复派单仍受 R07 守卫限制。
 
 ### 不阻塞主会话（所有 external 阶段默认后台）
@@ -146,8 +165,8 @@ gpt（架构师）因**额度耗尽**等原因不可用时，插件把 gpt **挂
 
 每次 `implement`/`rework` 派单前，插件先对目标 worker 做一轮**轻量可用性探测**（同一任务同一 worker 探测成功即缓存；`probe: true` 强制重探、`probe: false` 跳过；`config.workerProbe: false` 全局关闭）。若探测返回**额度类错误**（limit/quota/429/余额/欠费/限流…）：
 
-- 立即把该 worker 记为不可用（`failover.json`，跨重载持久），并在派单反馈里明示：`[可用性门禁] zcode 不可用（可用性探测失败：HTTP 429 …）→ 已上报，并自动改由 qoder 执行本轮任务。`；
-- **自动改派**另一个可用 worker 执行本轮（优先 worker 角色；架构师不参与 worker 替代，其容错走架构师交接）；STATE 的派单记录带 `substitutedFrom` / `substitutionReason`，JOURNAL 留痕；
+- 立即把该 worker 记为不可用（`failover.json`，跨重载持久），并在派单反馈里明示：`[可用性门禁] zcode 不可用（可用性探测失败：HTTP 429 …）→ 已上报，并自动改由 opencode 执行本轮任务。`；
+- **自动改派**另一个可用 worker 执行本轮：**后端配对优先**——zcode 不可用改派备份 opencode，opencode 不可用改派 zcode；其余情形按 worker 角色顺序补位（qoder 无固定备份，由其余可用 worker 补位；qoder 固定前端，一般不反向承接后端任务）。tester 不参与 worker 替代，其容错走测试者交接。STATE 的派单记录带 `substitutedFrom` / `substitutionReason`，JOURNAL 留痕；
 - 此后对该 worker 的派单也会被自动绕开；`squad_status` 显示"挂起：zcode（…自动…）→ 派单将自动改由其他 worker 执行"；
 - 用户确认额度恢复后 `squad_failover({ agent: "zcode", recover: true })` 解除；
 - 非额度类探测异常只提示（`[可用性门禁] … 探测异常（非额度类）…继续按计划派发`），不改变执行者；
@@ -160,7 +179,7 @@ gpt（架构师）因**额度耗尽**等原因不可用时，插件把 gpt **挂
 - **业务返工预算（默认 3 轮）**：业务验收不通过的返工；与技术额度独立计数。未扩展时第 4 轮暂停。业务返工改动代码后必须重新通过技术验收，再重新业务验收。
 - **到上限是暂停，不是硬拒绝**：先向用户说明阻塞点及已完成部分并**等待决策**；仅用户明确同意后调用 `squad_extend`（如 `squad_extend(kind="design", rounds=3, reason="用户批准的追加理由", confirmed=true)`）追加轮次再派单。每次扩展都要重新取得用户同意（每次都传 `confirmed=true`），可重复扩展、无插件硬上限，但不得预先充值，也**不自动续跑**；用户拒绝或未回复时保持暂停。
 - **默认值只在插件常量里**：各类上限存 STATE（`designLimit` / `techReworkLimit` / `businessReworkLimit` / `reworkLimit`），由 `squad_extend` 提高。
-- **简化/兼容流程**（`flow="simple"` 或未配置 architect 的任务、旧任务）沿用旧门禁：Lead 批准 PLAN + brain 单一 REVIEW 验收，返工预算用 `kind="implement"` 扩展。
+- **简化/兼容流程**（`flow="simple"` 或未配置 tester 的任务、旧任务）沿用旧门禁：Lead 批准 PLAN + brain 单一 REVIEW 验收，返工预算用 `kind="implement"` 扩展。
 
 ## Worktree 分支开发（默认开启）
 
@@ -210,7 +229,7 @@ node --test dsh-agent-squad/test/settings.test.js
 ASQ_LIVE_QODER=1 node --test --test-name-pattern='^T09 ' dsh-agent-squad/test/settings.test.js
 ```
 
-测试保持二十个顶层用例（T01–T20；T11 完整流程与双验收，T12 架构师容错交接，T13 后台并行派发，T14 角色 worker 能力与 leaderWorker，T15 worker 可用性门禁与自动替代，T16 阶段化并行与 Base 分支合并，T17 分层进度与自动同步，T18 外部阶段非阻塞与延迟记账，T19 同会话多任务隔离与寻址，T20 多任务独立 worktree 与运行时合法子代理名）；实机模式由 qoder 一次派单修改两个临时仓库，各新增一次提交，并输出 `AC7 task=... cwd=... repo=... commit=... repo=... commit=...`。普通单测不能代替该证据。
+测试保持二十个顶层用例（T01–T20；T11 完整流程与双验收，T12 测试者容错交接，T13 后台并行派发，T14 角色 worker 能力与 leaderWorker，T15 worker 可用性门禁与自动替代，T16 阶段化并行与 Base 分支合并，T17 分层进度与自动同步，T18 外部阶段非阻塞与延迟记账，T19 同会话多任务隔离与寻址，T20 多任务独立 worktree 与运行时合法子代理名）；实机模式由 qoder 一次派单修改两个临时仓库，各新增一次提交，并输出 `AC7 task=... cwd=... repo=... commit=... repo=... commit=...`。普通单测不能代替该证据。
 
 ## B 模式：外部 provider（一次性）
 
@@ -301,7 +320,7 @@ token：GLM implement 26,295 / rework 26,459（cache 主导）；Codex 设计 + 
   "agents": [
     { "id": "codex", "displayName": "codex", "role": "brain",
       "executor": "external", "model": "codex", "description": "…" },
-    { "id": "gpt", "displayName": "gpt", "role": "architect",
+    { "id": "gpt", "displayName": "gpt", "role": "tester",
       "executor": "local", "model": "openai/gpt-6.2-sol", "description": "…" },
     { "id": "zcode", "displayName": "zcode", "role": "worker",
       "executor": "local", "model": "zai-coding-cn/glm-5.3", "description": "…" },
@@ -313,8 +332,8 @@ token：GLM implement 26,295 / rework 26,459（cache 主导）；Codex 设计 + 
   "worktree": { "directory": ".agents/worktrees" } }
 ```
 
-- **字段**：五个成员固定 id（codex/gpt/zcode/qoder/opencode，只读），可编辑 `displayName/role/executor/model/reasoning/worker/description`，以及顶层 `leaderWorker`（Lead 的 worker 能力）；worktree 只有 `directory`（仓库相对路径，拒绝绝对路径与 `..`）。`reasoning`（思考强度，''/low/high/xhigh/max）仅对固定模型执行者生效（local，或 `provider/model` 形式的外部一次性），派发时作为 `reasoningEffort` 传给子代理；纯外部 provider（codex-cli 等）不显示该控件。
-- **role 三态**：`brain`（业务设计与验收）| `architect`（系统架构师）| `worker`（实现与自测）。
+- **字段**：五个成员固定 id（codex/gpt/zcode/qoder/opencode，只读），可编辑 `displayName/role/executor/model/reasoning/description`；worktree 只有 `directory`（仓库相对路径，拒绝绝对路径与 `..`）。`reasoning`（思考强度，''/low/high/xhigh/max）仅对固定模型执行者生效（local，或 `provider/model` 形式的外部一次性），派发时作为 `reasoningEffort` 传给子代理；纯外部 provider（codex-cli 等）不显示该控件。`agents[].worker` 与顶层 `leaderWorker` 不在页面暴露（见上）。
+- **role 三态**：`brain`（业务+技术设计与双验收）| `tester`（测试验收者）| `worker`（实现与自测）。
 - **executor 三态**：`external`（外部 provider，一次性派发）、`local`（`provider/model` 固定模型本地子代理，可续跑）、`team`（进程内队友，可续跑）。校验：名称唯一、至少一个 brain、local 模型必须在模型目录内、external provider 必须已注册。
 - **迁移**：v1（三成员）自动补 gpt，v2（四成员）自动补 opencode，均升为 v3，用户既有编辑与 revision 全部保留。
 - **读写**：页面经 Host 的 loopback 同源 HTTP（`GET/PUT /agent-squad/settings`、`GET /agent-squad/models`）读写；非 loopback socket、非本地 Host（如 `127.attacker.example`）或跨源/异协议 Origin 一律 403。保存走 revision 乐观锁：并发写第二笔返回 **409 REVISION_CONFLICT** 并附服务器当前 settings；页面显示冲突横幅并保留草稿，点"改用服务器版本"经确认才替换。恢复出厂默认只写入草稿，保存才落盘。未保存的草稿在切换设置页后保留（工厂级会话），保存期间编辑冻结，无字段错误的服务器故障（IO/模型目录 503）显示整体错误提示。
@@ -349,7 +368,7 @@ token：GLM implement 26,295 / rework 26,459（cache 主导）；Codex 设计 + 
         role: brain
         provider: codex      # 外部 provider（一次性）
       - name: gpt
-        role: architect      # 系统架构师
+        role: tester         # 测试验收者
         provider: ''
         model: openai/gpt-6.2-sol    # 本地固定模型（可续跑）
       - name: zcode
@@ -366,7 +385,7 @@ token：GLM implement 26,295 / rework 26,459（cache 主导）；Codex 设计 + 
         provider: ''         # 空 = team 队友（可续跑）
 ```
 
-- `role`：`brain` | `architect` | `worker`（可编辑字段保存在设置文件；bundle 只作 seed 与 charter/context 补充）。
+- `role`：`brain` | `tester` | `worker`（可编辑字段保存在设置文件；bundle 只作 seed 与 charter/context 补充）。
 - **小队是显式启用（opt-in）**：普通会话不进入 Squad。启用状态在内存里按会话保存；插件重载后用 `squad_enable` 恢复，不影响任务数据。
 - **worktree 始终启用**（无开关）：省略 repos 时保留单仓复用与失败降级行为；显式 repos 严格校验，多仓始终创建独立子 worktree，即使入口是 linked checkout 也不复用。路径与回滚规则见上方“Worktree 分支开发”。
 - **运行中不重派**：目标（本地子代理或 team 队友）处于 running/provisioning 时拒绝再次派单或切换执行方式，避免同时保留两个活动执行者；空闲时同绑定续跑、改绑定（模型/执行方式）则下一次新建。
@@ -394,9 +413,12 @@ token：GLM implement 26,295 / rework 26,459（cache 主导）；Codex 设计 + 
     ├── PLAN.md               # 业务方案草稿 + 编号验收标准（brain 写）
     ├── PLAN-R<n>.md          # 第 n 次设计的方案归档（n 随扩展增长）
     ├── PLAN-APPROVED.md      # 业务方案与业务验收的唯一权威规格（squad_approve_plan 写）
-    ├── SPEC.md               # 技术规格（architect 写；当前版本）
+    ├── SPEC.md               # 技术规格（brain 写；当前版本）
     ├── SPEC-V<n>.md          # 第 n 版技术规格归档（external 同步归档）
-    ├── TECH-REVIEW.md        # 技术验收结论 + 证据（architect 写；gpt 实现代签时由 brain 写）
+    ├── TEST-REVIEW.md        # 测试验收结论 + 证据（tester 写；含补充的测试用例与完整测试结果）
+    ├── AUTHORITY.md          # 验收模式：指定的权威方案（authority 固化；唯一验收依据）
+    ├── ACCEPTANCE-REPORT.md  # 验收模式：双维度验收报告（五要素；R<n> 归档历史轮次）
+    ├── TECH-REVIEW.md        # 技术验收结论 + 证据（brain 写；brain 实现代码时由 tester 代签）
     ├── TECH-REVIEW-R<round>.md  # 每轮技术验收归档
     ├── REVIEW.md             # 业务验收结论 + 证据（brain 写）
     ├── REVIEW-R<round>.md    # 每轮业务验收归档
@@ -427,8 +449,8 @@ token：GLM implement 26,295 / rework 26,459（cache 主导）；Codex 设计 + 
 | 工具 | 调用者 | 作用 |
 | --- | --- | --- |
 | `squad_enable` | 任意会话根（未启用时） | 显式启用小队：仅当用户明确要求"用小队"时调用；仅提到队友名字不算启用。启用后本会话成为 Squad Lead |
-| `squad_start` | Lead | 可选 `repos: string[]`（默认当前仓库，首项为主仓）与 `flow: "full"\|"simple"`（默认 full；无 architect 参与者自动降级为简化规则并警告）；建 worktree 集合、写 TASK/JOURNAL/STATE 和门禁快照，最后发布 current |
-| `squad_dispatch` | Lead | 首次创建 / 之后续跑指定队友，推进 phase（design/spec/implement/tech-review/review/rework）与 round；design 受设计预算与已批准限制，spec 限 architect，implement/rework 受 PLAN 批准与规格交付门禁且 external 执行者默认后台派发（background: false 恢复阻塞），tech-review 禁止自签，review（完整流程）要求技术验收新鲜通过；到预算上限时暂停并提示先问用户 |
+| `squad_start` | Lead | 可选 `repos: string[]`（默认当前仓库，首项为主仓）、`flow: "full"\|"simple"`（研发模式流程，默认 full；无 tester 参与者自动降级为简化规则并警告）、`mode: "dev"\|"acceptance"`（默认 dev 研发模式）与 `authority`（验收模式必填：权威方案路径或全文，固化为 AUTHORITY.md）；建 worktree 集合、写 TASK/JOURNAL/STATE 和门禁快照，最后发布 current |
+| `squad_dispatch` | Lead | 首次创建 / 之后续跑指定队友，推进 phase（研发模式 design/spec/implement/test-review/tech-review/review/rework；验收模式 acceptance/rework）与 round；design 受设计预算与已批准限制，spec 限 brain，implement/rework 受 PLAN 批准与规格交付门禁且 external 执行者默认后台派发（background: false 恢复阻塞），test-review 限 tester（挂起时 brain 代行），tech-review 默认 brain 且要求新鲜的 APPROVED 测试验收、禁止自签，review（完整流程）要求技术验收新鲜通过；验收模式 acceptance 强制 gpt（技术维度）→ codex（业务维度）顺序并定稿 ACCEPTANCE-REPORT.md，rework 需要新鲜的 CHANGES_REQUESTED 验收结论；到预算上限时暂停并提示先问用户 |
 | `squad_approve_plan` | Lead（仅 Lead 可见） | 审核通过 PLAN.md：补归档当前轮次 `PLAN-R<n>.md`，写 `PLAN-APPROVED.md` 与 `planApproved`/`planApprovedAt`；缺 PLAN、已收尾或已批准时拒绝 |
 | `squad_extend` | Lead（仅 Lead 可见） | 用户决策门禁：仅当对应预算（完整流程 `kind` = design/tech/business；简化/兼容 `kind` = design/implement）已到上限且用户明确同意后调用（`confirmed=true` 必填，`rounds` 正整数默认 3，`reason` 必填），提高该类上限并追加一条扩展记录；未到上限、未确认或非 Lead 一律拒绝；可重复扩展，不自动续跑 |
 | `squad_status` | Lead | 任务、阶段/轮次、流程（flow/specPublished/specVersion/codeEpoch/implementers）、双验收绑定与结论、全部仓库/worktree/分支/基线、PLAN 门禁、各类预算与最近 6 条扩展记录、成员状态、记忆文件、最近派单 |
@@ -436,8 +458,8 @@ token：GLM implement 26,295 / rework 26,459（cache 主导）；Codex 设计 + 
 | `squad_finish` | Lead | 校验无队友运行 + 验收 approved（完整流程需技术+业务双验收且新鲜），逐仓提交并记录结果，切回主仓库源目录，写 FINAL.md 与每仓合并命令；多仓失败可重试 |
 | `squad_parallel_start` | Lead（仅 Lead 可见） | 基础层交付后开启并行阶段：基于 Base 为每个特性创建独立 worktree/分支，供按 feature 并行派单 |
 | `squad_deliver` | Lead（仅 Lead 可见） | 交付并合并：基础层（通过验收后把 squad 分支合入 Base）或单个特性（`feature`，合入 Base）；源仓库须切在 Base，冲突报错不标记完成 |
-| `squad_failover` | Lead（仅 Lead 可见） | 架构师容错：额度耗尽时挂起架构师（自动触发或手动 `reason`），职责由 brain 代行；`recover: true` 在用户确认恢复后解除挂起；挂起状态持久化于 failover.json |
-| `squad_report` | brain / architect / worker | 把结果、阻塞或验收结论发回 Lead 并写 JOURNAL；架构师上报额度耗尽的 blocked 会触发自动挂起 |
+| `squad_failover` | Lead（仅 Lead 可见） | 测试者容错：额度耗尽时挂起 tester（自动触发或手动 `reason`），测试验收职责由 brain 代行；`recover: true` 在用户确认恢复后解除挂起；挂起状态持久化于 failover.json |
+| `squad_report` | brain / tester / worker | 把结果、阻塞或验收结论发回 Lead 并写 JOURNAL；tester 上报额度耗尽的 blocked 会触发自动挂起 |
 
 ## 安装 / 卸载
 

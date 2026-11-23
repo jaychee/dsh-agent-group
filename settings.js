@@ -22,47 +22,54 @@ export const FIXED_IDS = ['codex', 'gpt', 'zcode', 'qoder', 'opencode']
 
 export const EXECUTORS = ['external', 'local', 'team']
 
-/** Roster roles: brain = business design/acceptance, architect = technical
- * spec/acceptance, worker = implementation. */
-export const ROLES = ['brain', 'architect', 'worker']
+/** Roster roles: brain = business design + technical spec + dual acceptance,
+ * tester = test acceptance (review/supplement test cases, run the full suite),
+ * worker = implementation. Legacy files carrying 'architect' migrate to
+ * 'tester' on load. */
+export const ROLES = ['brain', 'tester', 'worker']
 
-/** Factory defaults: brain + architect on pinned local models, team workers. */
+/** Factory defaults: the squad the user pinned — codex/gpt/zcode/qoder on
+ * local models, opencode on OpenCode Go; worker is fixed to zcode (primary
+ * backend), opencode (backup backend) and qoder (frontend-only). */
 export const DEFAULT_AGENTS = [
   {
     id: 'codex',
     displayName: 'codex',
     role: 'brain',
-    executor: 'team',
-    model: '',
+    executor: 'local',
+    model: 'openai-codex/gpt-6.2-astra',
+    reasoning: 'xhigh',
     worker: false,
-    description: '业务设计与验收：给出业务方案、对外行为与验收标准，并做业务验收。',
+    description: '业务设计与验收：给出业务方案、对外行为与验收标准，并做业务验收（本地 OpenAI Codex GPT-6.2-Astra，xhigh）。',
   },
   {
     id: 'gpt',
     displayName: 'gpt',
-    role: 'architect',
+    role: 'tester',
     executor: 'local',
     model: 'openai/gpt-6.2-sol',
-    worker: true,
-    description: '系统架构师：发布技术规格并做技术验收；worker 不可用或技术返工到限时可接手实现。',
+    worker: false,
+    description: '测试验收者：依据 brain 的技术实现规格与验收方案审核 worker 的测试用例，不合格时补充测试用例并完整测试（默认不参与实现）。',
   },
   {
     id: 'zcode',
     displayName: 'zcode',
     role: 'worker',
-    executor: 'team',
-    model: '',
+    executor: 'local',
+    model: 'zai-coding-cn/glm-5.3',
+    reasoning: 'max',
     worker: true,
-    description: '后端 worker：实现后端代码并自测。',
+    description: '主力后端 worker：后端任务优先派发；实现后端代码并自测，自测通过后才交付（本地 GLM-5.3，max）。',
   },
   {
     id: 'qoder',
     displayName: 'qoder',
     role: 'worker',
-    executor: 'team',
-    model: '',
+    executor: 'local',
+    model: 'qoder/qmodel_latest',
+    reasoning: 'xhigh',
     worker: true,
-    description: '前端 worker：主责前端产品代码开发与自测，兼做后端代码开发。',
+    description: '前端 worker：固定负责前端页面交互设计、实现与自测，不做后端（本地 Qwen4-Max，xhigh）。',
   },
   {
     id: 'opencode',
@@ -72,7 +79,7 @@ export const DEFAULT_AGENTS = [
     model: 'dsh-opencode-go/deepseek-v4.1-flash',
     reasoning: 'max',
     worker: true,
-    description: '后端 worker：实现后端代码并自测（OpenCode Go 的 DeepSeek V4.1 Flash，可续跑）。',
+    description: '备份后端 worker：zcode 不可用时接手后端实现与自测（OpenCode Go DeepSeek V4.1 Flash，max，可续跑）。',
   },
 ]
 
@@ -264,7 +271,7 @@ export function seedFromBundle(bundleAgents, worktreeDir) {
       role: row.role,
       executor: pinned ? 'local' : external ? 'external' : 'team',
       model: pinned ? row.model : external ? row.provider : '',
-      worker: row.worker === undefined ? row.role !== 'brain' : row.worker,
+      worker: row.worker === undefined ? row.role === 'worker' : row.worker,
       ...(row.reasoning === undefined ? {} : { reasoning: row.reasoning }),
       description: row.description,
     }
@@ -451,6 +458,20 @@ export function createSettingsStore(options = {}) {
         `settings version ${String(parsed?.version)} is not supported; file left untouched`,
         { status: 500 },
       )
+    }
+    // Role migration: the architect role retired (its spec/tech-review duties
+    // moved to brain); gpt is now the tester. Normalize in memory so old
+    // files keep validating; the next save persists 'tester'.
+    if (Array.isArray(parsed.agents)) {
+      let roleChanged = false
+      const agents = parsed.agents.map((agent) => {
+        if (isPlainObject(agent) && agent.role === 'architect') {
+          roleChanged = true
+          return { ...agent, role: 'tester' }
+        }
+        return agent
+      })
+      if (roleChanged) parsed = { ...parsed, agents }
     }
     if (parsed.version !== SETTINGS_VERSION) {
       // Older files migrate in place: insert any missing fixed rows (gpt in

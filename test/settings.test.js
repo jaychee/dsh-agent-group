@@ -16,7 +16,7 @@ const delayMs = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 
 const BUNDLE_AGENTS = [
   { name: 'codex', role: 'brain', provider: 'mock-ext', context: 'fresh', description: 'brain' },
-  { name: 'gpt', role: 'architect', provider: '', model: '', context: 'fresh', description: 'architect' },
+  { name: 'gpt', role: 'tester', provider: '', model: '', context: 'fresh', description: 'tester' },
   { name: 'zcode', role: 'worker', provider: '', model: 'zai-coding-cn/glm-5.3', context: 'fresh', description: 'worker' },
   { name: 'qoder', role: 'worker', provider: '', model: 'zai-coding-cn/glm-5.3', context: 'fresh', description: 'worker2' },
   { name: 'opencode', role: 'worker', provider: '', model: 'dsh-opencode-go/deepseek-v4.1-flash', context: 'fresh', description: 'worker3' },
@@ -31,24 +31,25 @@ const BRAIN_ITEMS = [
   '把业务目标写成可执行业务方案，存入 PLAN.md：对外行为、用户可见结果、边界场景与编号验收标准（AC）。',
   '涉及对外接口时逐项写明接口契约与错误行为；没有接口变更时明确写“无接口变更”，并列出须保留的对外行为。',
   '列出边界输入与精确期望值；每条 AC 必须给出可直接执行的验收命令、执行目录、退出码与通过条件。',
-  '在“假设与待确认”中显式列出假设及影响；未确定且影响交付的事项标为待确认，不能让架构师或 worker 猜测。禁止使用“适当”“合理”“类似”“等等”“参考现有实现”替代具体规格。',
+  '在“假设与待确认”中显式列出假设及影响；未确定且影响交付的事项标为待确认，不能让测试验收者或 worker 猜测。禁止使用“适当”“合理”“类似”“等等”“参考现有实现”替代具体规格。',
   '你可以澄清方案；但要改变原有业务功能、对外结果或验收标准，必须先请用户决策，不得擅自变更。',
-  '写完后自检“一个没有上下文的架构师能否只靠 PLAN 拍板技术设计”，把结论写入 PLAN.md；不能时补全方案，或列入“假设与待确认”并标明阻塞项，不得宣称方案可执行。',
-  '业务验收轮以 PLAN-APPROVED.md 为唯一权威业务规格，逐条核对 AC 并在 REVIEW.md 写明 AC 编号、验证命令、退出码、关键输出与结论；亲自运行或检查，不接受没有证据的声明。技术结论对照 SPEC.md 与 TECH-REVIEW.md，不替技术验收背书。',
-  '当架构师接手实现时，由你对照 SPEC.md 亲自运行验证测试并代签技术验收：在 TECH-REVIEW.md 记录命令、退出码、关键输出与编号缺陷，最后一行同样是「VERDICT: APPROVED」或「VERDICT: CHANGES_REQUESTED」；之后再按业务方案单独签署业务验收，两份验收独立记录。',
+  '写完后自检“一个没有上下文的实现者能否只靠 PLAN 拍板技术设计”，把结论写入 PLAN.md；不能时补全方案，或列入“假设与待确认”并标明阻塞项，不得宣称方案可执行。',
+  '设计轮（spec）读取已批准的 PLAN-APPROVED.md，把技术规格写入 SPEC.md，至少覆盖适用的：代码结构、文件与模块职责、数据库表与迁移、领域模型及其依赖、对外接口与错误行为、各模块实现、可执行验证用例；对不适用的部分逐项明确说明“不适用”。',
+  '技术验收轮（tech-review）以当前 SPEC.md 为唯一权威技术规格：做代码审查、亲自运行验证测试，在 TECH-REVIEW.md 逐条记录需求/AC 编号、命令、退出码、关键输出与可执行的编号缺陷清单；技术验收前必须已有一份仍然新鲜的 APPROVED 测试验收（TEST-REVIEW.md）。',
+  '当你本人接手实现过代码时，不能再签署自己改动的技术验收：技术验收改由 tester（gpt）对照 SPEC.md 代签；你的业务验收仍单独签署，两份验收独立记录。',
+  '业务验收轮以 PLAN-APPROVED.md 为唯一权威业务规格，逐条核对 AC 并在 REVIEW.md 写明 AC 编号、验证命令、退出码、关键输出与结论；亲自运行或检查，不接受没有证据的声明。',
 ]
-const ARCHITECT_ITEMS = [
-  '设计轮（spec）读取已批准的业务方案 PLAN-APPROVED.md；对缺失的技术设计拍板，对已有设计审核、补充。',
-  '把技术规格写入 SPEC.md，至少覆盖适用的：代码结构、文件与模块职责、数据库表与迁移、领域模型及其依赖、对外接口与错误行为、各模块实现、可执行验证用例；对不适用的部分逐项明确说明“不适用”。',
-  '技术实现可以调整，但不能擅改业务行为；若必须改业务预期，暂停受影响工作并在报告中交 Lead 转用户决策。',
-  '规格有问题时按 worker 的上报修订并发布新版本（更新 SPEC.md，版本号以派单为准）；单纯澄清规格不扣返工额度，也不重置已用额度。',
-  '技术验收轮（tech-review）以当前 SPEC.md 为唯一权威技术规格：做代码审查、亲自运行验证测试，在 TECH-REVIEW.md 逐条记录需求/AC 编号、命令、退出码、关键输出与可执行的编号缺陷清单。',
-  '接手实现时按 worker 章程执行并自测，但你不能签署自己改动的技术验收：插件会拒绝对你派 tech-review；交由 brain（codex）对照 SPEC.md 独立代签技术验收。',
+const TESTER_ITEMS = [
+  '测试验收轮（test-review）读取 brain 的 SPEC.md（技术实现规格）与 PLAN-APPROVED.md（验收方案），逐条 AC 审核 worker 在 REPORT.md 中提交的测试用例：是否覆盖每条 AC、测试名/输入/期望值是否与规格一致、命令是否可直接执行、证据是否真实完整。',
+  'worker 的测试用例不合格（缺失、覆盖不足、与规格不符、证据不实）时，由你补充测试用例并进行完整测试：补齐缺失用例、亲自运行完整测试套件、记录真实结果，不得只指出问题不补齐。',
+  '把测试验收结论写入 TEST-REVIEW.md：逐条 AC 记录审核结论、你补充的测试用例、完整测试的命令/退出码/关键输出；最后一行必须是机器可读的「VERDICT: APPROVED」（用例合格或已补齐且完整测试通过）或「VERDICT: CHANGES_REQUESTED」（存在测试无法覆盖的实现缺陷，给出编号缺陷清单与每项最小修复方案）。',
+  'brain 本人接手实现过代码时，由你对照 SPEC.md 代签技术验收（TECH-REVIEW.md）：代码审查、亲自运行验证测试、逐条记录命令/退出码/关键输出与编号缺陷，最后一行同样是「VERDICT: APPROVED」或「VERDICT: CHANGES_REQUESTED」。',
+  '不写生产代码：只补测试用例与测试脚本，不改实现逻辑；发现实现缺陷报 CHANGES_REQUESTED 转 worker 修复，不代改。',
 ]
 const WORKER_ITEMS = [
   `动手前先读 TASK.md、PLAN-APPROVED.md（业务方案）与 SPEC.md（技术规格）。${S_TEXT}${E_TEXT}`,
   '只做规格定义的最小改动；不得引入规格未定义的接口、文件或依赖，不重新设计、不改名、不扩大范围。',
-  '规格缺失、矛盾或明显错误时立即停止实现，报 "blocked"，引用 PLAN-APPROVED.md/SPEC.md 的具体章节与编号，并列出缺失项或冲突原文；需要归档而文件缺失时明确引用文件名；豁免任务引用 TASK.md 章节或 Lead 派单条目。规格有问题上报 Lead 转 gpt 修订发布，不自行偏离或改用 PLAN.md。',
+  '规格缺失、矛盾或明显错误时立即停止实现，报 "blocked"，引用 PLAN-APPROVED.md/SPEC.md 的具体章节与编号，并列出缺失项或冲突原文；需要归档而文件缺失时明确引用文件名；豁免任务引用 TASK.md 章节或 Lead 派单条目。规格有问题上报 Lead 转 brain（codex）修订发布，不自行偏离或改用 PLAN.md。',
   '按 SPEC.md 指定的测试名、输入与期望输出写或更新测试，并亲自运行每条 AC 的验收命令；豁免任务按 TASK.md 与 Lead 本轮派单执行。',
   '在 REPORT.md 逐条 AC 给证据：AC 编号、改动文件路径、测试名、实际命令、退出码、关键输出与结论；失败或未执行必须如实标注，不得只写“测试通过”。',
 ]
@@ -83,7 +84,7 @@ test('T01 settings store seeds, persists, recovers corruption, keeps old file on
     first.agents.map((agent) => [agent.id, agent.role, agent.executor, agent.model]),
     [
       ['codex', 'brain', 'external', 'mock-ext'],
-      ['gpt', 'architect', 'team', ''],
+      ['gpt', 'tester', 'team', ''],
       ['zcode', 'worker', 'local', 'zai-coding-cn/glm-5.3'],
       ['qoder', 'worker', 'local', 'zai-coding-cn/glm-5.3'],
       ['opencode', 'worker', 'local', 'dsh-opencode-go/deepseek-v4.1-flash'],
@@ -133,7 +134,7 @@ test('T01 settings store seeds, persists, recovers corruption, keeps old file on
       ['codex', 'gpt', 'zcode', 'qoder', 'opencode'],
     )
     assert.equal(migrated.agents[0].displayName, '老codex')
-    assert.equal(migrated.agents[1].role, 'architect')
+    assert.equal(migrated.agents[1].role, 'tester')
     assert.equal(migrated.agents[2].displayName, '实现者')
     assert.equal(migrated.worktree.directory, 'kept-worktrees')
     const onDisk = JSON.parse(await readFile(v1Path, 'utf8'))
@@ -150,7 +151,7 @@ test('T01 settings store seeds, persists, recovers corruption, keeps old file on
           revision: 4,
           agents: [
             { id: 'codex', displayName: 'codex', role: 'brain', executor: 'team', model: '', description: 'b' },
-            { id: 'gpt', displayName: 'architect', role: 'architect', executor: 'team', model: '', description: 'a' },
+            { id: 'gpt', displayName: 'architect', role: 'tester', executor: 'team', model: '', description: 'a' },
             { id: 'zcode', displayName: '后端', role: 'worker', executor: 'team', model: '', description: 'w' },
             { id: 'qoder', displayName: 'qoder', role: 'worker', executor: 'team', model: '', description: 'w2' },
           ],
@@ -469,7 +470,7 @@ test('T03 dispatch reads fresh settings and routes external/local/team executors
           revision: 1,
           agents: [
             { id: 'codex', displayName: 'codex', role: 'brain', executor: 'external', model: 'mock-ext', description: 'b' },
-            { id: 'gpt', displayName: 'gpt', role: 'architect', executor: 'team', model: '', description: 'a' },
+            { id: 'gpt', displayName: 'gpt', role: 'tester', executor: 'team', model: '', description: 'a' },
             { id: 'zcode', displayName: 'zcode', role: 'worker', executor: 'local', model: 'p/m1', description: 'w' },
             { id: 'qoder', displayName: 'qoder', role: 'worker', executor: 'team', model: '', description: 'w2' },
           ],
@@ -522,7 +523,7 @@ test('T03 dispatch reads fresh settings and routes external/local/team executors
     )
     assert.match(startOutput, /任务 .+ 已创建/)
     assert.match(startOutput, /原地开发/)
-    assert.match(startOutput, /没有 architect 参与/)
+    assert.match(startOutput, /没有 tester 参与/)
     assert.match(startOutput, /squad_approve_plan/)
     const firstTaskId = /任务 (t-\S+) 已创建/.exec(startOutput)[1]
     const firstDir = join(workspace, '.agent-squad', firstTaskId)
@@ -1021,7 +1022,7 @@ test('T04 validation rejects invalid rosters with field paths and HTTP refuses n
     description: '',
     ...patch,
   })
-  const architect = validAgent('gpt', { role: 'architect' })
+  const architect = validAgent('gpt', { role: 'tester' })
   const opencode = validAgent('opencode')
   const four = (codex, zcode, qoder) => [codex, architect, zcode, qoder, opencode]
   const valid = (agents, worktree = { directory: '.agents/worktrees' }) =>
@@ -1029,8 +1030,8 @@ test('T04 validation rejects invalid rosters with field paths and HTTP refuses n
 
   assert.equal(valid(four(validAgent('codex', { role: 'brain' }), validAgent('zcode'), validAgent('qoder'))).ok, true)
   assert.equal(valid(four(validAgent('codex', { role: 'brain' }), validAgent('zcode'), validAgent('qoder'))).ok, true)
-  assert.equal(valid([validAgent('codex', { role: 'brain' }), validAgent('gpt', { role: 'architect', executor: 'local', model: 'openai/gpt-6.2-sol', reasoning: 'xhigh' }), validAgent('zcode'), validAgent('qoder'), opencode]).ok, true)
-  assert.equal(valid(four(validAgent('codex', { role: 'brain' }), validAgent('zcode'), validAgent('qoder', { role: 'architect' }))).ok, true)
+  assert.equal(valid([validAgent('codex', { role: 'brain' }), validAgent('gpt', { role: 'tester', executor: 'local', model: 'openai/gpt-6.2-sol', reasoning: 'xhigh' }), validAgent('zcode'), validAgent('qoder'), opencode]).ok, true)
+  assert.equal(valid(four(validAgent('codex', { role: 'brain' }), validAgent('zcode'), validAgent('qoder', { role: 'tester' }))).ok, true)
 
   const cases = [
     {
@@ -1580,7 +1581,7 @@ test('T07 plan gate: lead review, design budget, squad_approve_plan, archives an
           revision: 1,
           agents: [
             { id: 'codex', displayName: 'codex', role: 'brain', executor: 'external', model: 'mock-ext', description: 'b' },
-            { id: 'gpt', displayName: 'gpt', role: 'architect', executor: 'team', model: '', description: 'a' },
+            { id: 'gpt', displayName: 'gpt', role: 'tester', executor: 'team', model: '', description: 'a' },
             { id: 'zcode', displayName: 'zcode', role: 'worker', executor: 'local', model: 'p/m1', description: 'w' },
             { id: 'qoder', displayName: 'qoder', role: 'worker', executor: 'team', model: '', description: 'w2' },
           ],
@@ -1912,7 +1913,7 @@ test('T07 plan gate: lead review, design budget, squad_approve_plan, archives an
     assert.match(clientSource, /flowPlanLoop/)
     assert.match(clientSource, /flowApprove/)
     assert.match(clientSource, /settings\.section/)
-    assert.match(clientSource, /roleArchitect/)
+    assert.match(clientSource, /roleTester/)
     // The settings page exposes the per-agent reasoning effort for pinned
     // provider/model executors (local + one-shot external).
     assert.match(clientSource, /asq-\$\{agent\.id\}-reasoning/)
@@ -1923,10 +1924,10 @@ test('T07 plan gate: lead review, design budget, squad_approve_plan, archives an
     // --- PLAN §6: verbatim S/E/M and charter items in the changed sections ---
     const brainSeg = indexSource.slice(
       indexSource.indexOf('const BRAIN_CHARTER ='),
-      indexSource.indexOf('const ARCHITECT_CHARTER ='),
+      indexSource.indexOf('const TESTER_CHARTER ='),
     )
-    const architectSeg = indexSource.slice(
-      indexSource.indexOf('const ARCHITECT_CHARTER ='),
+    const testerSeg = indexSource.slice(
+      indexSource.indexOf('const TESTER_CHARTER ='),
       indexSource.indexOf('const WORKER_CHARTER ='),
     )
     const workerSeg = indexSource.slice(
@@ -1938,7 +1939,7 @@ test('T07 plan gate: lead review, design budget, squad_approve_plan, archives an
       indexSource.indexOf('const DEFAULT_AGENTS ='),
     )
     for (const item of BRAIN_ITEMS) assert.ok(brainSeg.includes(item), `BRAIN missing: ${item}`)
-    for (const item of ARCHITECT_ITEMS) assert.ok(architectSeg.includes(item), `ARCHITECT missing: ${item}`)
+    for (const item of TESTER_ITEMS) assert.ok(testerSeg.includes(item), `TESTER missing: ${item}`)
     for (const item of WORKER_ITEMS) assert.ok(workerSeg.includes(item), `WORKER missing: ${item}`)
     // §4 step 3: the Lead reviews the business plan as a context-free
     // architect; step 4 approves; step 5 dispatches the spec round.
@@ -1953,10 +1954,10 @@ test('T07 plan gate: lead review, design budget, squad_approve_plan, archives an
       'LEAD step 4 sentence missing',
     )
     assert.ok(
-      leadSeg.includes('5. 派 architect（gpt），phase="spec"：读取 PLAN-APPROVED.md，发布技术规格 SPEC.md'),
+      leadSeg.includes('5. 派 brain（codex），phase="spec"：读取 PLAN-APPROVED.md，发布技术规格 SPEC.md'),
       'LEAD step 5 sentence missing',
     )
-    for (const item of [...BRAIN_ITEMS, ...ARCHITECT_ITEMS, S_TEXT, E_TEXT, M_TEXT]) {
+    for (const item of [...BRAIN_ITEMS, ...TESTER_ITEMS, S_TEXT, E_TEXT, M_TEXT]) {
       assert.ok(readme.includes(item), `README missing: ${item}`)
     }
     assert.ok(readme.includes(WORKER_ITEMS[1]), 'README missing worker no-introduce item')
@@ -2434,7 +2435,7 @@ async function writeSquadSettings(dshHome, qoderExecutor) {
         revision: 1,
         agents: [
           { id: 'codex', displayName: 'codex', role: 'brain', executor: 'external', model: 'mock-ext', description: 'b' },
-          { id: 'gpt', displayName: 'gpt', role: 'architect', executor: 'team', model: '', description: 'a' },
+          { id: 'gpt', displayName: 'gpt', role: 'tester', executor: 'team', model: '', description: 'a' },
           { id: 'zcode', displayName: 'zcode', role: 'worker', executor: 'local', model: 'p/m1', description: 'w' },
           {
             id: 'qoder',
@@ -3513,7 +3514,7 @@ test('T10 budget extension requires user confirmation and resumes exhausted budg
           revision: 1,
           agents: [
             { id: 'codex', displayName: 'codex', role: 'brain', executor: 'external', model: 'mock-ext', description: 'b' },
-            { id: 'gpt', displayName: 'gpt', role: 'architect', executor: 'team', model: '', description: 'a' },
+            { id: 'gpt', displayName: 'gpt', role: 'tester', executor: 'team', model: '', description: 'a' },
             { id: 'zcode', displayName: 'zcode', role: 'worker', executor: 'local', model: 'p/m1', description: 'w' },
             { id: 'qoder', displayName: 'qoder', role: 'worker', executor: 'team', model: '', description: 'w2' },
           ],
@@ -4068,7 +4069,7 @@ test('T10 budget extension requires user confirmation and resumes exhausted budg
       await noSide(
         task,
         () => design('late'),
-        `任务 ${task} 的 PLAN 已批准（${state.planApprovedAt}）：不能再派 design 返工，请派 architect 发布技术规格（phase="spec"）。`,
+        `任务 ${task} 的 PLAN 已批准（${state.planApprovedAt}）：不能再派 design 返工，请派 brain（codex）发布技术规格（phase="spec"）。`,
       )
     })
 
@@ -4247,7 +4248,7 @@ test('T11 full flow: opt-in gate, spec/tech-review pipeline, dual acceptance, ta
           revision: 1,
           agents: [
             { id: 'codex', displayName: 'codex', role: 'brain', executor: 'external', model: 'mock-ext', description: 'b' },
-            { id: 'gpt', displayName: 'gpt', role: 'architect', executor: 'local', model: 'p/arch', description: 'a' },
+            { id: 'gpt', displayName: 'gpt', role: 'tester', executor: 'local', model: 'p/arch', description: 'a' },
             { id: 'zcode', displayName: 'zcode', role: 'worker', executor: 'local', model: 'p/m1', description: 'w' },
             { id: 'qoder', displayName: 'qoder', role: 'worker', executor: 'team', model: '', description: 'w2' },
           ],
@@ -4300,13 +4301,20 @@ test('T11 full flow: opt-in gate, spec/tech-review pipeline, dual acceptance, ta
       const { createSettingsStore, DEFAULT_AGENTS } = await import('../settings.js')
       const fresh = createSettingsStore({ filePath: join(dshHome, 'seed-probe', 'settings.json') })
       const seeded = await fresh.read()
-      assert.equal(seeded.agents.find((agent) => agent.id === 'gpt').role, 'architect')
+      assert.equal(seeded.agents.find((agent) => agent.id === 'gpt').role, 'tester')
       assert.equal(seeded.agents.find((agent) => agent.id === 'gpt').model, DEFAULT_AGENTS.find((agent) => agent.id === 'gpt').model)
       const qoder = seeded.agents.find((agent) => agent.id === 'qoder')
       assert.equal(qoder.role, 'worker')
-      assert.match(qoder.description, /主责前端产品代码开发与自测，兼做后端代码开发/)
+      assert.match(qoder.description, /固定负责前端页面交互设计、实现与自测，不做后端/)
       const zcode = seeded.agents.find((agent) => agent.id === 'zcode')
-      assert.match(zcode.description, /后端代码并自测/)
+      assert.match(zcode.description, /主力后端 worker/)
+      // Worker is fixed to the three worker-role members; architect opts out.
+      for (const id of ['codex', 'gpt']) {
+        assert.equal(seeded.agents.find((agent) => agent.id === id).worker, false)
+      }
+      for (const id of ['zcode', 'qoder', 'opencode']) {
+        assert.equal(seeded.agents.find((agent) => agent.id === id).worker, true)
+      }
     }
 
     // --- task F: the full pipeline ------------------------------------------
@@ -4316,34 +4324,35 @@ test('T11 full flow: opt-in gate, spec/tech-review pipeline, dual acceptance, ta
     {
       const state = await readState(taskF)
       assert.equal(state.flow, 'full')
-      assert.equal(state.specRequired, true) // architect participates
+      assert.equal(state.specRequired, true) // tester participates
       assert.equal(state.specPublished, false)
       assert.equal(state.specVersion, 0)
       assert.equal(state.codeEpoch, 0)
       assert.deepEqual(state.implementers, [])
       assert.equal(state.techReworkLimit, 3)
       assert.equal(state.businessReworkLimit, 3)
-      assert.match(startF, /full（业务方案 → 技术规格 → 实现 → 技术验收 → 业务验收）/)
+      assert.match(startF, /full（业务方案 → 技术规格 → 实现 → 测试验收 → 技术验收 → 业务验收）/)
     }
 
     // design → PLAN.md (external), spec gated until the Lead approves.
     await dispatch({ agent: 'codex', message: 'plan', phase: 'design' })
     await assert.rejects(
-      dispatch({ agent: 'gpt', message: 'early spec', phase: 'spec' }),
+      dispatch({ agent: 'codex', message: 'early spec', phase: 'spec' }),
       /业务方案（PLAN\.md）尚未经 Lead 审核批准/,
     )
     await tool('squad_approve_plan').execute({ task_id: taskF }, exec)
 
-    // spec: only the architect role; wrong roles refused with no side effects
+    // spec: only the brain role; wrong roles refused with no side effects
     // (the design-round BRIEF stays byte-identical through the refusal).
     const briefAfterDesign = await readFile(join(dirF, 'BRIEF.md'), 'utf8')
     assert.match(briefAfterDesign, /phase=design/)
-    await assert.rejects(dispatch({ agent: 'zcode', message: 's', phase: 'spec' }), /spec 阶段只能派 architect 角色；zcode 当前是 worker。/)
+    await assert.rejects(dispatch({ agent: 'zcode', message: 's', phase: 'spec' }), /spec 阶段只能派 brain（codex）——技术设计与技术规格由 brain 负责；zcode 当前是 worker。/)
+    await assert.rejects(dispatch({ agent: 'gpt', message: 's', phase: 'spec' }), /spec 阶段只能派 brain（codex）——技术设计与技术规格由 brain 负责；gpt 当前是 tester。/)
     assert.equal(await readFile(join(dirF, 'BRIEF.md'), 'utf8'), briefAfterDesign)
-    // gpt is a pinned local child: first spec spawn carries the model options.
-    const specOut = await dispatch({ agent: 'gpt', message: 'write SPEC', phase: 'spec' })
-    assert.match(specOut, /已创建本地子代理 gpt \[architect\] model=p\/arch/)
-    assert.deepEqual(host.activations.at(-1).agentOptions, { provider: 'p', model: 'arch' })
+    // codex (external mock) publishes the spec; the file exists for archiving.
+    await writeFile(join(dirF, 'SPEC.md'), '# SPEC F\n', 'utf8')
+    const specOut = await dispatch({ agent: 'codex', message: 'write SPEC', phase: 'spec' })
+    assert.match(specOut, /\[brain\] provider=mock-ext/)
     assert.match(specOut, /specVersion=1/)
     assert.match(specOut, /不需要 Lead 再审批/)
     assert.equal((await readState(taskF)).specPublished, true)
@@ -4357,17 +4366,28 @@ test('T11 full flow: opt-in gate, spec/tech-review pipeline, dual acceptance, ta
     await tool('squad_approve_plan').execute({ task_id: taskG }, exec)
     await assert.rejects(
       dispatch({ agent: 'zcode', message: 'too early', phase: 'implement' }),
-      /技术规格尚未交付：先派 architect（gpt）phase="spec" 发布 SPEC\.md，再派 implement；规格发布后即可派工，不需要 Lead 再审批。/,
+      /技术规格尚未交付：先派 brain（codex）phase="spec" 发布 SPEC\.md，再派 implement；规格发布后即可派工，不需要 Lead 再审批。/,
     )
-    await dispatch({ agent: 'gpt', message: 'spec G', phase: 'spec' })
+    await writeFile(join(dirG, 'SPEC.md'), '# SPEC G\n', 'utf8')
+    await dispatch({ agent: 'codex', message: 'spec G', phase: 'spec' })
     await dispatch({ agent: 'zcode', message: 'impl', phase: 'implement' })
     let stateG = await readState(taskG)
     assert.equal(stateG.codeEpoch, 1)
     assert.deepEqual(stateG.implementers, ['zcode'])
 
-    // tech-review: needs implementation; only architect/brain; workers refused.
+    // test-review gates tech-review: a missing/stale TEST-REVIEW refuses it.
+    await assert.rejects(dispatch({ agent: 'codex', message: 'tr', phase: 'tech-review' }), /测试验收未通过或已失效：技术验收前必须先有仍然新鲜的测试验收（TEST-REVIEW\.md 以 VERDICT: APPROVED 结束，且验收后代码\/规格未再变动）。先派 gpt phase="test-review"。/)
+    await assert.rejects(dispatch({ agent: 'zcode', message: 'tstr', phase: 'test-review' }), /test-review 只能派 tester（gpt）；zcode 当前是 worker。/)
+    // gpt is a pinned local child: the first test-review spawn carries the model options.
+    await writeVerdict(taskG, 'TEST-REVIEW.md', 'APPROVED')
+    const testOut = await dispatch({ agent: 'gpt', message: 'review tests', phase: 'test-review' })
+    assert.match(testOut, /已创建本地子代理 gpt \[tester\] model=p\/arch/)
+    assert.deepEqual(host.activations.at(-1).agentOptions, { provider: 'p', model: 'arch' })
+    assert.match(testOut, /testReview: codeEpoch=1 specVersion=1/)
+    assert.ok(await stat(join(dirG, 'TEST-REVIEW-R1.md')))
+    // tech-review: needs implementation; default brain; workers refused.
     await writeVerdict(taskG, 'TECH-REVIEW.md', 'APPROVED')
-    await assert.rejects(dispatch({ agent: 'zcode', message: 'tr', phase: 'tech-review' }), /tech-review 只能派 architect（gpt），或由 brain（codex）在架构师接手实现后代签；zcode 当前是 worker。/)
+    await assert.rejects(dispatch({ agent: 'zcode', message: 'tr', phase: 'tech-review' }), /tech-review 默认派 brain（codex）；brain 已在本任务写代码时改派 tester（gpt）代签；zcode 当前是 worker（已在本任务写代码，不能签署自己改动的技术验收）。/)
     // business review: refused until a FRESH technical approval exists.
     await assert.rejects(dispatch({ agent: 'codex', message: 'br', phase: 'review' }), /技术验收未通过或已失效.*先派 tech-review。/s)
     // qoder is a worker: the full-flow business review is brain-only.
@@ -4376,8 +4396,10 @@ test('T11 full flow: opt-in gate, spec/tech-review pipeline, dual acceptance, ta
     // --- task F continues: tech failure → rework → fresh gates --------------
     // (current.json now points at G, so every F dispatch passes task_id.)
     await dispatch({ agent: 'zcode', message: 'impl F', phase: 'implement', task_id: taskF })
+    await writeVerdict(taskF, 'TEST-REVIEW.md', 'APPROVED')
+    await dispatch({ agent: 'gpt', message: 'test 1', phase: 'test-review', task_id: taskF })
     await writeVerdict(taskF, 'TECH-REVIEW.md', 'CHANGES_REQUESTED')
-    await dispatch({ agent: 'gpt', message: 'tech 1', phase: 'tech-review', task_id: taskF })
+    await dispatch({ agent: 'codex', message: 'tech 1', phase: 'tech-review', task_id: taskF })
     let stateF = await readState(taskF)
     assert.equal(stateF.lastTechVerdict, 'CHANGES_REQUESTED')
     assert.equal(stateF.techReview.codeEpoch, stateF.codeEpoch)
@@ -4396,8 +4418,10 @@ test('T11 full flow: opt-in gate, spec/tech-review pipeline, dual acceptance, ta
     // no pending failing acceptance → rework refused.
     await assert.rejects(dispatch({ agent: 'zcode', message: 'nothing', phase: 'rework', task_id: taskF }), /没有待返工的验收结论/)
     // fresh tech approval → business review records its own binding.
+    await writeVerdict(taskF, 'TEST-REVIEW.md', 'APPROVED')
+    await dispatch({ agent: 'gpt', message: 'test 2', phase: 'test-review', task_id: taskF })
     await writeVerdict(taskF, 'TECH-REVIEW.md', 'APPROVED')
-    await dispatch({ agent: 'gpt', message: 'tech 2', phase: 'tech-review', task_id: taskF })
+    await dispatch({ agent: 'codex', message: 'tech 2', phase: 'tech-review', task_id: taskF })
     await writeVerdict(taskF, 'REVIEW.md', 'CHANGES_REQUESTED')
     await dispatch({ agent: 'codex', message: 'business 1', phase: 'review', task_id: taskF })
     stateF = await readState(taskF)
@@ -4413,11 +4437,13 @@ test('T11 full flow: opt-in gate, spec/tech-review pipeline, dual acceptance, ta
     // business rework changed code → tech stale again → finish refused.
     await writeVerdict(taskF, 'REVIEW.md', 'APPROVED')
     await assert.rejects(tool('squad_finish').execute({ summary: 'no', task_id: taskF }, exec), /技术验收结论已失效/)
+    await writeVerdict(taskF, 'TEST-REVIEW.md', 'APPROVED')
+    await dispatch({ agent: 'gpt', message: 'test 3', phase: 'test-review', task_id: taskF })
     await writeVerdict(taskF, 'TECH-REVIEW.md', 'APPROVED')
-    await dispatch({ agent: 'gpt', message: 'tech 3', phase: 'tech-review', task_id: taskF })
+    await dispatch({ agent: 'codex', message: 'tech 3', phase: 'tech-review', task_id: taskF })
     await dispatch({ agent: 'codex', message: 'business 2', phase: 'review', task_id: taskF })
     stateF = await readState(taskF)
-    assert.equal(stateF.techReview.reviewer, 'gpt')
+    assert.equal(stateF.techReview.reviewer, 'codex')
     assert.equal(stateF.businessReview.reviewer, 'codex')
     assert.equal(stateF.techReview.codeEpoch, stateF.codeEpoch)
     assert.equal(stateF.businessReview.codeEpoch, stateF.codeEpoch)
@@ -4430,17 +4456,38 @@ test('T11 full flow: opt-in gate, spec/tech-review pipeline, dual acceptance, ta
     const taskH = /任务 (t-\S+) 已创建/.exec(startH)[1]
     await dispatch({ agent: 'codex', message: 'plan H', phase: 'design' })
     await tool('squad_approve_plan').execute({ task_id: taskH }, exec)
-    await dispatch({ agent: 'gpt', message: 'spec H', phase: 'spec' })
-    // The architect may take over implementation directly.
+    const dirH = join(workspace, '.agent-squad', taskH)
+    await writeFile(join(dirH, 'SPEC.md'), '# SPEC H\n', 'utf8')
+    await dispatch({ agent: 'codex', message: 'spec H', phase: 'spec' })
+    // The tester no longer implements by default (worker is fixed to
+    // zcode/opencode/qoder): the takeover first refuses, then succeeds after
+    // an explicit worker opt-in.
+    await assert.rejects(
+      dispatch({ agent: 'gpt', message: 'gpt implements', phase: 'implement' }),
+      /完整流程的 implement 需要 worker 能力：gpt（tester）的 worker 能力未启用/,
+    )
+    {
+      const { createSettingsStore } = await import('../settings.js')
+      const takeoverStore = createSettingsStore({ filePath: settingsPath })
+      const snap = await takeoverStore.read()
+      await takeoverStore.save({
+        expectedRevision: snap.revision,
+        agents: snap.agents.map((agent) => (agent.id === 'gpt' ? { ...agent, worker: true } : agent)),
+        worktree: snap.worktree,
+        leaderWorker: snap.leaderWorker ?? false,
+      })
+    }
     await dispatch({ agent: 'gpt', message: 'gpt implements', phase: 'implement' })
     stateG = await readState(taskH)
     assert.deepEqual(stateG.implementers, ['gpt'])
     assert.equal(stateG.codeEpoch, 1)
-    // Self-sign ban: gpt cannot sign its own technical acceptance.
+    // Self-sign ban: gpt (implemented) cannot sign the technical acceptance.
+    await writeVerdict(taskH, 'TEST-REVIEW.md', 'APPROVED')
+    await dispatch({ agent: 'gpt', message: 'test H', phase: 'test-review' })
     await writeVerdict(taskH, 'TECH-REVIEW.md', 'APPROVED')
     await assert.rejects(
       dispatch({ agent: 'gpt', message: 'self sign', phase: 'tech-review' }),
-      /gpt 已在本任务中写代码，不能签署自己改动的技术验收：改派 brain（codex）对照 SPEC\.md 独立代签技术验收，业务验收仍由 codex 按业务方案单独签署，两份验收独立记录。/,
+      /tech-review 默认派 brain（codex）；brain 已在本任务写代码时改派 tester（gpt）代签；gpt 当前是 tester（已在本任务写代码，不能签署自己改动的技术验收）。/,
     )
     // codex signs BOTH acceptances as two independent records.
     await dispatch({ agent: 'codex', message: 'tech on behalf', phase: 'tech-review' })
@@ -4463,17 +4510,23 @@ test('T11 full flow: opt-in gate, spec/tech-review pipeline, dual acceptance, ta
     const taskQ = /任务 (t-\S+) 已创建/.exec(startQ)[1]
     await dispatch({ agent: 'codex', message: 'plan Q', phase: 'design' })
     await tool('squad_approve_plan').execute({ task_id: taskQ }, exec)
-    await dispatch({ agent: 'gpt', message: 'spec Q', phase: 'spec' })
+    const dirQ = join(workspace, '.agent-squad', taskQ)
+    await writeFile(join(dirQ, 'SPEC.md'), '# SPEC Q\n', 'utf8')
+    await dispatch({ agent: 'codex', message: 'spec Q', phase: 'spec' })
     await dispatch({ agent: 'zcode', message: 'impl Q', phase: 'implement' })
     for (let round = 1; round <= 3; round += 1) {
+      await writeVerdict(taskQ, 'TEST-REVIEW.md', 'APPROVED')
+      await dispatch({ agent: 'gpt', message: `test ${round}`, phase: 'test-review' })
       await writeVerdict(taskQ, 'TECH-REVIEW.md', 'CHANGES_REQUESTED')
-      await dispatch({ agent: 'gpt', message: `tech ${round}`, phase: 'tech-review' })
+      await dispatch({ agent: 'codex', message: `tech ${round}`, phase: 'tech-review' })
       const worker = round === 2 ? 'qoder' : 'zcode' // quota shared across workers
       await dispatch({ agent: worker, message: `fix ${round}`, phase: 'rework' })
       assert.equal((await readState(taskQ)).techReworkRounds, round)
     }
+    await writeVerdict(taskQ, 'TEST-REVIEW.md', 'APPROVED')
+    await dispatch({ agent: 'gpt', message: 'test 4', phase: 'test-review' })
     await writeVerdict(taskQ, 'TECH-REVIEW.md', 'CHANGES_REQUESTED')
-    await dispatch({ agent: 'gpt', message: 'tech 4', phase: 'tech-review' })
+    await dispatch({ agent: 'codex', message: 'tech 4', phase: 'tech-review' })
     const briefBefore = await readFile(join(dirG, 'BRIEF.md'), 'utf8').catch(() => undefined)
     await assert.rejects(
       dispatch({ agent: 'zcode', message: '4th rework', phase: 'rework' }),
@@ -4524,12 +4577,12 @@ test('T11 full flow: opt-in gate, spec/tech-review pipeline, dual acceptance, ta
 })
 
 /** T12 — architect failover: quota auto-suspend, brain handover, recovery, persistence. */
-test('T12 failover suspends a quota-exhausted architect and hands its duties to the brain', async () => {
+test('T12 failover suspends a quota-exhausted tester and hands its duties to the brain', async () => {
   const workspace = await tempRoot()
   const dshHome = await tempRoot()
   process.env.DSH_HOME = dshHome
   try {
-    // All-team roster: codex brain, gpt architect, zcode worker.
+    // All-team roster: codex brain, gpt tester, zcode worker.
     const settingsPath = join(dshHome, 'agent-squad', 'settings.json')
     await mkdir(join(dshHome, 'agent-squad'), { recursive: true })
     await writeFile(
@@ -4540,7 +4593,7 @@ test('T12 failover suspends a quota-exhausted architect and hands its duties to 
           revision: 1,
           agents: [
             { id: 'codex', displayName: 'codex', role: 'brain', executor: 'team', model: '', description: 'b' },
-            { id: 'gpt', displayName: 'gpt', role: 'architect', executor: 'team', model: '', description: 'a' },
+            { id: 'gpt', displayName: 'gpt', role: 'tester', executor: 'team', model: '', description: 'a' },
             { id: 'zcode', displayName: 'zcode', role: 'worker', executor: 'team', model: '', description: 'w' },
             { id: 'qoder', displayName: 'qoder', role: 'worker', executor: 'team', model: '', description: 'w2' },
           ],
@@ -4565,6 +4618,8 @@ test('T12 failover suspends a quota-exhausted architect and hands its duties to 
       const out = await tool('squad_start').execute({ goal, acceptance: 'ok', agents }, exec)
       return /任务 (t-\S+) 已创建/.exec(out)[1]
     }
+    const writeVerdict = async (task, file, verdict) =>
+      writeFile(join(workspace, '.agent-squad', task, file), `# ${file}\n\n结论如上。\n\nVERDICT: ${verdict}\n`, 'utf8')
 
     // --- task F: manual suspension, handover gates, recovery ----------------
     const taskF = await startTask('F', ['codex', 'gpt', 'zcode'])
@@ -4573,53 +4628,57 @@ test('T12 failover suspends a quota-exhausted architect and hands its duties to 
     await writeFile(join(dirF, 'PLAN.md'), '# PLAN F\n', 'utf8')
     await tool('squad_approve_plan').execute({ task_id: taskF }, exec)
 
-    // Before suspension the brain cannot take the spec round.
-    await assert.rejects(dispatch({ agent: 'codex', message: 's', phase: 'spec' }), /spec 阶段只能派 architect 角色；codex 当前是 brain。/)
-    // Failover tool validation: reason required; only architects.
+    // The technical spec is the brain's own duty; the tester is refused.
+    await assert.rejects(dispatch({ agent: 'gpt', message: 's', phase: 'spec' }), /spec 阶段只能派 brain（codex）——技术设计与技术规格由 brain 负责；gpt 当前是 tester。/)
+    const specOut = await dispatch({ agent: 'codex', message: 'write spec', phase: 'spec' })
+    assert.match(specOut, /已(创建|续跑) codex \[brain\]/)
+    assert.ok(!/代行/.test(specOut), 'the brain spec round is its own duty, no acting marker')
+    const stateSpec = JSON.parse(await readFile(join(dirF, 'STATE.json'), 'utf8'))
+    assert.equal(stateSpec.specPublished, true)
+    assert.equal(stateSpec.specVersion, 1)
+    // Failover tool validation: reason required; only testers.
     await assert.rejects(failover({ agent: 'gpt' }), /reason 必须是非空字符串/)
-    await assert.rejects(failover({ agent: 'zcode', reason: 'x' }), /仅架构师支持挂起交接.*zcode 当前是 worker/)
+    await assert.rejects(failover({ agent: 'zcode', reason: 'x' }), /仅测试验收者（tester）支持挂起交接（brain 代行测试验收）；zcode 当前是 worker/)
     // Manual suspension persists and shows in status.
     const suspendOut = await failover({ agent: 'gpt', reason: '额度耗尽（手动验证）' })
-    assert.match(suspendOut, /架构师 gpt 已挂起/)
-    assert.match(suspendOut, /squad_dispatch\({ agent: "codex", phase: "spec" \| "tech-review", … }\)/)
+    assert.match(suspendOut, /测试验收者 gpt 已挂起/)
+    assert.match(suspendOut, /squad_dispatch\({ agent: "codex", phase: "test-review", … }\)/)
     assert.deepEqual(
       Object.keys(JSON.parse(await readFile(failoverPath, 'utf8')).suspended),
       ['gpt'],
     )
     await assert.rejects(failover({ agent: 'gpt', reason: 'again' }), /已处于挂起状态/)
     const statusSuspended = await tool('squad_status').execute({}, exec)
-    assert.match(statusSuspended, /挂起：gpt（自 .+；手动；原因：额度耗尽（手动验证））→ 架构师职责由 brain 代行/)
-    // Suspended architect refuses dispatch with handover guidance.
+    assert.match(statusSuspended, /挂起：gpt（自 .+；手动；原因：额度耗尽（手动验证））→ 测试验收职责由 brain 代行/)
+    // Suspended tester refuses dispatch with handover guidance.
     await assert.rejects(
-      dispatch({ agent: 'gpt', message: 'spec', phase: 'spec' }),
-      /gpt 已挂起.*架构师职责由 brain 代行：squad_dispatch\({ agent: "codex", phase: "spec" \| "tech-review", … }\).*squad_failover\({ agent: "gpt", recover: true }\)/s,
+      dispatch({ agent: 'gpt', message: 'tests', phase: 'test-review' }),
+      /gpt 已挂起.*测试验收职责由 brain 代行：squad_dispatch\({ agent: "codex", phase: "test-review", … }\).*squad_failover\({ agent: "gpt", recover: true }\)/s,
     )
-    // The brain now covers the spec round (acting architect); the dispatch
-    // return itself carries the acting marker for auditability.
-    const specOut = await dispatch({ agent: 'codex', message: 'write spec', phase: 'spec' })
-    assert.match(specOut, /已(创建|续跑) codex \[brain\]/)
-    assert.match(specOut, /（代行架构师职责：架构师挂起，交付 SPEC\.md \/ TECH-REVIEW\.md）/)
-    const specPrompt = host.spawned.at(-1).prompt.map((block) => block.text).join('')
-    assert.match(specPrompt, /代行架构师职责/)
-    assert.match(specPrompt, /SPEC\.md/)
-    const stateF = JSON.parse(await readFile(join(dirF, 'STATE.json'), 'utf8'))
-    assert.equal(stateF.specPublished, true)
-    assert.equal(stateF.specVersion, 1)
-    // tech-review to the brain stays allowed; implement first (codeEpoch).
+    // The brain covers test acceptance while the tester is suspended; the
+    // dispatch return itself carries the acting marker for auditability.
     await dispatch({ agent: 'zcode', message: 'impl', phase: 'implement' })
-    const trOut = await dispatch({ agent: 'codex', message: 'tech', phase: 'tech-review' })
+    await writeVerdict(taskF, 'TEST-REVIEW.md', 'APPROVED')
+    const trOut = await dispatch({ agent: 'codex', message: 'test', phase: 'test-review' })
     assert.match(trOut, /已续跑 codex \[brain\]/)
-    assert.match(trOut, /（代行架构师职责：架构师挂起，交付 SPEC\.md \/ TECH-REVIEW\.md）/)
+    assert.match(trOut, /（代行测试验收职责：测试者挂起，交付 TEST-REVIEW\.md）/)
+    const testPrompt = host.sent.at(-1).content.map((block) => block.text).join('')
+    assert.match(testPrompt, /代行测试验收职责/)
+    assert.match(testPrompt, /TEST-REVIEW\.md/)
+    // tech-review stays the brain's own duty (no acting marker).
+    await writeVerdict(taskF, 'TECH-REVIEW.md', 'APPROVED')
+    const techOut = await dispatch({ agent: 'codex', message: 'tech', phase: 'tech-review' })
+    assert.ok(!/代行/.test(techOut), 'regular brain tech-review carries no acting marker')
 
-    // Recovery restores the architect and closes the acting gate.
+    // Recovery restores the tester and closes the acting gate.
     const recoverOut = await failover({ agent: 'gpt', recover: true })
     assert.match(recoverOut, /已解除挂起/)
+    assert.match(recoverOut, /test-review 重新派给它/)
     assert.deepEqual(JSON.parse(await readFile(failoverPath, 'utf8')).suspended, {})
     await assert.rejects(failover({ agent: 'gpt', recover: true }), /未挂起，无需恢复/)
-    await assert.rejects(dispatch({ agent: 'codex', message: 's', phase: 'spec' }), /spec 阶段只能派 architect 角色；codex 当前是 brain。/)
-    const gptSpecAgain = await dispatch({ agent: 'gpt', message: 'spec again', phase: 'spec' })
-    assert.match(gptSpecAgain, /已创建 gpt \[architect\]/)
-    assert.ok(!/代行架构师职责/.test(gptSpecAgain), 'regular architect dispatch carries no acting marker')
+    const gptTestAgain = await dispatch({ agent: 'gpt', message: 'test again', phase: 'test-review' })
+    assert.match(gptTestAgain, /已创建 gpt \[tester\]/)
+    assert.ok(!/代行/.test(gptTestAgain), 'regular tester dispatch carries no acting marker')
     const statusRestored = await tool('squad_status').execute({}, exec)
     assert.match(statusRestored, /挂起：无/)
 
@@ -4629,6 +4688,9 @@ test('T12 failover suspends a quota-exhausted architect and hands its duties to 
     await dispatch({ agent: 'codex', message: 'plan', phase: 'design' })
     await writeFile(join(dirG, 'PLAN.md'), '# PLAN G\n', 'utf8')
     await tool('squad_approve_plan').execute({ task_id: taskG }, exec)
+    await dispatch({ agent: 'codex', message: 'spec G', phase: 'spec' })
+    await dispatch({ agent: 'zcode', message: 'impl G', phase: 'implement' })
+    await writeVerdict(taskG, 'TEST-REVIEW.md', 'APPROVED')
     const originalStart = host.subagents.startActivation
     const originalSend = host.subagents.sendMessage
     const gptMemberId = host.members.find(
@@ -4648,10 +4710,10 @@ test('T12 failover suspends a quota-exhausted architect and hands its duties to 
     installQuotaThrow('HTTP 429 quota exceeded：账户额度耗尽')
     try {
       await assert.rejects(
-        dispatch({ agent: 'gpt', message: 'spec', phase: 'spec' }),
+        dispatch({ agent: 'gpt', message: 'tests', phase: 'test-review' }),
         (error) =>
           /额度耗尽/.test(error.message) &&
-          /gpt 已因额度问题自动挂起.*squad_dispatch\({ agent: "codex", phase: "spec", … }\).*squad_failover\({ agent: "gpt", recover: true }\)/s.test(error.message),
+          /gpt 已因额度问题自动挂起.*squad_dispatch\({ agent: "codex", phase: "test-review", … }\).*squad_failover\({ agent: "gpt", recover: true }\)/s.test(error.message),
       )
     } finally {
       host.subagents.startActivation = originalStart
@@ -4665,15 +4727,15 @@ test('T12 failover suspends a quota-exhausted architect and hands its duties to 
     await tool('squad_failover').execute({ agent: 'gpt', recover: true }, exec)
     installQuotaThrow('spawn crashed for unrelated reasons')
     try {
-      await assert.rejects(dispatch({ agent: 'gpt', message: 'spec', phase: 'spec' }), /spawn crashed/)
+      await assert.rejects(dispatch({ agent: 'gpt', message: 'tests', phase: 'test-review' }), /spawn crashed/)
       assert.equal(JSON.parse(await readFile(failoverPath, 'utf8')).suspended.gpt, undefined)
     } finally {
       host.subagents.startActivation = originalStart
       host.subagents.sendMessage = originalSend
     }
 
-    // --- auto-suspend: the architect reports blocked with a quota summary ---
-    await dispatch({ agent: 'gpt', message: 'spec', phase: 'spec' })
+    // --- auto-suspend: the tester reports blocked with a quota summary ------
+    await dispatch({ agent: 'gpt', message: 'tests', phase: 'test-review' })
     const gptAgent = [...host.agentsById.values()].find((agent) => agent.__membership?.name === 'gpt')
     assert.ok(gptAgent, 'spawned gpt member exists')
     const reportOut = await tool('squad_report').execute(
@@ -4682,7 +4744,7 @@ test('T12 failover suspends a quota-exhausted architect and hands its duties to 
     )
     assert.match(reportOut, /status=blocked/)
     assert.match(JSON.parse(await readFile(failoverPath, 'utf8')).suspended.gpt.reason, /队友报告额度耗尽/)
-    await assert.rejects(dispatch({ agent: 'gpt', message: 'again', phase: 'spec' }), /已挂起/)
+    await assert.rejects(dispatch({ agent: 'gpt', message: 'again', phase: 'test-review' }), /已挂起/)
 
     // --- persistence: a fresh plugin generation keeps the suspension --------
     {
@@ -4700,12 +4762,15 @@ test('T12 failover suspends a quota-exhausted architect and hands its duties to 
       await writeFile(join(dirP, 'PLAN.md'), '# PLAN P\n', 'utf8')
       await tool2('squad_approve_plan').execute({ task_id: taskP }, exec2)
       await assert.rejects(
-        tool2('squad_dispatch').execute({ agent: 'gpt', message: 'spec', phase: 'spec' }, exec2),
+        tool2('squad_dispatch').execute({ agent: 'gpt', message: 'tests', phase: 'test-review' }, exec2),
         /gpt 已挂起（自 2026-11-20T00:00:00.000Z；原因：重启前挂起）/,
       )
       // And the brain may act while the persisted suspension is in force.
+      await tool2('squad_dispatch').execute({ agent: 'codex', message: 'spec P', phase: 'spec' }, exec2)
+      await tool2('squad_dispatch').execute({ agent: 'zcode', message: 'impl P', phase: 'implement' }, exec2)
+      await writeFile(join(dirP, 'TEST-REVIEW.md'), 'VERDICT: APPROVED\n', 'utf8')
       assert.match(
-        await tool2('squad_dispatch').execute({ agent: 'codex', message: 'acting spec', phase: 'spec' }, exec2),
+        await tool2('squad_dispatch').execute({ agent: 'codex', message: 'acting test review', phase: 'test-review' }, exec2),
         /已(创建|续跑) codex \[brain\]/,
       )
     }
@@ -4733,7 +4798,7 @@ test('T13 background dispatch is the default for external implement and unblocks
           revision: 1,
           agents: [
             { id: 'codex', displayName: 'codex', role: 'brain', executor: 'team', model: '', description: 'b' },
-            { id: 'gpt', displayName: 'gpt', role: 'architect', executor: 'team', model: '', description: 'a' },
+            { id: 'gpt', displayName: 'gpt', role: 'tester', executor: 'team', model: '', description: 'a' },
             { id: 'zcode', displayName: 'zcode', role: 'worker', executor: 'external', model: 'mock-ext', description: 'w' },
             { id: 'qoder', displayName: 'qoder', role: 'worker', executor: 'local', model: 'p/fe', description: 'w2' },
           ],
@@ -4852,7 +4917,7 @@ test('T14 any role can act as a worker and the Lead has its own worker switch', 
           leaderWorker: false,
           agents: [
             { id: 'codex', displayName: 'codex', role: 'brain', executor: 'team', model: '', description: 'b' },
-            { id: 'gpt', displayName: 'gpt', role: 'architect', executor: 'team', model: '', description: 'a' },
+            { id: 'gpt', displayName: 'gpt', role: 'tester', executor: 'team', model: '', description: 'a' },
             { id: 'zcode', displayName: 'zcode', role: 'worker', executor: 'local', model: 'p/m1', description: 'w' },
             { id: 'qoder', displayName: 'qoder', role: 'worker', executor: 'local', model: 'p/fe', description: 'w2' },
           ],
@@ -4907,12 +4972,12 @@ test('T14 any role can act as a worker and the Lead has its own worker switch', 
     await dispatch({ agent: 'codex', message: 'plan', phase: 'design' })
     await writeFile(join(dir, 'PLAN.md'), '# PLAN W\n', 'utf8')
     await tool('squad_approve_plan').execute({ task_id: task }, exec)
-    await dispatch({ agent: 'gpt', message: 'spec', phase: 'spec' })
+    await dispatch({ agent: 'codex', message: 'spec', phase: 'spec' })
 
     // codex defaults to worker:false → implement refused with guidance.
     await assert.rejects(
       dispatch({ agent: 'codex', message: 'write code', phase: 'implement' }),
-      /完整流程的 implement 需要 worker 能力：codex（brain）的 worker 能力未启用；在设置页开启后即可作为 worker 并行实现。/,
+      /完整流程的 implement 需要 worker 能力：codex（brain）的 worker 能力未启用；worker 固定为 zcode（主力后端）\/ opencode（备份后端）\/ qoder（固定前端）/,
     )
     // Enable codex's worker capability and retry: the brain now implements.
     {
@@ -4928,13 +4993,15 @@ test('T14 any role can act as a worker and the Lead has its own worker switch', 
     let state = JSON.parse(await readFile(join(dir, 'STATE.json'), 'utf8'))
     assert.deepEqual(state.implementers, ['codex'])
     assert.equal(state.codeEpoch, 1)
-    // Independence: the implementer cannot sign its own technical acceptance.
+    // Independence: the implementer cannot sign its own technical acceptance;
+    // the tester countersigns when the brain implemented.
+    await writeFile(join(dir, 'TEST-REVIEW.md'), '# TEST\n\nVERDICT: APPROVED\n', 'utf8')
+    assert.match(await dispatch({ agent: 'gpt', message: 'test', phase: 'test-review' }), /已(创建|续跑) gpt \[tester\]/)
     await assert.rejects(
       dispatch({ agent: 'codex', message: 'self sign', phase: 'tech-review' }),
-      /codex 已在本任务中写代码，不能签署自己改动的技术验收/,
+      /codex 已在本任务中写代码，不能签署自己改动的技术验收：改派 tester（gpt）对照 SPEC\.md 代签技术验收/,
     )
-    // The architect (worker default true) still signs it.
-    assert.match(await dispatch({ agent: 'gpt', message: 'tech', phase: 'tech-review' }), /已(创建|续跑) gpt \[architect\]/)
+    assert.match(await dispatch({ agent: 'gpt', message: 'tech', phase: 'tech-review' }), /已(创建|续跑) gpt \[tester\]/)
     state = JSON.parse(await readFile(join(dir, 'STATE.json'), 'utf8'))
     assert.equal(state.techReview.reviewer, 'gpt')
 
@@ -4945,17 +5012,26 @@ test('T14 any role can act as a worker and the Lead has its own worker switch', 
     // Older rows omit `worker`; the runtime defaults worker-role agents to
     // capable (proven by the successful dispatch above).
     // The qoder-specific charter ships with the fallback defaults (a bundle
-    // that omits per-agent charters dispatches the generic worker charter).
+    // that omits per-agent charters dispatches the generic worker charter);
+    // qoder is fixed frontend and hands backend work to zcode/opencode.
     const indexForQoder = await readFile(new URL('../index.js', import.meta.url), 'utf8')
-    assert.match(indexForQoder, /兼职后端：可承担后端代码（接口\/脚本\/数据层）的实现与测试；前端资源竞争时前端优先。/)
+    assert.match(indexForQoder, /固定前端：负责前端页面的交互设计、实现与自测/)
+    assert.match(indexForQoder, /不承担后端代码（接口\/脚本\/数据层）的实现/)
 
-    // --- policy / UI wiring carries the new switches -----------------------
+    // --- policy / UI wiring: backend keeps the flags, page hides the toggles --
     const indexSource = await readFile(new URL('../index.js', import.meta.url), 'utf8')
     const clientSource = await readFile(new URL('../client.js', import.meta.url), 'utf8')
     assert.match(indexSource, /leaderWorker/)
-    assert.match(indexSource, /任何开启了 worker 能力的角色（含 codex\/gpt/)
-    assert.match(clientSource, /leaderWorker/)
-    assert.match(clientSource, /fieldWorker/)
+    assert.match(indexSource, /worker 固定为 zcode \/ opencode \/ qoder 三名/)
+    assert.match(indexSource, /优先派 zcode/)
+    assert.match(indexSource, /备份 opencode/)
+    // The settings page no longer exposes the worker-capability switches; the
+    // persisted flags keep applying (all members configured worker=false).
+    assert.doesNotMatch(clientSource, /fieldWorker/)
+    assert.doesNotMatch(clientSource, /leaderWorker/)
+    // The save payload still carries the agents untouched, so a page edit
+    // cannot silently re-enable a removed toggle.
+    assert.match(clientSource, /agents: session\.draft\.agents/)
   } finally {
     delete process.env.DSH_HOME
     await rm(workspace, { recursive: true, force: true })
@@ -4979,7 +5055,7 @@ test('T15 worker availability probe suspends a quota-limited worker and substitu
           revision: 1,
           agents: [
             { id: 'codex', displayName: 'codex', role: 'brain', executor: 'team', model: '', description: 'b' },
-            { id: 'gpt', displayName: 'gpt', role: 'architect', executor: 'team', model: '', description: 'a' },
+            { id: 'gpt', displayName: 'gpt', role: 'tester', executor: 'team', model: '', description: 'a' },
             { id: 'zcode', displayName: 'zcode', role: 'worker', executor: 'external', model: 'mock-ext', description: 'w' },
             { id: 'qoder', displayName: 'qoder', role: 'worker', executor: 'external', model: 'mock-ext', description: 'w2' },
             { id: 'opencode', displayName: 'opencode', role: 'worker', executor: 'team', model: '', worker: false, description: 'w3' },
@@ -5015,7 +5091,7 @@ test('T15 worker availability probe suspends a quota-limited worker and substitu
     await dispatch({ agent: 'codex', message: 'plan', phase: 'design' })
     await writeFile(join(dir, 'PLAN.md'), '# PLAN G\n', 'utf8')
     await tool('squad_approve_plan').execute({ task_id: task }, exec)
-    await dispatch({ agent: 'gpt', message: 'spec', phase: 'spec' })
+    await dispatch({ agent: 'codex', message: 'spec', phase: 'spec' })
 
     // --- zcode probe hits the quota: report, suspend, substitute qoder ------
     const out = await dispatch({ agent: 'zcode', message: 'impl', phase: 'implement', background: false })
@@ -5127,7 +5203,7 @@ test('T16 parallel features branch from the Base branch and merge back after del
           revision: 1,
           agents: [
             { id: 'codex', displayName: 'codex', role: 'brain', executor: 'team', model: '', description: 'b' },
-            { id: 'gpt', displayName: 'gpt', role: 'architect', executor: 'team', model: '', description: 'a' },
+            { id: 'gpt', displayName: 'gpt', role: 'tester', executor: 'team', model: '', description: 'a' },
             { id: 'zcode', displayName: 'zcode', role: 'worker', executor: 'local', model: 'p/m1', description: 'w' },
             { id: 'qoder', displayName: 'qoder', role: 'worker', executor: 'local', model: 'p/fe', description: 'w2' },
           ],
@@ -5162,7 +5238,7 @@ test('T16 parallel features branch from the Base branch and merge back after del
     await dispatch({ agent: 'codex', message: 'plan', phase: 'design' })
     await writeFile(join(dir, 'PLAN.md'), '# PLAN\n', 'utf8')
     await tool('squad_approve_plan').execute({ task_id: task }, exec)
-    await dispatch({ agent: 'gpt', message: 'spec', phase: 'spec' })
+    await dispatch({ agent: 'codex', message: 'spec', phase: 'spec' })
     await dispatch({ agent: 'zcode', message: 'base impl', phase: 'implement' })
     // Common code lands in the task worktree.
     await writeFile(join(state.worktree.path, 'core.js'), 'module.exports = { core: true }\n', 'utf8')
@@ -5175,8 +5251,10 @@ test('T16 parallel features branch from the Base branch and merge back after del
     await assert.rejects(tool('squad_deliver').execute({ summary: 'base' }, exec), /TECH-REVIEW\.md/)
 
     // --- base acceptance, then deliver to Base ------------------------------
+    await writeVerdict(task, 'TEST-REVIEW.md', 'APPROVED')
+    await dispatch({ agent: 'gpt', message: 'test', phase: 'test-review' })
     await writeVerdict(task, 'TECH-REVIEW.md', 'APPROVED')
-    await dispatch({ agent: 'gpt', message: 'tech', phase: 'tech-review' })
+    await dispatch({ agent: 'codex', message: 'tech', phase: 'tech-review' })
     await writeVerdict(task, 'REVIEW.md', 'APPROVED')
     await dispatch({ agent: 'codex', message: 'review', phase: 'review' })
     const baseBefore = (await gitOut(repo, ['rev-parse', 'HEAD'])).trim()
@@ -5270,8 +5348,10 @@ test('T16 parallel features branch from the Base branch and merge back after del
     // --- final acceptance on the merged Base, then close --------------------
     state = await readState(task)
     assert.ok(state.features.every((item) => item.merged))
+    await writeVerdict(task, 'TEST-REVIEW.md', 'APPROVED')
+    await dispatch({ agent: 'gpt', message: 'final test', phase: 'test-review' })
     await writeVerdict(task, 'TECH-REVIEW.md', 'APPROVED')
-    const finalTech = await dispatch({ agent: 'gpt', message: 'final tech', phase: 'tech-review' })
+    const finalTech = await dispatch({ agent: 'codex', message: 'final tech', phase: 'tech-review' })
     assert.match(finalTech, new RegExp(`workspace=${repo.replace(/[.*+?^${}()|[\\]\\]/g, '\\$&')}`)) // reviews run on the merged Base
     await writeVerdict(task, 'REVIEW.md', 'APPROVED')
     await dispatch({ agent: 'codex', message: 'final review', phase: 'review' })
@@ -5315,7 +5395,7 @@ test('T17 status and PROGRESS.md show layered task and teammate progress', async
           revision: 1,
           agents: [
             { id: 'codex', displayName: 'codex', role: 'brain', executor: 'team', model: '', description: 'b' },
-            { id: 'gpt', displayName: 'gpt', role: 'architect', executor: 'team', model: '', description: 'a' },
+            { id: 'gpt', displayName: 'gpt', role: 'tester', executor: 'team', model: '', description: 'a' },
             { id: 'zcode', displayName: 'zcode', role: 'worker', executor: 'team', model: '', description: 'w' },
             { id: 'qoder', displayName: 'qoder', role: 'worker', executor: 'team', model: '', description: 'w2' },
           ],
@@ -5369,7 +5449,7 @@ test('T17 status and PROGRESS.md show layered task and teammate progress', async
     assert.match(status, /## 队员进度/)
 
     // Spec + implement advance the phase checklist.
-    await dispatch({ agent: 'gpt', message: 'spec', phase: 'spec' })
+    await dispatch({ agent: 'codex', message: 'spec', phase: 'spec' })
     assert.match(await readProgress(), /✓ 技术规格：v1（SPEC\.md）/)
     await dispatch({ agent: 'zcode', message: 'impl', phase: 'implement' })
     assert.match(await readProgress(), /✓ 基础层实现：1 轮/)
@@ -5410,7 +5490,7 @@ test('T18 slow external phases return immediately, stay pending, then flush', as
           revision: 1,
           agents: [
             { id: 'codex', displayName: 'codex', role: 'brain', executor: 'external', model: 'mock-ext', description: 'b' },
-            { id: 'gpt', displayName: 'gpt', role: 'architect', executor: 'external', model: 'mock-ext', description: 'a' },
+            { id: 'gpt', displayName: 'gpt', role: 'tester', executor: 'external', model: 'mock-ext', description: 'a' },
             { id: 'zcode', displayName: 'zcode', role: 'worker', executor: 'external', model: 'mock-ext', description: 'w' },
             { id: 'qoder', displayName: 'qoder', role: 'worker', executor: 'external', model: 'mock-ext', description: 'w2' },
           ],
@@ -5469,7 +5549,7 @@ test('T18 slow external phases return immediately, stay pending, then flush', as
     assert.match(await tool('squad_approve_plan').execute({ task_id: task }, exec), /已批准/)
 
     // --- spec pending → deferred SPEC-V archive -----------------------------
-    assert.match(await dispatch({ agent: 'gpt', message: 'spec', phase: 'spec' }), /已后台派发 gpt/)
+    assert.match(await dispatch({ agent: 'codex', message: 'spec', phase: 'spec' }), /已后台派发 codex/)
     await delayMs(120)
     await writeFile(join(dir, 'SPEC.md'), '# SPEC\n', 'utf8')
     await tool('squad_status').execute({}, exec)
@@ -5479,8 +5559,13 @@ test('T18 slow external phases return immediately, stay pending, then flush', as
     await dispatch({ agent: 'zcode', message: 'impl', phase: 'implement' })
     await delayMs(120)
     await tool('squad_status').execute({}, exec)
+    await writeFile(join(dir, 'TEST-REVIEW.md'), '# TEST\n\nVERDICT: APPROVED\n', 'utf8')
+    assert.match(await dispatch({ agent: 'gpt', message: 'test', phase: 'test-review' }), /已后台派发 gpt/)
+    await delayMs(120)
+    await tool('squad_status').execute({}, exec)
+    assert.ok(await stat(join(dir, 'TEST-REVIEW-R1.md')))
     await writeFile(join(dir, 'TECH-REVIEW.md'), '# TECH\n\nVERDICT: APPROVED\n', 'utf8')
-    assert.match(await dispatch({ agent: 'gpt', message: 'tech', phase: 'tech-review' }), /已后台派发 gpt/)
+    assert.match(await dispatch({ agent: 'codex', message: 'tech', phase: 'tech-review' }), /已后台派发 codex/)
     // finish is blocked while the review is still in flight (the generic
     // running-child guard fires first, the pending gate covers the rest).
     await assert.rejects(
@@ -5526,7 +5611,7 @@ test('T19 two active tasks keep separate state, teammates and addressing', async
           revision: 1,
           agents: [
             { id: 'codex', displayName: 'codex', role: 'brain', executor: 'team', model: '', description: 'b' },
-            { id: 'gpt', displayName: 'gpt', role: 'architect', executor: 'team', model: '', description: 'a' },
+            { id: 'gpt', displayName: 'gpt', role: 'tester', executor: 'team', model: '', description: 'a' },
             { id: 'zcode', displayName: 'zcode', role: 'worker', executor: 'team', model: '', description: 'w' },
             { id: 'qoder', displayName: 'qoder', role: 'worker', executor: 'team', model: '', description: 'w2' },
             { id: 'opencode', displayName: 'opencode', role: 'worker', executor: 'team', model: '', description: 'w3' },
@@ -5629,7 +5714,7 @@ test('T20 a second task gets its own worktree and a runtime-safe child name', as
           revision: 1,
           agents: [
             { id: 'codex', displayName: 'codex', role: 'brain', executor: 'team', model: '', description: 'b' },
-            { id: 'gpt', displayName: 'gpt', role: 'architect', executor: 'team', model: '', description: 'a' },
+            { id: 'gpt', displayName: 'gpt', role: 'tester', executor: 'team', model: '', description: 'a' },
             { id: 'zcode', displayName: 'zcode', role: 'worker', executor: 'team', model: '', description: 'w' },
             { id: 'qoder', displayName: 'qoder', role: 'worker', executor: 'team', model: '', description: 'w2' },
             { id: 'opencode', displayName: 'opencode', role: 'worker', executor: 'team', model: '', description: 'w3' },
@@ -5719,6 +5804,138 @@ test('T20 a second task gets its own worktree and a runtime-safe child name', as
     delete process.env.DSH_HOME
     if (repo) await cleanupSquadArtifacts([repo]).catch(() => {})
     await rm(root, { recursive: true, force: true })
+    await rm(dshHome, { recursive: true, force: true })
+  }
+})
+
+/** T21 — acceptance mode: authority doc, dual-dimension acceptance, report rounds, worker fixes. */
+test('T21 acceptance mode runs dual acceptance against an authority document', async () => {
+  const workspace = await tempRoot()
+  const dshHome = await tempRoot()
+  process.env.DSH_HOME = dshHome
+  try {
+    const settingsPath = join(dshHome, 'agent-squad', 'settings.json')
+    await mkdir(join(dshHome, 'agent-squad'), { recursive: true })
+    await writeFile(
+      settingsPath,
+      JSON.stringify(
+        {
+          version: 3,
+          revision: 1,
+          agents: [
+            { id: 'codex', displayName: 'codex', role: 'brain', executor: 'team', model: '', description: 'b' },
+            { id: 'gpt', displayName: 'gpt', role: 'tester', executor: 'team', model: '', description: 'a' },
+            { id: 'zcode', displayName: 'zcode', role: 'worker', executor: 'team', model: '', description: 'w' },
+            { id: 'qoder', displayName: 'qoder', role: 'worker', executor: 'team', model: '', description: 'w2' },
+            { id: 'opencode', displayName: 'opencode', role: 'worker', executor: 'team', model: '', description: 'w3' },
+          ],
+          worktree: { directory: '.agents/worktrees' },
+        },
+        null,
+        2,
+      ),
+      'utf8',
+    )
+    const { apply } = await import('../index.js')
+    const host = mockHost(workspace, dshHome)
+    apply(host.ctx, { workerProbe: false, agents: BUNDLE_AGENTS })
+    const tool = (name) => host.registered.find((entry) => entry.definition.name === name).definition
+    const lead = { id: 'lead-1', session: { id: 'session-1' }, __membership: { role: 'lead', name: 'lead' } }
+    const exec = { agent: lead, signal: undefined }
+    await tool('squad_enable').execute({}, exec)
+    const dispatch = (args) => tool('squad_dispatch').execute(args, exec)
+    const readState = async (task) =>
+      JSON.parse(await readFile(join(workspace, '.agent-squad', task, 'STATE.json'), 'utf8'))
+    const writeReport = async (task, verdict, round) =>
+      writeFile(
+        join(workspace, '.agent-squad', task, 'ACCEPTANCE-REPORT.md'),
+        `# 验收报告 R${round}\n\n① 验收方案与标准：从 AUTHORITY.md 推导。\n② 上一轮修复情况：${round > 1 ? 'P1 已修复（有证据）。' : '—（首轮）'}\n③ 本轮发现的问题：…\n④ 修复建议：…\n\nVERDICT: ${verdict}\n`,
+        'utf8',
+      )
+
+    // --- creation: authority required, materialized; flow snapshot ----------
+    await assert.rejects(
+      tool('squad_start').execute({ goal: 'A', acceptance: 'ok', mode: 'acceptance' }, exec),
+      /验收模式必须提供 authority/,
+    )
+    const startOut = await tool('squad_start').execute(
+      { goal: 'A', acceptance: 'ok', mode: 'acceptance', authority: '权威方案 AC：登录接口返回 token，错误码 401。' },
+      exec,
+    )
+    const task = /任务 (t-\S+) 已创建/.exec(startOut)[1]
+    const dir = join(workspace, '.agent-squad', task)
+    assert.match(startOut, /acceptance（权威方案 → gpt 技术维度验收 → codex 业务维度验收 → 验收报告 → worker 修复循环）/)
+    assert.match(startOut, /已固化到 AUTHORITY\.md/)
+    const authority = await readFile(join(dir, 'AUTHORITY.md'), 'utf8')
+    assert.match(authority, /权威方案 AC：登录接口返回 token/)
+    let state = await readState(task)
+    assert.equal(state.mode, 'acceptance')
+    assert.equal(state.flow, 'acceptance')
+    assert.equal(state.planRequired, false)
+    assert.equal(state.authority.file, 'AUTHORITY.md')
+
+    // --- dev phases are refused in acceptance mode ---------------------------
+    await assert.rejects(dispatch({ agent: 'codex', message: 'p', phase: 'design' }), /验收模式任务没有 design 阶段/)
+    await assert.rejects(dispatch({ agent: 'zcode', message: 'i', phase: 'implement' }), /验收模式任务没有 implement 阶段/)
+
+    // --- round 1: order enforced, roles gated --------------------------------
+    await assert.rejects(dispatch({ agent: 'codex', message: 'biz first', phase: 'acceptance' }), /双验收顺序（强制）：先派 tester（gpt，phase="acceptance"）完成技术维度验收/)
+    await assert.rejects(dispatch({ agent: 'zcode', message: 'who', phase: 'acceptance' }), /acceptance 只能派 tester（gpt，技术维度）与 brain（codex，业务维度）；zcode 当前是 worker。/)
+    assert.match(await dispatch({ agent: 'gpt', message: 'tech review r1', phase: 'acceptance' }), /acceptance: 轮次=1/)
+    await assert.rejects(dispatch({ agent: 'gpt', message: 'tech again', phase: 'acceptance' }), /本轮（第 1 轮）技术维度验收已由 gpt 完成/)
+    await writeReport(task, 'CHANGES_REQUESTED', 1)
+    assert.match(await dispatch({ agent: 'codex', message: 'biz finalize r1', phase: 'acceptance' }), /acceptance: 轮次=1 技术维度=gpt 业务维度=codex verdict=CHANGES_REQUESTED/)
+    state = await readState(task)
+    assert.equal(state.acceptanceRounds, 1)
+    assert.deepEqual(state.acceptanceSteps, { tech: 'gpt', biz: 'codex' })
+    assert.equal(state.lastAcceptanceVerdict, 'CHANGES_REQUESTED')
+    assert.ok(await stat(join(dir, 'ACCEPTANCE-REPORT-R1.md')))
+    // Round 1 concluded: another brain dispatch refuses until the issues are fixed.
+    await assert.rejects(dispatch({ agent: 'codex', message: 'again', phase: 'acceptance' }), /本轮（第 1 轮）验收已定稿/)
+    // finish needs APPROVED.
+    await assert.rejects(tool('squad_finish').execute({ summary: 'no', task_id: task }, exec), /不是 APPROVED/)
+
+    // --- worker fixes ride the tech budget; fixes stale the round ------------
+    assert.match(
+      await dispatch({ agent: 'zcode', message: 'fix P1', phase: 'rework' }),
+      /rework: tech=1\/3 business=0\/3/,
+    )
+    state = await readState(task)
+    assert.equal(state.codeEpoch, 1)
+    assert.deepEqual(state.implementers, ['zcode'])
+    assert.equal(bindingStale(state), false, 'the acceptance binding must be stale after the fix')
+    await assert.rejects(dispatch({ agent: 'zcode', message: 'fix P2', phase: 'rework' }), /需要仍然新鲜的 CHANGES_REQUESTED 验收结论/)
+
+    // --- round 2: fresh dual acceptance, previous-round fix status ------------
+    assert.match(await dispatch({ agent: 'gpt', message: 'tech review r2', phase: 'acceptance' }), /acceptance: 轮次=2/)
+    state = await readState(task)
+    assert.equal(state.acceptanceRounds, 2)
+    assert.deepEqual(state.acceptanceSteps, { tech: 'gpt', biz: null })
+    const prompt = host.sent.at(-1).content.map((block) => block.text).join('')
+    assert.match(prompt, /AUTHORITY\.md/)
+    assert.match(prompt, /ACCEPTANCE-REPORT-R<上一轮>\.md|ACCEPTANCE-REPORT-R/)
+    await writeReport(task, 'APPROVED', 2)
+    assert.match(await dispatch({ agent: 'codex', message: 'biz finalize r2', phase: 'acceptance' }), /verdict=APPROVED/)
+    state = await readState(task)
+    assert.equal(state.lastAcceptanceVerdict, 'APPROVED')
+    assert.ok(await stat(join(dir, 'ACCEPTANCE-REPORT-R2.md')))
+    // Fresh APPROVED closes the task.
+    assert.match(await tool('squad_finish').execute({ summary: 'acceptance done', task_id: task }, exec), /收尾/)
+
+    // --- a dev-mode task has no acceptance phase ------------------------------
+    const devStart = await tool('squad_start').execute({ goal: 'D', acceptance: 'ok' }, exec)
+    const devTask = /任务 (t-\S+) 已创建/.exec(devStart)[1]
+    await assert.rejects(
+      dispatch({ agent: 'gpt', message: 'x', phase: 'acceptance', task_id: devTask }),
+      /研发模式任务没有 acceptance 阶段/,
+    )
+
+    function bindingStale(current) {
+      return Number(current.acceptance?.codeEpoch) === Number(current.codeEpoch)
+    }
+  } finally {
+    delete process.env.DSH_HOME
+    await rm(workspace, { recursive: true, force: true })
     await rm(dshHome, { recursive: true, force: true })
   }
 })
