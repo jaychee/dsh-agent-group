@@ -69,6 +69,28 @@ async function tempRoot() {
   return mkdtemp(join(tmpdir(), 'asq-test-'))
 }
 
+// apply() captures the settings path (and adjacent failover/probe paths) from
+// DSH_HOME. Set it before constructing or applying the mock and restore the
+// caller's value, including when this file is run without test isolation.
+function useFixtureDshHome(dshHome) {
+  const previous = process.env.DSH_HOME
+  process.env.DSH_HOME = dshHome
+  return () => {
+    if (previous === undefined) delete process.env.DSH_HOME
+    else process.env.DSH_HOME = previous
+  }
+}
+
+function assertFixtureDshHome(dshHome) {
+  assert.ok(
+    typeof dshHome === 'string' &&
+      dirname(dshHome) === tmpdir() &&
+      dshHome.startsWith(join(tmpdir(), 'asq-test-')) &&
+      process.env.DSH_HOME === dshHome,
+    'mockHost requires an isolated DSH_HOME matching its fixture directory',
+  )
+}
+
 /** T01 — store lifecycle: seed, persistence, revision, corrupt recovery, atomic-write failure. */
 test('T01 settings store seeds, persists, recovers corruption, keeps old file on write failure', async () => {
   const { createSettingsStore, seedFromBundle } = await import('../settings.js')
@@ -256,6 +278,7 @@ test('T02 collectModels groups providers and survives single-provider failure', 
 
 /** Mock host for T03/T07/T08 wiring: minimal surface the plugin's apply() touches. */
 function mockHost(workspace, dshHome, hooks = {}, options = {}) {
+  assertFixtureDshHome(dshHome)
   // Tool registrations keep their `when` visibility condition so tests can
   // assert Lead-only registration (squad_approve_plan).
   const registered = []
@@ -276,11 +299,30 @@ function mockHost(workspace, dshHome, hooks = {}, options = {}) {
     options.workingDirectory ?? { get: () => workspace, set: async () => {} }
   let childSeq = 0
   const agentsById = new Map()
-  const makeAgent = (id, membership) => {
+  // Host name reservation: a name is taken at creation and is NOT released
+  // when the session merely becomes idle (TR-09 contract).
+  const createdNames = new Set()
+  const reserveName = (name) => {
+    if (name === undefined) return
+    if (options.strictNames && createdNames.has(name)) {
+      const error = new Error(`a subagent named "${name}" already exists`)
+      error.code = 'DUPLICATE_AGENT_NAME'
+      throw error
+    }
+    createdNames.add(name)
+  }
+  const makeAgent = (id, membership, extra = {}) => {
     const agent = {
       id,
-      status: 'inactive',
-      session: { id: 'session-1' },
+      status: extra.status ?? 'idle',
+      session: {
+        id: extra.sessionId ?? `session-${id}`,
+        requestHeader: () => extra.header,
+      },
+      options: extra.options ?? {},
+      runMaintenance:
+        extra.runMaintenance ??
+        (async (task) => task(new AbortController().signal)),
       __membership: membership,
       ctx: {
         systemPrompt: {
@@ -313,8 +355,14 @@ function mockHost(workspace, dshHome, hooks = {}, options = {}) {
     startActivation: async ({ provider, childId, name, prompt, parent, agentOptions, cwd, signal, label, delivery }) => {
       childSeq += 1
       const id = childId ?? `child-${childSeq}`
+      reserveName(name)
       activations.push({ provider, childId: id, name, prompt, agentOptions, cwd, label, delivery })
-      const isTeamSpawn = (provider === 'spawn' || provider === 'fork') && agentOptions === undefined
+      // Team spawn/fork carries no pinned route fields (only an optional
+      // maxTokens cap); local pinned children always carry provider/model.
+      const pinnedRoute =
+        agentOptions !== undefined &&
+        (typeof agentOptions.provider === 'string' || typeof agentOptions.model === 'string')
+      const isTeamSpawn = (provider === 'spawn' || provider === 'fork') && !pinnedRoute
       if (isTeamSpawn && name) {
         spawned.push({ name, prompt, description: label })
         // Named continuable teammate (the spawnTeammate replacement):
@@ -403,6 +451,9 @@ function mockHost(workspace, dshHome, hooks = {}, options = {}) {
       })),
     getProvider: (id) => providers.get(id),
   }
+  const services = options.services ?? {}
+  const handlers = {}
+  const logger = options.logger ?? { warn: () => {} }
   const ctx = {
     agents: {
       list: () => [...agentsById.values()],
@@ -410,6 +461,7 @@ function mockHost(workspace, dshHome, hooks = {}, options = {}) {
     },
     tools: { register: (definition, options) => registered.push({ definition, when: options?.when }) },
     get: (name) => {
+      if (name in services) return services[name]
       if (name === 'workingDirectory') {
         return {
           get: (session) => {
@@ -428,14 +480,19 @@ function mockHost(workspace, dshHome, hooks = {}, options = {}) {
       return undefined
     },
     on: (event, handler) => {
+      ;(handlers[event] ??= []).push(handler)
       if (event === 'agent/created') createdHandlers.push(handler)
     },
     effect: (fn) => {
+      // Guard again at apply time, before createSettingsStore() captures a
+      // path. Constructing a mock within a fixture isn't enough on its own.
+      assertFixtureDshHome(dshHome)
       const dispose = fn()
       disposers.push(dispose)
       return dispose
     },
     inject: (_deps, callback) => callback(ctx),
+    logger: () => logger,
   }
   // A running row WITHOUT a name: local children appear in listDescendants
   // but must not match the team-member name lookup.
@@ -449,6 +506,7 @@ function mockHost(workspace, dshHome, hooks = {}, options = {}) {
   return {
     ctx, registered, activations, sent, spawned, sections, members, agentsById, makeAgent,
     dshHome, subagents, providers, runIds, disposers, cwdCalls, markRunning, unmarkRunning,
+    services, handlers, createdNames, reserveName, logger,
   }
 }
 
@@ -456,7 +514,7 @@ function mockHost(workspace, dshHome, hooks = {}, options = {}) {
 test('T03 dispatch reads fresh settings and routes external/local/team executors', async () => {
   const workspace = await tempRoot()
   const dshHome = await tempRoot()
-  process.env.DSH_HOME = dshHome
+  const restoreDshHome = useFixtureDshHome(dshHome)
   try {
     // Pre-write a legal settings file: codex→external(mock-ext), gpt→team(architect),
     // zcode→local(p/m), qoder→team.
@@ -557,7 +615,7 @@ test('T03 dispatch reads fresh settings and routes external/local/team executors
     )
     assert.match(local1, /已创建本地子代理 zcode/)
     const firstChild = host.activations.at(-1).childId
-    assert.deepEqual(host.activations.at(-1).agentOptions, { provider: 'p', model: 'm1' })
+    assert.deepEqual(host.activations.at(-1).agentOptions, { provider: 'p', model: 'm1', maxTokens: 16384 })
     assertSEM(host.activations.at(-1).prompt.map((block) => block.text).join(''))
     await assertBrief(firstDir)
 
@@ -772,7 +830,7 @@ test('T03 dispatch reads fresh settings and routes external/local/team executors
       assert.match(out, /已外部派发 zcode \(zcode\).*provider=p2\/m9（一次性，不续跑）/)
       const act = host.activations.at(-1)
       assert.equal(act.provider, 'spawn')
-      assert.deepEqual(act.agentOptions, { provider: 'p2', model: 'm9' })
+      assert.deepEqual(act.agentOptions, { provider: 'p2', model: 'm9', maxTokens: 16384 })
       assert.equal(act.name, undefined)
       assert.equal(host.members.length, before)
       const oneShotTask = /task=(t-\S+) /.exec(out)[1]
@@ -1002,7 +1060,7 @@ test('T03 dispatch reads fresh settings and routes external/local/team executors
       }
     }
   } finally {
-    delete process.env.DSH_HOME
+    restoreDshHome()
     await rm(workspace, { recursive: true, force: true })
     await rm(dshHome, { recursive: true, force: true })
   }
@@ -1569,7 +1627,7 @@ test('T06 createSquadWorktree creates the configured branch and rejects escapes 
 test('T07 plan gate: lead review, design budget, squad_approve_plan, archives and status', async () => {
   const workspace = await tempRoot()
   const dshHome = await tempRoot()
-  process.env.DSH_HOME = dshHome
+  const restoreDshHome = useFixtureDshHome(dshHome)
   try {
     const settingsPath = join(dshHome, 'agent-squad', 'settings.json')
     await mkdir(join(dshHome, 'agent-squad'), { recursive: true })
@@ -1621,7 +1679,7 @@ test('T07 plan gate: lead review, design budget, squad_approve_plan, archives an
     // --- AC3: registration, opt-in gate and Lead-only visibility ------------
     const names = host.registered.map((entry) => entry.definition.name).sort()
     assert.deepEqual(names, [
-      'squad_approve_plan', 'squad_deliver', 'squad_dispatch', 'squad_enable', 'squad_extend', 'squad_failover', 'squad_finish', 'squad_parallel_start', 'squad_report', 'squad_start', 'squad_status', 'squad_wait',
+      'squad_approve_plan', 'squad_compact', 'squad_deliver', 'squad_dispatch', 'squad_enable', 'squad_extend', 'squad_failover', 'squad_finish', 'squad_parallel_start', 'squad_report', 'squad_start', 'squad_status', 'squad_wait',
     ])
     // Before opting in, the root sees ONLY the enable gate; the squad tools
     // and the Lead persona stay hidden (opt-in contract).
@@ -1987,7 +2045,7 @@ test('T07 plan gate: lead review, design budget, squad_approve_plan, archives an
       'README lead tool row must list squad_extend',
     )
   } finally {
-    delete process.env.DSH_HOME
+    restoreDshHome()
     await rm(workspace, { recursive: true, force: true })
     await rm(dshHome, { recursive: true, force: true })
   }
@@ -2485,7 +2543,7 @@ async function cleanupSquadArtifacts(repos) {
 test('T09 multi-repository lifecycle, validation, rollback and compatibility', async () => {
   const root = await tempRoot()
   const dshHome = await tempRoot()
-  process.env.DSH_HOME = dshHome
+  const restoreDshHome = useFixtureDshHome(dshHome)
   const labeled = async (name, fn) => {
     try {
       await fn()
@@ -3484,7 +3542,7 @@ test('T09 multi-repository lifecycle, validation, rollback and compatibility', a
       await cleanupSquadArtifacts([repoM, repoN])
     })
   } finally {
-    delete process.env.DSH_HOME
+    restoreDshHome()
     await rm(root, { recursive: true, force: true })
     await rm(dshHome, { recursive: true, force: true })
   }
@@ -3494,7 +3552,7 @@ test('T09 multi-repository lifecycle, validation, rollback and compatibility', a
 test('T10 budget extension requires user confirmation and resumes exhausted budgets', async () => {
   const workspace = await tempRoot()
   const dshHome = await tempRoot()
-  process.env.DSH_HOME = dshHome
+  const restoreDshHome = useFixtureDshHome(dshHome)
   const labeled = async (name, fn) => {
     try {
       await fn()
@@ -3665,7 +3723,7 @@ test('T10 budget extension requires user confirmation and resumes exhausted budg
       assert.deepEqual(
         host.registered.map((row) => row.definition.name).sort(),
         [
-          'squad_approve_plan', 'squad_deliver', 'squad_dispatch', 'squad_enable', 'squad_extend', 'squad_failover',
+          'squad_approve_plan', 'squad_compact', 'squad_deliver', 'squad_dispatch', 'squad_enable', 'squad_extend', 'squad_failover',
           'squad_finish', 'squad_parallel_start', 'squad_report', 'squad_start', 'squad_status', 'squad_wait',
         ],
       )
@@ -4224,7 +4282,7 @@ test('T10 budget extension requires user confirmation and resumes exhausted budg
       await noSide(task, () => design('still'), designPause(9, 9))
     })
   } finally {
-    delete process.env.DSH_HOME
+    restoreDshHome()
     await rm(workspace, { recursive: true, force: true })
     await rm(dshHome, { recursive: true, force: true })
   }
@@ -4234,7 +4292,7 @@ test('T10 budget extension requires user confirmation and resumes exhausted budg
 test('T11 full flow: opt-in gate, spec/tech-review pipeline, dual acceptance, takeover and budgets', async () => {
   const workspace = await tempRoot()
   const dshHome = await tempRoot()
-  process.env.DSH_HOME = dshHome
+  const restoreDshHome = useFixtureDshHome(dshHome)
   try {
     // Roster: codex external brain, gpt local architect (pinned p/arch),
     // zcode local worker (p/m1), qoder team worker.
@@ -4382,7 +4440,7 @@ test('T11 full flow: opt-in gate, spec/tech-review pipeline, dual acceptance, ta
     await writeVerdict(taskG, 'TEST-REVIEW.md', 'APPROVED')
     const testOut = await dispatch({ agent: 'gpt', message: 'review tests', phase: 'test-review' })
     assert.match(testOut, /已创建本地子代理 gpt \[tester\] model=p\/arch/)
-    assert.deepEqual(host.activations.at(-1).agentOptions, { provider: 'p', model: 'arch' })
+    assert.deepEqual(host.activations.at(-1).agentOptions, { provider: 'p', model: 'arch', maxTokens: 16384 })
     assert.match(testOut, /testReview: codeEpoch=1 specVersion=1/)
     assert.ok(await stat(join(dirG, 'TEST-REVIEW-R1.md')))
     // tech-review: needs implementation; default brain; workers refused.
@@ -4570,7 +4628,7 @@ test('T11 full flow: opt-in gate, spec/tech-review pipeline, dual acceptance, ta
     )
     assert.match(await tool('squad_finish').execute({ summary: 'S done', task_id: taskS }, exec), /收尾/)
   } finally {
-    delete process.env.DSH_HOME
+    restoreDshHome()
     await rm(workspace, { recursive: true, force: true })
     await rm(dshHome, { recursive: true, force: true })
   }
@@ -4580,7 +4638,7 @@ test('T11 full flow: opt-in gate, spec/tech-review pipeline, dual acceptance, ta
 test('T12 failover suspends a quota-exhausted tester and hands its duties to the brain', async () => {
   const workspace = await tempRoot()
   const dshHome = await tempRoot()
-  process.env.DSH_HOME = dshHome
+  const restoreDshHome = useFixtureDshHome(dshHome)
   try {
     // All-team roster: codex brain, gpt tester, zcode worker.
     const settingsPath = join(dshHome, 'agent-squad', 'settings.json')
@@ -4775,7 +4833,7 @@ test('T12 failover suspends a quota-exhausted tester and hands its duties to the
       )
     }
   } finally {
-    delete process.env.DSH_HOME
+    restoreDshHome()
     await rm(workspace, { recursive: true, force: true })
     await rm(dshHome, { recursive: true, force: true })
   }
@@ -4785,7 +4843,7 @@ test('T12 failover suspends a quota-exhausted tester and hands its duties to the
 test('T13 background dispatch is the default for external implement and unblocks the Lead', async () => {
   const workspace = await tempRoot()
   const dshHome = await tempRoot()
-  process.env.DSH_HOME = dshHome
+  const restoreDshHome = useFixtureDshHome(dshHome)
   try {
     // zcode external mock provider, qoder local.
     const settingsPath = join(dshHome, 'agent-squad', 'settings.json')
@@ -4893,7 +4951,7 @@ test('T13 background dispatch is the default for external implement and unblocks
     assert.match(workerPrompt, /并行默认：本轮交办包含多个独立文件\/模块时/)
     assert.match(workerPrompt, /子代理\/并行能力同时开发/)
   } finally {
-    delete process.env.DSH_HOME
+    restoreDshHome()
     await rm(workspace, { recursive: true, force: true })
     await rm(dshHome, { recursive: true, force: true })
   }
@@ -4903,7 +4961,7 @@ test('T13 background dispatch is the default for external implement and unblocks
 test('T14 any role can act as a worker and the Lead has its own worker switch', async () => {
   const workspace = await tempRoot()
   const dshHome = await tempRoot()
-  process.env.DSH_HOME = dshHome
+  const restoreDshHome = useFixtureDshHome(dshHome)
   try {
     const { createSettingsStore, validateAgentsAndWorktree } = await import('../settings.js')
     const settingsPath = join(dshHome, 'agent-squad', 'settings.json')
@@ -5033,7 +5091,7 @@ test('T14 any role can act as a worker and the Lead has its own worker switch', 
     // cannot silently re-enable a removed toggle.
     assert.match(clientSource, /agents: session\.draft\.agents/)
   } finally {
-    delete process.env.DSH_HOME
+    restoreDshHome()
     await rm(workspace, { recursive: true, force: true })
     await rm(dshHome, { recursive: true, force: true })
   }
@@ -5043,7 +5101,7 @@ test('T14 any role can act as a worker and the Lead has its own worker switch', 
 test('T15 worker availability probe suspends a quota-limited worker and substitutes', async () => {
   const workspace = await tempRoot()
   const dshHome = await tempRoot()
-  process.env.DSH_HOME = dshHome
+  const restoreDshHome = useFixtureDshHome(dshHome)
   try {
     const settingsPath = join(dshHome, 'agent-squad', 'settings.json')
     await mkdir(join(dshHome, 'agent-squad'), { recursive: true })
@@ -5179,7 +5237,7 @@ test('T15 worker availability probe suspends a quota-limited worker and substitu
       )
     }
   } finally {
-    delete process.env.DSH_HOME
+    restoreDshHome()
     await rm(workspace, { recursive: true, force: true })
     await rm(dshHome, { recursive: true, force: true })
   }
@@ -5189,7 +5247,7 @@ test('T15 worker availability probe suspends a quota-limited worker and substitu
 test('T16 parallel features branch from the Base branch and merge back after delivery', async () => {
   const root = await tempRoot()
   const dshHome = await tempRoot()
-  process.env.DSH_HOME = dshHome
+  const restoreDshHome = useFixtureDshHome(dshHome)
   let repo
   try {
     repo = await makeGitRepo(root, 'parallel-repo', 'base', { 'README.md': 'seed\n' })
@@ -5372,7 +5430,7 @@ test('T16 parallel features branch from the Base branch and merge back after del
       assert.deepEqual(statusLines, [])
     }
   } finally {
-    delete process.env.DSH_HOME
+    restoreDshHome()
     await cleanupSquadArtifacts([repo]).catch(() => {})
     await rm(root, { recursive: true, force: true })
     await rm(dshHome, { recursive: true, force: true })
@@ -5383,7 +5441,7 @@ test('T16 parallel features branch from the Base branch and merge back after del
 test('T17 status and PROGRESS.md show layered task and teammate progress', async () => {
   const workspace = await tempRoot()
   const dshHome = await tempRoot()
-  process.env.DSH_HOME = dshHome
+  const restoreDshHome = useFixtureDshHome(dshHome)
   try {
     const settingsPath = join(dshHome, 'agent-squad', 'settings.json')
     await mkdir(join(dshHome, 'agent-squad'), { recursive: true })
@@ -5468,7 +5526,7 @@ test('T17 status and PROGRESS.md show layered task and teammate progress', async
     assert.match(afterReport, /zcode \[worker\] 空闲 · 最近 implement r1 @ /)
     assert.match(afterReport, /自动同步：/)
   } finally {
-    delete process.env.DSH_HOME
+    restoreDshHome()
     await rm(workspace, { recursive: true, force: true })
     await rm(dshHome, { recursive: true, force: true })
   }
@@ -5478,7 +5536,7 @@ test('T17 status and PROGRESS.md show layered task and teammate progress', async
 test('T18 slow external phases return immediately, stay pending, then flush', async () => {
   const workspace = await tempRoot()
   const dshHome = await tempRoot()
-  process.env.DSH_HOME = dshHome
+  const restoreDshHome = useFixtureDshHome(dshHome)
   try {
     const settingsPath = join(dshHome, 'agent-squad', 'settings.json')
     await mkdir(join(dshHome, 'agent-squad'), { recursive: true })
@@ -5589,7 +5647,7 @@ test('T18 slow external phases return immediately, stay pending, then flush', as
     // Every acceptance is satisfied → finishing is allowed.
     assert.match(await tool('squad_finish').execute({ summary: 'done' }, exec), /收尾/)
   } finally {
-    delete process.env.DSH_HOME
+    restoreDshHome()
     await rm(workspace, { recursive: true, force: true })
     await rm(dshHome, { recursive: true, force: true })
   }
@@ -5599,7 +5657,7 @@ test('T18 slow external phases return immediately, stay pending, then flush', as
 test('T19 two active tasks keep separate state, teammates and addressing', async () => {
   const workspace = await tempRoot()
   const dshHome = await tempRoot()
-  process.env.DSH_HOME = dshHome
+  const restoreDshHome = useFixtureDshHome(dshHome)
   try {
     const settingsPath = join(dshHome, 'agent-squad', 'settings.json')
     await mkdir(join(dshHome, 'agent-squad'), { recursive: true })
@@ -5690,7 +5748,7 @@ test('T19 two active tasks keep separate state, teammates and addressing', async
       /已(续跑|创建) zcode/,
     )
   } finally {
-    delete process.env.DSH_HOME
+    restoreDshHome()
     await rm(workspace, { recursive: true, force: true })
     await rm(dshHome, { recursive: true, force: true })
   }
@@ -5700,7 +5758,7 @@ test('T19 two active tasks keep separate state, teammates and addressing', async
 test('T20 a second task gets its own worktree and a runtime-safe child name', async () => {
   const root = await tempRoot()
   const dshHome = await tempRoot()
-  process.env.DSH_HOME = dshHome
+  const restoreDshHome = useFixtureDshHome(dshHome)
   let repo
   try {
     repo = await makeGitRepo(root, 'mt-repo', 'base', { 'README.md': 'seed\n' })
@@ -5801,7 +5859,7 @@ test('T20 a second task gets its own worktree and a runtime-safe child name', as
     assert.equal(currentB.taskId, taskB)
     assert.equal(currentB.memoryRoot, join(repo, '.agents', 'worktrees', `squad-${taskB}`, '.agent-squad'))
   } finally {
-    delete process.env.DSH_HOME
+    restoreDshHome()
     if (repo) await cleanupSquadArtifacts([repo]).catch(() => {})
     await rm(root, { recursive: true, force: true })
     await rm(dshHome, { recursive: true, force: true })
@@ -5812,7 +5870,7 @@ test('T20 a second task gets its own worktree and a runtime-safe child name', as
 test('T21 acceptance mode runs dual acceptance against an authority document', async () => {
   const workspace = await tempRoot()
   const dshHome = await tempRoot()
-  process.env.DSH_HOME = dshHome
+  const restoreDshHome = useFixtureDshHome(dshHome)
   try {
     const settingsPath = join(dshHome, 'agent-squad', 'settings.json')
     await mkdir(join(dshHome, 'agent-squad'), { recursive: true })
@@ -5934,8 +5992,2927 @@ test('T21 acceptance mode runs dual acceptance against an authority document', a
       return Number(current.acceptance?.codeEpoch) === Number(current.codeEpoch)
     }
   } finally {
-    delete process.env.DSH_HOME
+    restoreDshHome()
     await rm(workspace, { recursive: true, force: true })
     await rm(dshHome, { recursive: true, force: true })
   }
+})
+
+/** Shared verbatim texts the T22–T27 acceptance tests assert. */
+const CONTEXT_DISCIPLINE_TEXT =
+  '先 grep 定位，再 read 指定行段；不 cat 大文件。测试/构建输出重定向到文件，只读摘要；长日志不回贴。只回复 ≤150 字摘要 + 文件路径；返工只改编号缺陷。'
+const REWORK_SCOPE_TEXT = '只处理编号缺陷；不要重做已通过部分；只读相关文件段落，不要通读无关文件。'
+const USAGE_SAMPLE_LINE =
+  'context: model=qoder/qmodel_latest window=200000 used=172000 ratio=86.0% threshold=0.86'
+
+/** Settings rows used by the context-management tests. */
+function contextAgentSettings(overrides = {}) {
+  const rows = [
+    { id: 'codex', displayName: 'codex', role: 'brain', executor: 'external', model: 'mock-ext', description: 'b' },
+    { id: 'gpt', displayName: 'gpt', role: 'tester', executor: 'team', model: '', description: 'a' },
+    { id: 'zcode', displayName: 'zcode', role: 'worker', executor: 'local', model: 'p/m1', description: 'w' },
+    { id: 'qoder', displayName: 'qoder', role: 'worker', executor: 'team', model: '', description: 'w2' },
+    { id: 'opencode', displayName: 'opencode', role: 'worker', executor: 'local', model: 'dsh-opencode-go/deepseek-v4.1-flash', description: 'w3' },
+  ]
+  return {
+    version: 3,
+    revision: 1,
+    agents: rows.map((row) => ({ ...row, ...(overrides[row.id] ?? {}) })),
+    worktree: { directory: '.agents/worktrees' },
+  }
+}
+
+/** Promise-based fleet helper: temp workspace/DSH_HOME, one applied host. */
+async function withSquadHost(options, body) {
+  const workspace = await tempRoot()
+  const dshHome = await tempRoot()
+  const restoreDshHome = useFixtureDshHome(dshHome)
+  try {
+    await mkdir(join(dshHome, 'agent-squad'), { recursive: true })
+    await writeFile(
+      join(dshHome, 'agent-squad', 'settings.json'),
+      JSON.stringify(options.settings ?? contextAgentSettings(options.overrides), null, 2),
+      'utf8',
+    )
+    const host = mockHost(workspace, dshHome, options.hooks ?? {}, {
+      services: options.services,
+      externalDelayMs: options.externalDelayMs,
+      strictNames: options.strictNames,
+      logger: options.logger,
+    })
+    const { apply } = await import('../index.js')
+    apply(host.ctx, { workerProbe: false, agents: BUNDLE_AGENTS, ...(options.config ?? {}) })
+    const tool = (name) =>
+      host.registered.find((entry) => entry.definition.name === name)?.definition
+    const lead = {
+      id: options.leadId ?? 'lead-1',
+      session: { id: 'session-lead' },
+      __membership: { role: 'lead', name: 'lead' },
+    }
+    const exec = { agent: lead, signal: undefined }
+    await body({ workspace, dshHome, host, tool, lead, exec })
+  } finally {
+    restoreDshHome()
+    await rm(workspace, { recursive: true, force: true })
+    await rm(dshHome, { recursive: true, force: true })
+  }
+}
+
+/** Start one task and return its id plus memory dir. */
+async function startContextTask(tool, exec, args) {
+  const started = await tool('squad_start').execute(
+    { goal: 'g', acceptance: 'a', ...args },
+    exec,
+  )
+  const taskId = /任务 (t-\S+) 已创建/.exec(started)[1]
+  return { taskId, output: started }
+}
+
+/** T22 — context policy: strict config, real patch, caps and the pre-step fallback. */
+test('T22 context policy', async (t) => {
+  await t.test('mock host fails closed before loading settings/failover', async () => {
+    const workspace = await tempRoot()
+    const dshHome = await tempRoot()
+    // No real DSH_HOME is used, even if the guard regresses.
+    const restoreOuter = useFixtureDshHome(workspace)
+    try {
+      assert.throws(() => mockHost(workspace, dshHome), /isolated DSH_HOME/)
+      const restoreInner = useFixtureDshHome(dshHome)
+      let host
+      try {
+        host = mockHost(workspace, dshHome)
+      } finally {
+        restoreInner()
+      }
+      const { apply } = await import('../index.js')
+      assert.throws(() => apply(host.ctx, { agents: BUNDLE_AGENTS }), /isolated DSH_HOME/)
+      assert.equal(process.env.DSH_HOME, workspace)
+    } finally {
+      restoreOuter()
+      await rm(workspace, { recursive: true, force: true })
+      await rm(dshHome, { recursive: true, force: true })
+    }
+  })
+
+  // --- S2: the delivered patch really carries the 0.86 policy -------------
+  const patch = await readFile(new URL('../cordis.patch.yml', import.meta.url), 'utf8')
+  const yaml = patch.split('\n').filter((line) => !line.trimStart().startsWith('#')).join('\n')
+  const blocks = yaml.split(/(?=^- )/m).filter((block) => block.startsWith('- '))
+  assert.equal(blocks.length, 4, 'only one insert and three top-level overrides')
+  const [insert, basic, command, pruner] = blocks
+  assert.match(insert, /^- insert:/)
+  assert.doesNotMatch(insert, /id: (?:compaction-basic|command-compact|tool-result-pruner)\b/)
+  const contextPolicy = /^        contextPolicy: \{thresholdRatio: &(\w+) ([\d.]+), maxOutputTokens: (\d+), autoCompact: true, showUsage: true\}$/m.exec(insert)
+  assert.ok(contextPolicy, 'read the actual squad output cap and ratio anchor')
+  const [, anchor, rawRatio, rawCap] = contextPolicy
+  const ratio = Number(rawRatio)
+  const cap = Number(rawCap)
+  assert.equal(ratio, 0.86)
+  assert.equal(cap, 16384)
+  const basicHeader = /^- id: compaction-basic\n  disabled: false\n  config:\n    auto: true\n    maxTokens: (\d+)\n    modelPolicies:\n/.exec(basic)
+  assert.ok(basicHeader, 'native auto enabled and global cap set outside modelPolicies')
+  assert.equal(Number(basicHeader[1]), 8192)
+  assert.equal(command.trimEnd(), '- id: command-compact\n  disabled: false')
+  assert.equal(pruner.trimEnd(), '- id: tool-result-pruner\n  disabled: false')
+
+  const rows = new Map()
+  for (const line of basic.slice(basicHeader[0].length).trimEnd().split('\n')) {
+    const row = /^      - \{provider: ([\w-]+), model: ([\w.-]+), thresholdRatio: \*(\w+), headroomTokens: (\d+), retainRatio: ([\d.]+), maxTokens: (\d+)\}$/.exec(line)
+    assert.ok(row, `unexpected modelPolicies row: ${line}`)
+    const [, provider, model, reference, headroom, retainRatio, summaryCap] = row
+    assert.equal(reference, anchor)
+    const key = `${provider}/${model}`
+    assert.ok(!rows.has(key), `duplicate model policy: ${key}`)
+    const policy = { ratio, headroom: Number(headroom), retain: Number(retainRatio), summary: Number(summaryCap) }
+    assert.deepEqual(policy, { ratio: 0.86, headroom: 4096, retain: 0.12, summary: 8192 })
+    rows.set(key, policy)
+  }
+  const windows = [
+    ['openai/gpt-6.2-sol', 258000, 237520, 221880],
+    ['openai-codex/gpt-6.2-sol', 500000, 479520, 430000],
+    ['openai-codex/gpt-6.2-astra', 272000, 251520, 233920],
+    ['zai-coding-cn/glm-5.3', 1000000, 979520, 860000],
+    ['qoder/qmodel_latest', 200000, 179520, 172000],
+    ['dsh-opencode-go/deepseek-v4.1-flash', 1000000, 979520, 860000],
+  ]
+  assert.deepEqual([...rows.keys()].sort(), windows.map(([route]) => route).sort())
+  const thresholdFor = (window, output, policy) => Math.floor(Math.min(window * policy.ratio, window - output - policy.headroom))
+  for (const [route, window, remaining, expected] of windows) {
+    const policy = rows.get(route)
+    assert.equal(window - cap - policy.headroom, remaining, route)
+    assert.equal(thresholdFor(window, cap, policy), expected, route)
+    assert.ok(Math.floor((window - cap) * policy.retain) < expected, route)
+  }
+  assert.equal(thresholdFor(131072, cap, rows.get('qoder/qmodel_latest')), 110592)
+
+  // --- S1: strict validation with full field paths -------------------------
+  const invalid = [
+    [null, 'contextPolicy 必须是对象或 false'],
+    [[], 'contextPolicy 必须是对象或 false'],
+    ['0.86', 'contextPolicy 必须是对象或 false'],
+    [42, 'contextPolicy 必须是对象或 false'],
+    [{ foo: 1 }, 'contextPolicy.foo 未知字段'],
+    [{ thresholdRatio: 0.12 }, 'contextPolicy.thresholdRatio 必须是 (0.12,1] 的有限数'],
+    [{ thresholdRatio: 1.01 }, 'contextPolicy.thresholdRatio 必须是 (0.12,1] 的有限数'],
+    [{ thresholdRatio: Number.NaN }, 'contextPolicy.thresholdRatio 必须是 (0.12,1] 的有限数'],
+    [{ thresholdRatio: '0.86' }, 'contextPolicy.thresholdRatio 必须是 (0.12,1] 的有限数'],
+    [{ thresholdRatio: Number.POSITIVE_INFINITY }, 'contextPolicy.thresholdRatio 必须是 (0.12,1] 的有限数'],
+    [{ maxOutputTokens: 0 }, 'contextPolicy.maxOutputTokens 必须是正安全整数或 null'],
+    [{ maxOutputTokens: 1.5 }, 'contextPolicy.maxOutputTokens 必须是正安全整数或 null'],
+    [{ maxOutputTokens: Number.MAX_SAFE_INTEGER + 1 }, 'contextPolicy.maxOutputTokens 必须是正安全整数或 null'],
+    [{ maxOutputTokens: '16384' }, 'contextPolicy.maxOutputTokens 必须是正安全整数或 null'],
+    [{ autoCompact: 'false' }, 'contextPolicy.autoCompact 必须是布尔值'],
+    [{ autoCompact: null }, 'contextPolicy.autoCompact 必须是布尔值'],
+    [{ showUsage: 1 }, 'contextPolicy.showUsage 必须是布尔值'],
+    [{ showUsage: 'true' }, 'contextPolicy.showUsage 必须是布尔值'],
+  ]
+  for (const [bad, message] of invalid) {
+    const workspace = await tempRoot()
+    const dshHome = await tempRoot()
+    const restoreDshHome = useFixtureDshHome(dshHome)
+    try {
+      const host = mockHost(workspace, dshHome)
+      const { apply } = await import('../index.js')
+      assert.throws(
+        () => apply(host.ctx, { agents: BUNDLE_AGENTS, contextPolicy: bad }),
+        (error) => {
+          assert.ok(error instanceof TypeError, `TypeError for ${JSON.stringify(bad)}`)
+          assert.equal(error.message, message)
+          return true
+        },
+      )
+      assert.equal(host.registered.length, 0, 'invalid config does not register tools')
+      assert.equal(host.disposers.length, 0, 'invalid config does not register services')
+    } finally {
+      restoreDshHome()
+      await rm(workspace, { recursive: true, force: true })
+      await rm(dshHome, { recursive: true, force: true })
+    }
+  }
+
+  for (const thresholdRatio of [0.121, 1]) {
+    await withSquadHost({ config: { contextPolicy: { thresholdRatio, maxOutputTokens: 1 } } }, async ({ tool, exec, host }) => {
+      await startContextTask(tool, exec, { agents: ['zcode'] })
+      const out = await tool('squad_dispatch').execute({ agent: 'zcode', message: 'impl', phase: 'implement' }, exec)
+      assert.ok(out.includes(`threshold=${thresholdRatio}（新建/暂无用量）`))
+      assert.equal(host.activations.at(-1).agentOptions.maxTokens, 1)
+    })
+  }
+
+  // --- S1/S3: defaults, explicit values, caps and false --------------------
+  await withSquadHost({}, async ({ tool, exec, host }) => {
+    const { taskId } = await startContextTask(tool, exec, { agents: ['zcode', 'qoder', 'opencode'] })
+    await tool('squad_dispatch').execute({ agent: 'zcode', message: 'impl', phase: 'implement' }, exec)
+    assert.deepEqual(host.activations.at(-1).agentOptions, {
+      provider: 'p',
+      model: 'm1',
+      maxTokens: 16384,
+    })
+    // Team spawn only adds the cap; the route stays inherited.
+    await tool('squad_dispatch').execute({ agent: 'qoder', message: 'impl', phase: 'implement' }, exec)
+    assert.deepEqual(host.activations.at(-1).agentOptions, { maxTokens: 16384 })
+    assert.equal(host.activations.at(-1).provider, 'spawn')
+    // A smaller parent cap wins.
+    exec.agent.options = { maxTokens: 4096 }
+    const second = await startContextTask(tool, exec, { agents: ['zcode'] })
+    await tool('squad_dispatch').execute(
+      { agent: 'zcode', message: 'impl', phase: 'implement', task_id: second.taskId },
+      exec,
+    )
+    assert.deepEqual(host.activations.at(-1).agentOptions, {
+      provider: 'p',
+      model: 'm1',
+      maxTokens: 4096,
+    })
+    assert.ok(taskId)
+  })
+  await withSquadHost({ config: { contextPolicy: { maxOutputTokens: null } } }, async ({ tool, exec, host }) => {
+    await startContextTask(tool, exec, { agents: ['zcode'] })
+    await tool('squad_dispatch').execute({ agent: 'zcode', message: 'impl', phase: 'implement' }, exec)
+    assert.deepEqual(host.activations.at(-1).agentOptions, { provider: 'p', model: 'm1' })
+  })
+  await withSquadHost({ config: { contextPolicy: false } }, async ({ tool, exec, host }) => {
+    await startContextTask(tool, exec, { agents: ['zcode'] })
+    await tool('squad_dispatch').execute({ agent: 'zcode', message: 'impl', phase: 'implement' }, exec)
+    assert.deepEqual(host.activations.at(-1).agentOptions, { provider: 'p', model: 'm1' })
+    assert.equal(tool('squad_compact'), undefined, 'no compact tool without the policy')
+    assert.ok(!host.activations.at(-1).prompt.map((block) => block.text).join('').includes('上下文纪律'))
+  })
+  // External pinned gets the cap; non-pinned external gets no options at all.
+  await withSquadHost({
+    overrides: { codex: { executor: 'external', model: 'p/m9' } },
+  }, async ({ tool, exec, host, workspace }) => {
+    const { taskId } = await startContextTask(tool, exec, { agents: ['codex'] })
+    await writeFile(join(workspace, '.agent-squad', taskId, 'PLAN.md'), '# PLAN (mock)\n', 'utf8')
+    await tool('squad_dispatch').execute({ agent: 'codex', message: 'design', phase: 'design' }, exec)
+    assert.equal(host.activations.at(-1).provider, 'spawn')
+    assert.deepEqual(host.activations.at(-1).agentOptions, {
+      provider: 'p',
+      model: 'm9',
+      maxTokens: 16384,
+    })
+  })
+  await withSquadHost({}, async ({ tool, exec, host, workspace }) => {
+    const { taskId } = await startContextTask(tool, exec, { agents: ['codex'] })
+    await writeFile(join(workspace, '.agent-squad', taskId, 'PLAN.md'), '# PLAN (mock)\n', 'utf8')
+    await tool('squad_dispatch').execute({ agent: 'codex', message: 'design', phase: 'design' }, exec)
+    assert.equal(host.activations.at(-1).provider, 'mock-ext')
+    assert.equal(host.activations.at(-1).agentOptions, undefined)
+  })
+  // Team fork: host capability decides whether the cap is injected.
+  const forkAgents = BUNDLE_AGENTS.map((agent) =>
+    agent.name === 'qoder' ? { ...agent, context: 'fork' } : agent,
+  )
+  await withSquadHost({ config: { agents: forkAgents } }, async ({ tool, exec, host }) => {
+    host.providers.set('fork', { capabilities: { agentOptions: true } })
+    const first = await startContextTask(tool, exec, { agents: ['qoder'] })
+    await tool('squad_dispatch').execute({ agent: 'qoder', message: 'impl', phase: 'implement' }, exec)
+    assert.equal(host.activations.at(-1).provider, 'fork')
+    assert.deepEqual(host.activations.at(-1).agentOptions, { maxTokens: 16384 })
+    host.providers.set('fork', { capabilities: { agentOptions: false } })
+    const second = await startContextTask(tool, exec, { agents: ['qoder'] })
+    const out = await tool('squad_dispatch').execute(
+      { agent: 'qoder', message: 'impl', phase: 'implement', task_id: second.taskId },
+      exec,
+    )
+    assert.equal(host.activations.at(-1).provider, 'fork')
+    assert.equal(host.activations.at(-1).agentOptions, undefined)
+    assert.match(out, /fork 继承输出预留/)
+    assert.ok(first.taskId)
+    // Unknown fork capability (no provider registered) behaves like false.
+    host.providers.delete('fork')
+    const third = await startContextTask(tool, exec, { agents: ['qoder'] })
+    const unknownOut = await tool('squad_dispatch').execute(
+      { agent: 'qoder', message: 'impl', phase: 'implement', task_id: third.taskId },
+      exec,
+    )
+    assert.equal(host.activations.at(-1).provider, 'fork')
+    assert.equal(host.activations.at(-1).agentOptions, undefined)
+    assert.match(unknownOut, /fork 继承输出预留/)
+    const originalGetProvider = host.subagents.getProvider
+    host.subagents.getProvider = (id) => {
+      if (id === 'fork') throw new Error('capability unavailable')
+      return originalGetProvider(id)
+    }
+    const fourth = await startContextTask(tool, exec, { agents: ['qoder'] })
+    const before = host.activations.length
+    const failedLookupOut = await tool('squad_dispatch').execute(
+      { agent: 'qoder', message: 'impl', phase: 'implement', task_id: fourth.taskId }, exec,
+    )
+    assert.equal(host.activations.length, before + 1, 'do not fall back by starting another child')
+    assert.equal(host.activations.at(-1).provider, 'fork')
+    assert.equal(host.activations.at(-1).agentOptions, undefined)
+    assert.match(failedLookupOut, /fork 继承输出预留/)
+  })
+  // Probe and business dispatch share routing and cap; team never probes.
+  for (const [executor, model, provider, agentOptions] of [
+    ['local', 'p/m1', 'spawn', { provider: 'p', model: 'm1', reasoningEffort: 'max', maxTokens: cap }],
+    ['external', 'p/m1', 'spawn', { provider: 'p', model: 'm1', reasoningEffort: 'max', maxTokens: cap }],
+    ['external', 'mock-ext', 'mock-ext', undefined],
+    ['team', '', 'spawn', { maxTokens: cap }],
+  ]) {
+    await withSquadHost({
+      config: { workerProbe: true },
+      overrides: { zcode: { executor, model, reasoning: 'max' } },
+    }, async ({ tool, exec, host }) => {
+      await startContextTask(tool, exec, { agents: ['zcode'] })
+      await tool('squad_dispatch').execute({ agent: 'zcode', message: 'impl', phase: 'implement' }, exec)
+      const probe = host.activations.find((row) => row.label === 'probe/zcode')
+      const business = host.activations.at(-1)
+      assert.equal(business.provider, provider)
+      assert.deepEqual(business.agentOptions, agentOptions)
+      if (executor === 'team') {
+        assert.equal(probe, undefined)
+      } else {
+        assert.equal(probe?.delivery, 'caller')
+        assert.equal(probe.provider, provider)
+        assert.deepEqual(probe.agentOptions, agentOptions)
+        assert.notEqual(probe.childId, business.childId, 'probe is not the business child')
+      }
+    })
+  }
+
+  // S4 host-pressure contract stub: drive the registered pre-step hook, not
+  // a standalone if/T tautology. Installed basic owns the real prune/summary.
+  await t.test('pre-step delegates T−1/T and prune/re-measure to the host', async () => {
+    await withSquadHost({}, async ({ tool, exec, host, lead }) => {
+      await tool('squad_enable').execute({}, exec)
+      await startContextTask(tool, exec, { agents: ['zcode'] })
+      await tool('squad_dispatch').execute({ agent: 'zcode', message: 'impl', phase: 'implement' }, exec)
+      const { childId, agentOptions } = host.activations.at(-1)
+      const o = agentOptions.maxTokens
+      assert.equal(o, cap, 'O comes from the child request, not the summary cap')
+      const child = host.makeAgent(childId)
+      child.__root = lead
+      const calls = []
+      const events = []
+      let window, used, afterPrune
+      host.services.toolResultPruner = { pruneSession: () => { events.push('prune'); used = afterPrune } }
+      const measure = () => { events.push('measure'); return used }
+      host.services.compaction = {
+        config: { auto: false },
+        compactIfNeeded: async (agent, trigger, signal) => {
+          calls.push([agent, trigger, signal])
+          const { provider, model, maxTokens } = agent.session.requestHeader().config
+          const threshold = thresholdFor(window, maxTokens, rows.get(`${provider}/${model}`))
+          if (measure() < threshold) return null
+          host.services.toolResultPruner.pruneSession(agent.session)
+          if (measure() < threshold) return null
+          events.push('summary')
+          return null
+        },
+      }
+      const handler = host.handlers['agent/pre-step'][0]
+      const signal = new AbortController().signal
+      const decision = { kind: 'enter', messages: [] }
+      const next = async () => { events.push('next'); return decision }
+      for (const [route, sampleWindow, , threshold] of [...windows, ['qoder/qmodel_latest', 131072, undefined, 110592]]) {
+        const [provider, model] = route.split('/')
+        child.session.requestHeader = () => ({ config: { provider, model, maxTokens: o } })
+        window = sampleWindow
+        for (const [input, prunedTo, expected] of [
+          [threshold - 1, threshold - 1, ['measure', 'next']],
+          [threshold, threshold - 1, ['measure', 'prune', 'measure', 'next']],
+          [threshold, threshold, ['measure', 'prune', 'measure', 'summary', 'next']],
+        ]) {
+          used = input
+          afterPrune = prunedTo
+          calls.length = 0
+          events.length = 0
+          assert.equal(await handler({ agent: child, signal }, next), decision)
+          assert.deepEqual(calls, [[child, 'pressure', signal]])
+          assert.deepEqual(events, expected, `${route}, W=${window}, ${input}→${prunedTo}`)
+        }
+      }
+    })
+  })
+
+  // --- S4: exactly one automatic executor ---------------------------------
+  await withSquadHost({}, async ({ tool, exec, host, lead }) => {
+    await tool('squad_enable').execute({}, exec)
+    const { taskId } = await startContextTask(tool, exec, { agents: ['zcode'] })
+    await tool('squad_dispatch').execute({ agent: 'zcode', message: 'impl', phase: 'implement' }, exec)
+    const childId = host.activations.at(-1).childId
+    const child = host.makeAgent(childId, undefined, {
+      header: { config: { provider: 'p', model: 'm1' } },
+    })
+    child.__root = lead
+    const calls = []
+    const compaction = {
+      config: { auto: false },
+      compactIfNeeded: async (agent, trigger, signal) => {
+        calls.push({ agent, trigger, signal })
+        return null
+      },
+    }
+    host.services.compaction = compaction
+    const handler = host.handlers['agent/pre-step'][0]
+    assert.ok(handler, 'pre-step fallback registered')
+    let nextCalls = 0
+    const next = async () => {
+      nextCalls += 1
+      return { kind: 'enter', messages: [] }
+    }
+    await handler({ agent: child, signal: new AbortController().signal }, next)
+    assert.equal(calls.length, 1)
+    assert.equal(calls[0].agent, child)
+    assert.equal(calls[0].trigger, 'pressure')
+    assert.ok(calls[0].signal instanceof AbortSignal)
+    assert.equal(nextCalls, 1)
+    // native auto=true or unknown: nothing extra.
+    compaction.config = { auto: true }
+    await handler({ agent: child, signal: new AbortController().signal }, next)
+    assert.equal(calls.length, 1)
+    compaction.config = {}
+    await handler({ agent: child, signal: new AbortController().signal }, next)
+    assert.equal(calls.length, 1)
+    // aborted signal: pass-through.
+    const aborted = new AbortController()
+    aborted.abort()
+    await handler({ agent: child, signal: aborted.signal }, next)
+    assert.equal(calls.length, 1)
+    // Lead, unbound child, ordinary same-name child and disabled root: none.
+    compaction.config = { auto: false }
+    await handler({ agent: lead, signal: new AbortController().signal }, next)
+    await handler({ agent: host.makeAgent('unbound-1', undefined), signal: new AbortController().signal }, next)
+    const sameName = host.makeAgent('same-name-1', { role: 'teammate', name: 'zcode' })
+    sameName.__root = lead
+    await handler({ agent: sameName, signal: new AbortController().signal }, next)
+    const otherTree = host.makeAgent('other-tree-1', undefined)
+    otherTree.__root = { id: 'not-enabled-lead' }
+    await handler({ agent: otherTree, signal: new AbortController().signal }, next)
+    assert.equal(calls.length, 1)
+    // Missing service: pass-through.
+    delete host.services.compaction
+    await handler({ agent: child, signal: new AbortController().signal }, next)
+    assert.equal(calls.length, 1)
+    // next() throw is preserved and called exactly once even if compaction throws.
+    host.services.compaction = {
+      config: { auto: false },
+      compactIfNeeded: async () => {
+        throw new Error('fallback exploded')
+      },
+    }
+    const beforeThrow = nextCalls
+    await assert.rejects(
+      handler({ agent: child, signal: new AbortController().signal }, async () => {
+        nextCalls += 1
+        throw new Error('next failed')
+      }),
+      /next failed/,
+    )
+    assert.equal(nextCalls, beforeThrow + 1)
+    assert.ok(taskId)
+  })
+  // autoCompact:false registers no fallback at all; double-false means no auto.
+  await withSquadHost({
+    config: { contextPolicy: { autoCompact: false } },
+    services: { compaction: { config: { auto: false } } },
+  }, async ({ host }) => {
+    assert.equal(host.handlers['agent/pre-step'], undefined)
+  })
+
+  await t.test('probe substitution recomputes executor, pinned route and cap', async () => {
+    await withSquadHost({
+      config: { workerProbe: true },
+      overrides: { opencode: { executor: 'external', reasoning: 'max' } },
+    }, async ({ workspace, tool, exec, host }) => {
+      const { taskId } = await startContextTask(tool, exec, { agents: ['zcode', 'opencode'] })
+      exec.agent.options = { maxTokens: 4096 }
+      const originalStart = host.subagents.startActivation
+      host.subagents.startActivation = (spec) => {
+        if (spec.label === 'probe/zcode') throw new Error('HTTP 429 quota exceeded (fixture)')
+        return originalStart(spec)
+      }
+      const out = await tool('squad_dispatch').execute({ agent: 'zcode', message: 'impl', phase: 'implement' }, exec)
+      assert.match(out, /自动改由 opencode 执行/)
+      const [probe, business] = host.activations
+      const state = JSON.parse(await readFile(join(workspace, '.agent-squad', taskId, 'STATE.json'), 'utf8'))
+      const backupOptions = { provider: 'dsh-opencode-go', model: 'deepseek-v4.1-flash', reasoningEffort: 'max', maxTokens: 4096 }
+      assert.equal(probe.label, 'probe/opencode')
+      assert.deepEqual(probe.agentOptions, backupOptions)
+      assert.deepEqual({
+        capAndRoute: business.agentOptions,
+        name: business.name,
+        delivery: business.delivery,
+        mode: state.dispatches.at(-1).mode,
+        localChild: state.children?.opencode,
+      }, { capAndRoute: backupOptions, name: undefined, delivery: 'parent', mode: 'external', localChild: undefined })
+    })
+  })
+
+  await t.test('quota substitute rechecks current busy state and background eligibility', async () => {
+    await withSquadHost({
+      config: { workerProbe: true },
+      overrides: { opencode: { executor: 'team', model: '' } },
+    }, async ({ workspace, tool, exec, host }) => {
+      const { taskId } = await startContextTask(tool, exec, { agents: ['zcode', 'opencode'] })
+      await tool('squad_dispatch').execute({ agent: 'opencode', message: 'first', phase: 'implement' }, exec)
+      const member = host.members.at(-1)
+      const statePath = join(workspace, '.agent-squad', taskId, 'STATE.json')
+      const briefPath = join(dirname(statePath), 'BRIEF.md')
+      const before = await readFile(statePath, 'utf8')
+      const briefBefore = await readFile(briefPath, 'utf8')
+      const startActivation = host.subagents.startActivation
+      host.subagents.startActivation = (spec) => {
+        if (spec.label === 'probe/zcode') {
+          member.status = 'running' // The first catalog read saw this backup idle.
+          throw new Error('HTTP 429 quota exceeded (fixture)')
+        }
+        return startActivation(spec)
+      }
+      await assert.rejects(tool('squad_dispatch').execute({ agent: 'zcode', message: 'retry', phase: 'implement' }, exec), /目标 opencode 仍在运行或创建中/)
+      assert.equal(host.activations.length, 1)
+      assert.equal(host.sent.length, 0)
+      assert.equal(await readFile(statePath, 'utf8'), before)
+      assert.equal(await readFile(briefPath, 'utf8'), briefBefore)
+    })
+
+    await withSquadHost({ config: { workerProbe: true }, overrides: { zcode: { executor: 'external' } } },
+      async ({ workspace, tool, exec, host }) => {
+        const { taskId } = await startContextTask(tool, exec, { agents: ['zcode', 'opencode'] })
+        const statePath = join(workspace, '.agent-squad', taskId, 'STATE.json')
+        const roundAndBudget = async () => {
+          const { round, codeEpoch, dispatches, reworkRounds, techReworkRounds, businessReworkRounds } = JSON.parse(await readFile(statePath, 'utf8'))
+          return { round, codeEpoch, dispatches, reworkRounds, techReworkRounds, businessReworkRounds }
+        }
+        const before = await roundAndBudget()
+        const startActivation = host.subagents.startActivation
+        host.subagents.startActivation = (spec) => {
+          if (spec.label === 'probe/zcode') throw new Error('HTTP 429 quota exceeded (fixture)')
+          return startActivation(spec)
+        }
+        await assert.rejects(tool('squad_dispatch').execute(
+          { agent: 'zcode', message: 'retry', phase: 'implement', background: true }, exec,
+        ), /background 仅支持 external 执行者/)
+        assert.deepEqual(host.activations.map((row) => row.label), ['probe/opencode'])
+        assert.deepEqual(await roundAndBudget(), before, 'rejected business dispatch does not advance budgets')
+      },
+    )
+  })
+
+  await t.test('binding follows the actual executor and legacy name-only rows grant nothing', async () => {
+    const compacted = []
+    const meter = {
+      contextPressure: () => ({ contextWindow: 200000, pressureTokens: 150000 }),
+      measure: () => ({ totalTokens: 172000 }),
+    }
+    const pruner = { pruneSession: () => ({ pruned: [{ originalSeq: 1 }], charsRemoved: 1 }) }
+    const compaction = {
+      config: { auto: true },
+      compactNow: async (agent) => {
+        compacted.push(agent.id)
+        return { shadowedTokenCount: 1, shadowedSeqs: [1] }
+      },
+    }
+    await withSquadHost(
+      { services: { tokenMeter: meter, toolResultPruner: pruner, compaction } },
+      async ({ workspace, dshHome, host, tool, exec, lead }) => {
+        await tool('squad_enable').execute({}, exec)
+        const { taskId } = await startContextTask(tool, exec, { agents: ['zcode', 'qoder'] })
+        const statePath = join(workspace, '.agent-squad', taskId, 'STATE.json')
+        const readState = async () => JSON.parse(await readFile(statePath, 'utf8'))
+        const settingsPath = join(dshHome, 'agent-squad', 'settings.json')
+        const { createSettingsStore } = await import('../settings.js')
+        const store = createSettingsStore({ filePath: settingsPath })
+        const switchZcode = async (executor, model) => {
+          const snapshot = await store.read()
+          await store.save({
+            expectedRevision: snapshot.revision,
+            agents: snapshot.agents.map((row) =>
+              row.id === 'zcode' ? { ...row, executor, model } : row,
+            ),
+            worktree: snapshot.worktree,
+          })
+        }
+
+        // A live, idle local child for this task.
+        await tool('squad_dispatch').execute({ agent: 'zcode', message: 'impl', phase: 'implement' }, exec)
+        const localChildId = host.activations.at(-1).childId
+        const localLive = host.makeAgent(localChildId, undefined, {
+          header: { config: { provider: 'p', model: 'm1' } },
+        })
+        localLive.__root = lead
+        host.members.push({ id: localChildId, status: 'inactive' })
+
+        // Switching the same idle member to team must spawn a team member and
+        // withdraw the local record; status/compact work immediately.
+        await switchZcode('team', '')
+        const teamOut = await tool('squad_dispatch').execute(
+          { agent: 'zcode', message: 'impl as team', phase: 'implement' },
+          exec,
+        )
+        assert.match(teamOut, /已创建 zcode/)
+        const teamState = await readState()
+        assert.equal(teamState.dispatches.at(-1).mode, 'spawned')
+        assert.ok(teamState.members?.zcode?.id)
+        assert.notEqual(teamState.members.zcode.id, localChildId)
+        assert.equal(teamState.children?.zcode, undefined, 'stale local binding withdrawn')
+        const status = await tool('squad_status').execute({}, exec)
+        assert.match(status, /成员：[\s\S]*?context: /)
+        const compactOut = await tool('squad_compact').execute({ agent: 'zcode' }, exec)
+        assert.match(compactOut, /已压缩 zcode/)
+        assert.equal(compacted.at(-1), teamState.members.zcode.id)
+
+        // Switching back spawns a fresh local child and withdraws the member.
+        await switchZcode('local', 'p/m1')
+        const backOut = await tool('squad_dispatch').execute(
+          { agent: 'zcode', message: 'impl as local', phase: 'implement' },
+          exec,
+        )
+        assert.match(backOut, /已创建本地子代理 zcode/)
+        const backState = await readState()
+        assert.equal(backState.dispatches.at(-1).mode, 'local')
+        assert.ok(backState.children?.zcode?.id)
+        assert.equal(backState.members?.zcode, undefined, 'stale team binding withdrawn')
+
+        // Legacy name-only row (no task STATE record): no resume, no rebind,
+        // no usage grant.
+        delete backState.children.zcode
+        await writeFile(statePath, JSON.stringify(backState, null, 2), 'utf8')
+        const legacyId = 'legacy-name-only-1'
+        const legacyAgent = host.makeAgent(legacyId, { role: 'teammate', name: 'zcode' })
+        legacyAgent.__root = lead
+        host.members.push({ id: legacyId, name: 'zcode', status: 'inactive' })
+        const sentBefore = host.sent.length
+        const legacyOut = await tool('squad_dispatch').execute(
+          { agent: 'zcode', message: 'legacy', phase: 'implement' },
+          exec,
+        )
+        assert.match(legacyOut, /已创建本地子代理 zcode/)
+        const legacyState = await readState()
+        assert.notEqual(legacyState.children.zcode.id, legacyId)
+        assert.equal(host.sent.length, sentBefore, 'legacy row is never resumed')
+        assert.equal(host.sent.filter((item) => item.targetId === legacyId).length, 0)
+        const legacyStatus = await tool('squad_status').execute({}, exec)
+        const legacyLine = legacyStatus.split('\n').find((line) => line.includes(legacyId))
+        assert.ok(legacyLine === undefined || !legacyLine.includes('context:'))
+      },
+    )
+  })
+
+  await t.test('unique host names survive idle local→team→local switches', async () => {
+    const compacted = []
+    const meter = {
+      contextPressure: () => ({ contextWindow: 200000, pressureTokens: 150000 }),
+      measure: () => ({ totalTokens: 172000 }),
+    }
+    const pruner = { pruneSession: () => ({ pruned: [{ originalSeq: 1 }], charsRemoved: 1 }) }
+    const compaction = {
+      config: { auto: true },
+      compactNow: async (agent) => {
+        compacted.push(agent.id)
+        return { shadowedTokenCount: 1, shadowedSeqs: [1] }
+      },
+    }
+    await withSquadHost(
+      { strictNames: true, services: { tokenMeter: meter, toolResultPruner: pruner, compaction } },
+      async ({ workspace, dshHome, host, tool, exec, lead }) => {
+        await tool('squad_enable').execute({}, exec)
+        const { taskId } = await startContextTask(tool, exec, { agents: ['zcode', 'qoder'] })
+        const statePath = join(workspace, '.agent-squad', taskId, 'STATE.json')
+        const readState = async () => JSON.parse(await readFile(statePath, 'utf8'))
+        const settingsPath = join(dshHome, 'agent-squad', 'settings.json')
+        const { createSettingsStore } = await import('../settings.js')
+        const store = createSettingsStore({ filePath: settingsPath })
+        const switchZcode = async (executor, model) => {
+          const snapshot = await store.read()
+          await store.save({
+            expectedRevision: snapshot.revision,
+            agents: snapshot.agents.map((row) =>
+              row.id === 'zcode' ? { ...row, executor, model } : row,
+            ),
+            worktree: snapshot.worktree,
+          })
+        }
+        const bindLocal = (id, name) => {
+          const agent = host.makeAgent(id, undefined, {
+            header: { config: { provider: 'p', model: 'm1' } },
+          })
+          agent.__root = lead
+          host.members.push({ id, name, status: 'inactive' })
+          return agent
+        }
+
+        // 1) local child holds host name `zcode` even while idle.
+        await tool('squad_dispatch').execute({ agent: 'zcode', message: 'local one', phase: 'implement' }, exec)
+        const firstActivation = host.activations.at(-1)
+        assert.equal(firstActivation.name, 'zcode')
+        const childOne = firstActivation.childId
+        bindLocal(childOne, 'zcode')
+
+        // 2) switching to team must pick a free legal host name, not reuse it.
+        await switchZcode('team', '')
+        const teamOut = await tool('squad_dispatch').execute(
+          { agent: 'zcode', message: 'team one', phase: 'implement' },
+          exec,
+        )
+        assert.match(teamOut, /已创建 zcode/)
+        const teamActivation = host.activations.at(-1)
+        assert.ok(teamActivation.name)
+        assert.notEqual(teamActivation.name, 'zcode')
+        const teamState = await readState()
+        const teamId = teamState.members.zcode.id
+        assert.notEqual(teamId, childOne)
+        assert.equal(teamState.children?.zcode, undefined)
+
+        // 3) switching back to local must pick yet another free name.
+        await switchZcode('local', 'p/m1')
+        const localOut = await tool('squad_dispatch').execute(
+          { agent: 'zcode', message: 'local two', phase: 'implement' },
+          exec,
+        )
+        assert.match(localOut, /已创建本地子代理 zcode/)
+        const localActivation = host.activations.at(-1)
+        assert.ok(localActivation.name)
+        assert.notEqual(localActivation.name, 'zcode')
+        assert.notEqual(localActivation.name, teamActivation.name)
+        const localState = await readState()
+        const childThree = localState.children.zcode.id
+        assert.notEqual(childThree, childOne)
+        assert.equal(localState.members?.zcode, undefined)
+        bindLocal(childThree, localActivation.name)
+        const status = await tool('squad_status').execute({}, exec)
+        assert.ok(status.includes(`- zcode → ${childThree} `))
+        assert.match(await tool('squad_compact').execute({ agent: 'zcode' }, exec), /已压缩 zcode/)
+        assert.equal(compacted.at(-1), childThree)
+
+        // 4) an existing same-name legacy row must not block a new creation.
+        delete localState.children.zcode
+        await writeFile(statePath, JSON.stringify(localState, null, 2), 'utf8')
+        const legacyId = 'legacy-strict-row-1'
+        const legacyAgent = host.makeAgent(legacyId, { role: 'teammate', name: 'zcode' })
+        legacyAgent.__root = lead
+        host.members.push({ id: legacyId, name: 'zcode', status: 'inactive' })
+        const legacyOut = await tool('squad_dispatch').execute(
+          { agent: 'zcode', message: 'legacy strict', phase: 'implement' },
+          exec,
+        )
+        assert.match(legacyOut, /已创建本地子代理 zcode/)
+        const legacyState = await readState()
+        assert.notEqual(legacyState.children.zcode.id, legacyId)
+        assert.notEqual(host.activations.at(-1).name, 'zcode')
+        bindLocal(legacyState.children.zcode.id, host.activations.at(-1).name)
+        assert.match(await tool('squad_compact').execute({ agent: 'zcode' }, exec), /已压缩 zcode/)
+        assert.equal(compacted.at(-1), legacyState.children.zcode.id)
+      },
+    )
+  })
+
+  await t.test('withdrawn continuable ids lose the automatic fallback binding', async () => {
+    const calls = []
+    const compaction = {
+      config: { auto: false },
+      compactIfNeeded: async (agent) => {
+        calls.push(agent.id)
+        return null
+      },
+    }
+    await withSquadHost(
+      {
+        services: { compaction },
+        hooks: {
+          onExternal: async (provider) => {
+            if (provider === 'mock-ext') throw new Error('provider down')
+          },
+        },
+      },
+      async ({ workspace, dshHome, host, tool, exec, lead }) => {
+        await tool('squad_enable').execute({}, exec)
+        const { taskId } = await startContextTask(tool, exec, { agents: ['zcode'] })
+        const statePath = join(workspace, '.agent-squad', taskId, 'STATE.json')
+        const settingsPath = join(dshHome, 'agent-squad', 'settings.json')
+        const { createSettingsStore } = await import('../settings.js')
+        const store = createSettingsStore({ filePath: settingsPath })
+        const switchZcode = async (executor, model) => {
+          const snapshot = await store.read()
+          await store.save({
+            expectedRevision: snapshot.revision,
+            agents: snapshot.agents.map((row) =>
+              row.id === 'zcode' ? { ...row, executor, model } : row,
+            ),
+            worktree: snapshot.worktree,
+          })
+        }
+        const bindLocal = (id) => {
+          const agent = host.makeAgent(id, undefined, {
+            header: { config: { provider: 'p', model: 'm1' } },
+          })
+          agent.__root = lead
+          host.members.push({ id, status: 'inactive' })
+          return agent
+        }
+        const handler = host.handlers['agent/pre-step'][0]
+        assert.ok(handler)
+        const preStep = (agent) =>
+          handler({ agent, signal: new AbortController().signal }, async () => ({
+            kind: 'enter',
+            messages: [],
+          }))
+
+        await tool('squad_dispatch').execute({ agent: 'zcode', message: 'local', phase: 'implement' }, exec)
+        const oldId = host.activations.at(-1).childId
+        const oldAgent = bindLocal(oldId)
+        await preStep(oldAgent)
+        assert.deepEqual(calls, [oldId], 'active local child participates in the fallback')
+
+        // A failed external switch keeps the still-valid local ownership.
+        await switchZcode('external', 'mock-ext')
+        await assert.rejects(
+          tool('squad_dispatch').execute({ agent: 'zcode', message: 'failing ext', phase: 'implement' }, exec),
+          /provider down/,
+        )
+        await preStep(oldAgent)
+        assert.deepEqual(calls, [oldId, oldId], 'failed dispatch keeps the previous binding')
+
+        // A successful one-shot external switch withdraws the old binding.
+        await switchZcode('external', 'p/m9')
+        await tool('squad_dispatch').execute({ agent: 'zcode', message: 'one shot', phase: 'implement' }, exec)
+        await preStep(oldAgent)
+        assert.deepEqual(calls, [oldId, oldId], 'withdrawn id no longer triggers compaction')
+
+        // A later local child keeps the policy-driven fallback.
+        await switchZcode('local', 'p/m1')
+        await tool('squad_dispatch').execute({ agent: 'zcode', message: 'local again', phase: 'implement' }, exec)
+        const newId = host.activations.at(-1).childId
+        assert.notEqual(newId, oldId)
+        const newAgent = bindLocal(newId)
+        await preStep(newAgent)
+        assert.deepEqual(calls, [oldId, oldId, newId])
+      },
+    )
+  })
+
+  await t.test('a running base-name substitute is refused before probing or creation', async () => {
+    await withSquadHost(
+      { config: { workerProbe: true }, overrides: { opencode: { model: 'p/m1' } } },
+      async ({ workspace, host, tool, exec }) => {
+        await tool('squad_enable').execute({}, exec)
+        const { taskId } = await startContextTask(tool, exec, { agents: ['zcode', 'opencode'] })
+        const statePath = join(workspace, '.agent-squad', taskId, 'STATE.json')
+        const readState = async () => JSON.parse(await readFile(statePath, 'utf8'))
+        const before = await readState()
+
+        // The substitute has only a running same-base-name tree row; there is
+        // no STATE record proving it belongs to this task.
+        const runningRow = { id: 'running-opencode-1', name: 'opencode', status: 'running' }
+        host.members.push(runningRow)
+        const startActivation = host.subagents.startActivation
+        host.subagents.startActivation = (spec) => {
+          if (spec.label === 'probe/zcode') throw new Error('HTTP 429 quota exceeded (fixture)')
+          return startActivation(spec)
+        }
+        await assert.rejects(
+          tool('squad_dispatch').execute({ agent: 'zcode', message: 'impl', phase: 'implement' }, exec),
+          /目标 opencode 仍在运行或创建中/,
+        )
+        assert.equal(
+          host.activations.filter((row) => String(row.label ?? '').includes(`/${taskId}/`) === false).length,
+          host.activations.length,
+          'no business activation on refusal',
+        )
+        assert.equal(
+          host.activations.filter((row) => String(row.label ?? '') === `${taskId}/implement/opencode`).length,
+          0,
+        )
+        const afterReject = await readState()
+        assert.deepEqual(
+          {
+            dispatches: afterReject.dispatches,
+            round: afterReject.round,
+            codeEpoch: afterReject.codeEpoch,
+          },
+          {
+            dispatches: before.dispatches,
+            round: before.round,
+            codeEpoch: before.codeEpoch,
+          },
+          'refused dispatch does not advance state',
+        )
+
+        // Once idle, the same substitute is dispatchable with a fresh host name
+        // (the base name is still occupied by the old row).
+        runningRow.status = 'inactive'
+        const retry = await tool('squad_dispatch').execute(
+          { agent: 'zcode', message: 'retry', phase: 'implement' },
+          exec,
+        )
+        assert.match(retry, /已创建本地子代理 opencode/)
+        assert.notEqual(host.activations.at(-1).name, 'opencode')
+        const afterRetry = await readState()
+        assert.ok(afterRetry.children?.opencode?.id)
+        assert.notEqual(afterRetry.children.opencode.id, runningRow.id)
+      },
+    )
+  })
+
+  await t.test('a failed model-change creation restores the previous binding', async () => {
+    const compacted = []
+    const preStepCalls = []
+    const meter = {
+      contextPressure: () => ({ contextWindow: 200000, pressureTokens: 150000 }),
+      measure: () => ({ totalTokens: 172000 }),
+    }
+    const pruner = { pruneSession: () => ({ pruned: [{ originalSeq: 1 }], charsRemoved: 1 }) }
+    const compaction = {
+      config: { auto: false },
+      compactIfNeeded: async (agent) => {
+        preStepCalls.push(agent.id)
+        return null
+      },
+      compactNow: async (agent) => {
+        compacted.push(agent.id)
+        return { shadowedTokenCount: 1, shadowedSeqs: [1] }
+      },
+    }
+    await withSquadHost(
+      { services: { tokenMeter: meter, toolResultPruner: pruner, compaction } },
+      async ({ workspace, dshHome, host, tool, exec, lead }) => {
+        await tool('squad_enable').execute({}, exec)
+        const { taskId } = await startContextTask(tool, exec, { agents: ['zcode'] })
+        const statePath = join(workspace, '.agent-squad', taskId, 'STATE.json')
+        const readState = async () => JSON.parse(await readFile(statePath, 'utf8'))
+        const settingsPath = join(dshHome, 'agent-squad', 'settings.json')
+        const { createSettingsStore } = await import('../settings.js')
+        const store = createSettingsStore({ filePath: settingsPath })
+        const switchModel = async (model) => {
+          const snapshot = await store.read()
+          await store.save({
+            expectedRevision: snapshot.revision,
+            agents: snapshot.agents.map((row) => (row.id === 'zcode' ? { ...row, model } : row)),
+            worktree: snapshot.worktree,
+          })
+        }
+        const bindLocal = (id, name) => {
+          const agent = host.makeAgent(id, undefined, {
+            header: { config: { provider: 'p', model: 'p/m1' } },
+          })
+          agent.__root = lead
+          host.members.push({ id, name, status: 'inactive' })
+          return agent
+        }
+        const handler = host.handlers['agent/pre-step'][0]
+        assert.ok(handler)
+        const preStep = (agent) =>
+          handler({ agent, signal: new AbortController().signal }, async () => ({
+            kind: 'enter',
+            messages: [],
+          }))
+
+        await tool('squad_dispatch').execute({ agent: 'zcode', message: 'impl', phase: 'implement' }, exec)
+        const oldId = host.activations.at(-1).childId
+        const oldAgent = bindLocal(oldId, host.activations.at(-1).name)
+
+        // Model change whose creation fails must keep the old record.
+        await switchModel('p/m2')
+        const startActivation = host.subagents.startActivation
+        host.subagents.startActivation = (spec) => {
+          if (spec.label === `${taskId}/implement/zcode`) throw new Error('model capacity unavailable')
+          return startActivation(spec)
+        }
+        await assert.rejects(
+          tool('squad_dispatch').execute({ agent: 'zcode', message: 'impl m2', phase: 'implement' }, exec),
+          /model capacity unavailable/,
+        )
+        const failedState = await readState()
+        assert.equal(failedState.children?.zcode?.id, oldId, 'previous proven binding restored')
+        const status = await tool('squad_status').execute({}, exec)
+        assert.ok(status.includes(`- zcode → ${oldId} `))
+        assert.match(await tool('squad_compact').execute({ agent: 'zcode' }, exec), /已压缩 zcode/)
+        assert.equal(compacted.at(-1), oldId, 'compact still targets the old proven id')
+
+        // The old id keeps the fallback until the retried creation succeeds.
+        await preStep(oldAgent)
+        assert.deepEqual(preStepCalls, [oldId])
+
+        host.subagents.startActivation = startActivation
+        const retry = await tool('squad_dispatch').execute(
+          { agent: 'zcode', message: 'impl m2 retry', phase: 'implement' },
+          exec,
+        )
+        assert.match(retry, /已创建本地子代理 zcode/)
+        const retriedState = await readState()
+        const newId = retriedState.children.zcode.id
+        assert.notEqual(newId, oldId)
+        const newAgent = bindLocal(newId, host.activations.at(-1).name)
+        await preStep(oldAgent)
+        assert.deepEqual(preStepCalls, [oldId], 'superseded id withdrawn after success')
+        await preStep(newAgent)
+        assert.deepEqual(preStepCalls, [oldId, newId], 'new binding keeps the policy fallback')
+      },
+    )
+  })
+
+  await t.test('substitute probe re-reads the tree and refuses before probing', async () => {
+    // idle→running: the substitute becomes running after dispatch entry. The
+    // substitute probe must not run and no successful probe may be recorded.
+    await withSquadHost(
+      { config: { workerProbe: true }, overrides: { opencode: { model: 'p/m1' } } },
+      async ({ workspace, host, tool, exec }) => {
+        await tool('squad_enable').execute({}, exec)
+        const { taskId } = await startContextTask(tool, exec, { agents: ['zcode', 'opencode'] })
+        const statePath = join(workspace, '.agent-squad', taskId, 'STATE.json')
+        const readState = async () => JSON.parse(await readFile(statePath, 'utf8'))
+        const before = await readState()
+        const row = { id: 'substitute-row-1', name: 'opencode', status: 'inactive' }
+        host.members.push(row)
+        const startActivation = host.subagents.startActivation
+        host.subagents.startActivation = (spec) => {
+          if (spec.label === 'probe/zcode') {
+            row.status = 'running' // transition after the entry snapshot
+            throw new Error('HTTP 429 quota exceeded (fixture)')
+          }
+          return startActivation(spec)
+        }
+        await assert.rejects(
+          tool('squad_dispatch').execute({ agent: 'zcode', message: 'impl', phase: 'implement' }, exec),
+          /目标 opencode 仍在运行或创建中/,
+        )
+        assert.equal(
+          host.activations.filter((item) => String(item.label ?? '').includes(`/${taskId}/`)).length,
+          0,
+          'no business activation on refusal',
+        )
+        assert.equal(
+          host.activations.filter((item) => item.label === 'probe/opencode').length,
+          0,
+          'substitute was not probed from the stale idle snapshot',
+        )
+        const afterReject = await readState()
+        assert.deepEqual(
+          { probes: afterReject.probes, round: afterReject.round, dispatches: afterReject.dispatches },
+          { probes: before.probes, round: before.round, dispatches: before.dispatches },
+          'refusal does not record a substitute success or advance the round',
+        )
+      },
+    )
+
+    // running→idle: the substitute became idle; probing must use the fresh
+    // state and create a new child with a free host name.
+    await withSquadHost(
+      {
+        strictNames: true,
+        config: { workerProbe: true },
+        overrides: { opencode: { model: 'p/m1' } },
+      },
+      async ({ workspace, host, tool, exec }) => {
+        await tool('squad_enable').execute({}, exec)
+        const { taskId } = await startContextTask(tool, exec, { agents: ['zcode', 'opencode'] })
+        const row = { id: 'substitute-row-2', name: 'opencode', status: 'running' }
+        host.members.push(row)
+        const startActivation = host.subagents.startActivation
+        host.subagents.startActivation = (spec) => {
+          if (spec.label === 'probe/zcode') {
+            row.status = 'inactive' // stale snapshot said running
+            throw new Error('HTTP 429 quota exceeded (fixture)')
+          }
+          return startActivation(spec)
+        }
+        const out = await tool('squad_dispatch').execute(
+          { agent: 'zcode', message: 'impl', phase: 'implement' },
+          exec,
+        )
+        assert.match(out, /已创建本地子代理 opencode/)
+        assert.equal(
+          host.activations.filter((item) => item.label === 'probe/opencode').length,
+          1,
+          'substitute is probed from the refreshed idle state',
+        )
+        const business = host.activations.filter(
+          (item) => item.label === `${taskId}/implement/opencode`,
+        )
+        assert.equal(business.length, 1)
+        assert.ok(business[0].name)
+        assert.notEqual(business[0].name, 'opencode', 'stale host name is not reused')
+        const state = JSON.parse(await readFile(join(workspace, '.agent-squad', taskId, 'STATE.json'), 'utf8'))
+        assert.ok(state.probes?.opencode?.ok === true)
+        assert.ok(state.children?.opencode?.id)
+        assert.notEqual(state.children.opencode.id, row.id)
+      },
+    )
+  })
+
+  await t.test('an exact idle binding wins over a running base-name legacy row', async () => {
+    const setupBoundTask = async ({ workspace, host, tool, exec, boundStatus }) => {
+      await tool('squad_enable').execute({}, exec)
+      const { taskId } = await startContextTask(tool, exec, { agents: ['zcode'] })
+      const statePath = join(workspace, '.agent-squad', taskId, 'STATE.json')
+      const state = JSON.parse(await readFile(statePath, 'utf8'))
+      state.children = { zcode: { id: 'bound-child-1', model: 'p/m1', status: 'active' } }
+      await writeFile(statePath, JSON.stringify(state, null, 2), 'utf8')
+      host.members.push({
+        id: 'bound-child-1',
+        name: 'zcode-2',
+        status: boundStatus === 'running' ? 'running' : 'inactive',
+      })
+      host.members.push({ id: 'legacy-base-row', name: 'zcode', status: 'running' })
+      return { taskId, statePath }
+    }
+
+    // Current binding idle, unrelated base-name row running: resume (with
+    // probe:true) must target the exact bound id, not be refused.
+    await withSquadHost(
+      { config: { workerProbe: true } },
+      async ({ workspace, host, tool, exec }) => {
+        const { taskId } = await setupBoundTask({ workspace, host, tool, exec, boundStatus: 'idle' })
+        const out = await tool('squad_dispatch').execute(
+          { agent: 'zcode', message: 'resume exact', phase: 'implement', probe: true },
+          exec,
+        )
+        assert.match(out, /已续跑本地子代理 zcode/)
+        assert.equal(host.sent.at(-1).targetId, 'bound-child-1')
+        const state = JSON.parse(await readFile(join(workspace, '.agent-squad', taskId, 'STATE.json'), 'utf8'))
+        assert.equal(state.children.zcode.id, 'bound-child-1')
+        assert.equal(
+          host.activations.filter((item) => String(item.label ?? '').includes(`/${taskId}/`)).length,
+          0,
+          'resume does not create a business child',
+        )
+      },
+    )
+
+    // Reverse: the exact binding is running, the legacy base row idle → refuse.
+    await withSquadHost({}, async ({ workspace, host, tool, exec }) => {
+      await setupBoundTask({ workspace, host, tool, exec, boundStatus: 'running' })
+      await assert.rejects(
+        tool('squad_dispatch').execute({ agent: 'zcode', message: 'blocked', phase: 'implement' }, exec),
+        /目标 zcode 仍在运行或创建中/,
+      )
+      assert.equal(host.activations.length, 0)
+    })
+
+    // No record at all: a running base-name row still refuses (name proves
+    // "cannot dispatch", never a resume right).
+    await withSquadHost({ config: { workerProbe: true } }, async ({ workspace, host, tool, exec }) => {
+      await tool('squad_enable').execute({}, exec)
+      const { taskId } = await startContextTask(tool, exec, { agents: ['zcode'] })
+      const statePath = join(workspace, '.agent-squad', taskId, 'STATE.json')
+      const state = JSON.parse(await readFile(statePath, 'utf8'))
+      delete state.children
+      await writeFile(statePath, JSON.stringify(state, null, 2), 'utf8')
+      host.members.push({ id: 'no-record-running', name: 'zcode', status: 'running' })
+      await assert.rejects(
+        tool('squad_dispatch').execute({ agent: 'zcode', message: 'no record', phase: 'implement' }, exec),
+        /目标 zcode 仍在运行或创建中/,
+      )
+      assert.equal(host.activations.length, 0)
+    })
+  })
+
+  await t.test('both recorded ids participate in the busy gate', async () => {
+    const setupMixed = async ({ workspace, host, tool, exec, memberStatus, withBaseRunning }) => {
+      await tool('squad_enable').execute({}, exec)
+      const { taskId } = await startContextTask(tool, exec, { agents: ['opencode'] })
+      const statePath = join(workspace, '.agent-squad', taskId, 'STATE.json')
+      const state = JSON.parse(await readFile(statePath, 'utf8'))
+      state.children = {
+        opencode: {
+          id: 'history-child-idle',
+          model: 'dsh-opencode-go/deepseek-v4.1-flash',
+          status: 'active',
+        },
+      }
+      state.members = { opencode: { id: 'member-current' } }
+      await writeFile(statePath, JSON.stringify(state, null, 2), 'utf8')
+      host.members.push({ id: 'history-child-idle', name: 'opencode-old', status: 'inactive' })
+      // Only the unrelated row may own the base name; looking it up must not resolve to the member.
+      host.members.push({ id: 'member-current', name: 'opencode-2', status: memberStatus })
+      if (withBaseRunning) {
+        host.members.push({ id: 'unrelated-base-running', name: 'opencode', status: 'running' })
+      }
+      return { taskId, statePath }
+    }
+
+    // Historical idle child + running team member: the exact child row must not
+    // mask the running member. Refuse with no send/dispatch/state advance.
+    await withSquadHost(
+      { overrides: { opencode: { executor: 'team', model: '' } } },
+      async ({ workspace, host, tool, exec }) => {
+        const { taskId, statePath } = await setupMixed({
+          workspace, host, tool, exec, memberStatus: 'running', withBaseRunning: false,
+        })
+        const before = JSON.parse(await readFile(statePath, 'utf8'))
+        await assert.rejects(
+          tool('squad_dispatch').execute({ agent: 'opencode', message: 'blocked', phase: 'implement' }, exec),
+          /目标 opencode 仍在运行或创建中/,
+        )
+        assert.equal(host.sent.length, 0)
+        const after = JSON.parse(await readFile(statePath, 'utf8'))
+        assert.deepEqual(
+          {
+            probes: after.probes,
+            round: after.round,
+            codeEpoch: after.codeEpoch,
+            dispatches: after.dispatches,
+          },
+          {
+            probes: before.probes,
+            round: before.round,
+            codeEpoch: before.codeEpoch,
+            dispatches: before.dispatches,
+          },
+          'refused mixed bindings do not advance state',
+        )
+        assert.ok(taskId)
+      },
+    )
+
+    // Both exact rows idle: allow even with an unrelated base-name running row;
+    // resume the exact team member id.
+    await withSquadHost(
+      { overrides: { opencode: { executor: 'team', model: '' } } },
+      async ({ workspace, host, tool, exec }) => {
+        const { statePath } = await setupMixed({
+          workspace, host, tool, exec, memberStatus: 'inactive', withBaseRunning: true,
+        })
+        const before = JSON.parse(await readFile(statePath, 'utf8'))
+        const out = await tool('squad_dispatch').execute(
+          { agent: 'opencode', message: 'resume member', phase: 'implement' },
+          exec,
+        )
+        assert.match(out, /已续跑 opencode/)
+        assert.deepEqual(host.sent.map((entry) => entry.targetId), ['member-current'], 'exactly one delivery to the recorded team id')
+        assert.equal(host.activations.length, 0, 'reuse the member instead of creating another session')
+        const after = JSON.parse(await readFile(statePath, 'utf8'))
+        assert.equal(after.dispatches.length, before.dispatches.length + 1)
+        assert.equal(after.dispatches.at(-1).mode, 'resumed')
+        assert.equal(after.children?.opencode, undefined, 'stale child record withdrawn')
+        assert.equal(after.members.opencode.id, 'member-current')
+      },
+    )
+  })
+
+  await t.test('fallback warnings dedupe per agent and reason', async () => {
+    const warns = []
+    let reason = 'A'
+    let calls = 0
+    const compaction = {
+      config: { auto: false },
+      compactIfNeeded: async () => {
+        calls += 1
+        throw new Error(reason)
+      },
+    }
+    await withSquadHost(
+      { services: { compaction }, logger: { warn: (text) => warns.push(String(text)) } },
+      async ({ host, tool, exec, lead }) => {
+        await tool('squad_enable').execute({}, exec)
+        await startContextTask(tool, exec, { agents: ['zcode', 'opencode'] })
+        const handler = host.handlers['agent/pre-step'][0]
+        assert.ok(handler)
+        const bindChild = (id) => {
+          const agent = host.makeAgent(id, undefined, {})
+          agent.__root = lead
+          return agent
+        }
+        const fire = (agent) =>
+          handler({ agent, signal: new AbortController().signal }, async () => ({
+            kind: 'enter',
+            messages: [],
+          }))
+        const warningCount = () =>
+          warns.filter((text) => text.includes('补位压缩失败')).length
+
+        await tool('squad_dispatch').execute({ agent: 'zcode', message: 'impl', phase: 'implement' }, exec)
+        const zAgent = bindChild(host.activations.at(-1).childId)
+        await fire(zAgent) // A
+        reason = 'B'
+        await fire(zAgent) // B
+        reason = 'A'
+        await fire(zAgent) // duplicate A: no new warning
+        assert.equal(calls, 3)
+        assert.equal(warningCount(), 2, 'A/B/A warns only for A and B')
+
+        // Another Agent's first A is a separate (Agent, reason) pair.
+        await tool('squad_dispatch').execute({ agent: 'opencode', message: 'impl', phase: 'implement' }, exec)
+        const oAgent = bindChild(host.activations.at(-1).childId)
+        await fire(oAgent)
+        assert.equal(calls, 4)
+        assert.equal(warningCount(), 3, 'second agent gets its own first warning')
+
+        // Healthy/backpressure pass-through is not a failure: no warning.
+        compaction.compactIfNeeded = async () => {
+          calls += 1
+          return null
+        }
+        await fire(zAgent)
+        assert.equal(calls, 5)
+        assert.equal(warningCount(), 3, 'normal pressure handling does not warn')
+      },
+    )
+  })
+})
+
+/** T23 — manual teammate compaction: target resolution, order, errors, receipts. */
+test('T23 manual compact', async (t) => {
+  const order = []
+  const compactCalls = []
+  const pruneCalls = []
+  let compactInvoked = 0
+  let used = 172000
+  let compactImpl = async (agent, signal) => {
+    order.push('compactNow')
+    compactCalls.push({ agent, signal })
+    used = 96000
+    return { shadowedTokenCount: 1234, shadowedSeqs: [7, 9] }
+  }
+  const meter = {
+    contextPressure: () => ({ contextWindow: 200000, pressureTokens: 150000 }),
+    measure: () => {
+      order.push('measure')
+      return { totalTokens: used }
+    },
+  }
+  const pruner = {
+    pruneSession(session) {
+      order.push('prune')
+      pruneCalls.push(session)
+      return { pruned: [{ originalSeq: 1 }], charsRemoved: 10 }
+    },
+  }
+  const compactionService = {
+    config: { auto: true },
+    compactNow: (agent, signal) => {
+      compactInvoked += 1
+      return compactImpl(agent, signal)
+    },
+  }
+  const services = { tokenMeter: meter, toolResultPruner: pruner, compaction: compactionService }
+
+  await withSquadHost({ services }, async ({ workspace, dshHome, host, tool, lead, exec }) => {
+    await tool('squad_enable').execute({}, exec)
+    const settingsPath = join(dshHome, 'agent-squad', 'settings.json')
+    const { createSettingsStore } = await import('../settings.js')
+    const settingsStore = createSettingsStore({ filePath: settingsPath })
+    // Task B (team teammate) is created first so task A (local pinned child)
+    // owns the current pointer: default resolves local, explicit task_id the
+    // same-name team slot.
+    let snapshot = await settingsStore.read()
+    await settingsStore.save({
+      expectedRevision: snapshot.revision,
+      agents: snapshot.agents.map((row) =>
+        row.id === 'zcode' ? { ...row, executor: 'team', model: '' } : row,
+      ),
+      worktree: snapshot.worktree,
+    })
+    const b = await startContextTask(tool, exec, { agents: ['zcode'] })
+    await tool('squad_dispatch').execute({ agent: 'zcode', message: 'impl', phase: 'implement' }, exec)
+    const memberId = host.members.at(-1).id
+    const liveB = host.agentsById.get(memberId)
+    assert.ok(liveB)
+    liveB.runMaintenance = async (task) => {
+      order.push('maintenance-enter')
+      const value = await task(new AbortController().signal)
+      order.push('maintenance-exit')
+      return value
+    }
+    // Switch the same member back to a local pinned child for task A.
+    snapshot = await settingsStore.read()
+    await settingsStore.save({
+      expectedRevision: snapshot.revision,
+      agents: snapshot.agents.map((row) =>
+        row.id === 'zcode' ? { ...row, executor: 'local', model: 'p/m1' } : row,
+      ),
+      worktree: snapshot.worktree,
+    })
+    const a = await startContextTask(tool, exec, { agents: ['zcode'] })
+    await tool('squad_dispatch').execute({ agent: 'zcode', message: 'impl', phase: 'implement' }, exec)
+    const childA = host.activations.at(-1).childId
+    const liveA = host.makeAgent(childA, undefined, {
+      header: { config: { provider: 'qoder', model: 'qmodel_latest' } },
+      runMaintenance: async (task) => {
+        order.push('maintenance-enter')
+        const value = await task(new AbortController().signal)
+        order.push('maintenance-exit')
+        return value
+      },
+    })
+    liveA.__root = lead
+    // The local child must be a resident continuable row too.
+    host.members.push({ id: childA, status: 'inactive' })
+
+    // Default (current task A) resolves the local child; order is strict.
+    let discoverySignal
+    const listDescendants = host.subagents.listDescendants
+    host.subagents.listDescendants = (leadId, signal) => {
+      assert.equal(leadId, lead.id)
+      discoverySignal = signal
+      return listDescendants(leadId, signal)
+    }
+    order.length = 0
+    const localOut = await tool('squad_compact').execute({ agent: 'zcode' }, exec)
+    assert.match(localOut, new RegExp(`已压缩 zcode（task=${a.taskId}）`))
+    assert.match(localOut, /压缩前 context: model=qoder\/qmodel_latest window=200000 used=172000 ratio=86\.0%/)
+    assert.match(localOut, /压缩后 context: model=qoder\/qmodel_latest window=200000 used=96000 ratio=48\.0%/)
+    assert.equal(compactCalls.at(-1).agent, liveA)
+    assert.ok(discoverySignal instanceof AbortSignal)
+    assert.equal(compactCalls.at(-1).signal, discoverySignal)
+    assert.deepEqual(order, ['measure', 'maintenance-enter', 'prune', 'maintenance-exit', 'compactNow', 'measure'])
+    assert.equal(host.sent.length, 0, 'manual compaction never fakes a teammate message')
+    assert.equal(pruneCalls.at(-1), liveA.session)
+
+    // Explicit task_id resolves the same-name team member in task B.
+    order.length = 0
+    used = 172000
+    const teamOut = await tool('squad_compact').execute(
+      { agent: 'zcode', task_id: b.taskId },
+      exec,
+    )
+    assert.match(teamOut, new RegExp(`已压缩 zcode（task=${b.taskId}）`))
+    assert.match(
+      teamOut,
+      /压缩前 context: model=unknown window=200000 used=172000 ratio=86\.0% threshold=0\.86/,
+    )
+    assert.match(
+      teamOut,
+      /压缩后 context: model=unknown window=200000 used=96000 ratio=48\.0% threshold=0\.86/,
+    )
+    assert.match(teamOut, /shadowedTokens=1234 shadowedSeqs=\[7,9\]/)
+    assert.equal(compactCalls.at(-1).agent, liveB)
+    assert.equal(compactCalls.at(-1).signal, discoverySignal)
+    assert.equal(pruneCalls.at(-1), liveB.session)
+    assert.deepEqual(order, ['measure', 'maintenance-enter', 'prune', 'maintenance-exit', 'compactNow', 'measure'])
+    used = 172000
+
+    // Running target → busy with no host call.
+    liveB.status = 'running'
+    const invokedBeforeBusy = compactInvoked
+    const busyOut = await tool('squad_compact').execute({ agent: 'zcode', task_id: b.taskId }, exec)
+    assert.equal(busyOut, 'busy：队友运行中，稍后再试')
+    assert.equal(compactInvoked, invokedBeforeBusy)
+    liveB.status = 'idle'
+
+    // Host busy after pruning → busy + already-pruned notice, single attempt.
+    compactImpl = async () => {
+      throw Object.assign(new Error('busy'), { code: 'busy' })
+    }
+    const invokedBeforeHostBusy = compactInvoked
+    const hostBusyOut = await tool('squad_compact').execute({ agent: 'zcode', task_id: b.taskId }, exec)
+    assert.match(hostBusyOut, /^busy：队友运行中，稍后再试\n已修剪=1，请复查$/)
+    assert.equal(compactInvoked, invokedBeforeHostBusy + 1)
+
+    // Missing compactNow: refuse before pruning.
+    const savedCompaction = host.services.compaction
+    host.services.compaction = { config: { auto: true } }
+    const prunesBeforeMissing = pruneCalls.length
+    const missingOut = await tool('squad_compact').execute({ agent: 'zcode', task_id: b.taskId }, exec)
+    assert.equal(missingOut, '不可用：缺少 compaction.compactNow')
+    assert.equal(pruneCalls.length, prunesBeforeMissing)
+    host.services.compaction = savedCompaction
+
+    // null result: no safe range, explicit zero shadow numbers.
+    compactImpl = async () => null
+    const nullOut = await tool('squad_compact').execute({ agent: 'zcode', task_id: b.taskId }, exec)
+    assert.match(nullOut, /^无安全可压缩范围\n压缩前 context:/)
+    assert.match(nullOut, /shadowedTokens=0 shadowedSeqs=\[\]$/)
+
+    // 17 shadowed seqs: first 16 in order, then the total.
+    compactImpl = async () => ({
+      shadowedTokenCount: 17,
+      shadowedSeqs: Array.from({ length: 17 }, (_, index) => index + 1),
+    })
+    const manyOut = await tool('squad_compact').execute({ agent: 'zcode', task_id: b.taskId }, exec)
+    assert.match(manyOut, /shadowedSeqs=\[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16\]…（共17个）/)
+
+    await t.test('classified failures retain evidence of completed pruning', async () => {
+      const firstLines = {
+        changed: '历史已变化，请复查',
+        summary: '摘要失败，请复查',
+        commit: '提交失败，可能已部分生效，请复查',
+        persistence: '压缩完成但保存失败，请复查',
+        other: '压缩失败：boom',
+      }
+      const actual = {}
+      const before = [pruneCalls.length, compactInvoked]
+      for (const code of Object.keys(firstLines)) {
+        compactImpl = async () => { throw Object.assign(new Error('boom\nstack line two'), { code }) }
+        actual[code] = await tool('squad_compact').execute({ agent: 'zcode', task_id: b.taskId }, exec)
+      }
+      assert.deepEqual([pruneCalls.length, compactInvoked], before.map((count) => count + 5))
+      assert.deepEqual(actual, Object.fromEntries(Object.entries(firstLines).map(([code, text]) => [
+        code, `${text}\n已修剪=1，请复查`,
+      ])))
+    })
+    compactImpl = async () => {
+      const error = new Error('cancelled')
+      error.name = 'AbortError'
+      throw error
+    }
+    assert.match(await tool('squad_compact').execute({ agent: 'zcode', task_id: b.taskId }, exec), /^已取消压缩/)
+
+    // The tool-owned 180s budget classifies as a timeout, not a generic abort.
+    compactImpl = async () => null
+    const originalTimeout = AbortSignal.timeout
+    const invokedBeforeTimeout = compactInvoked
+    const prunesBeforeTimeout = pruneCalls.length
+    AbortSignal.timeout = (ms) => {
+      assert.equal(ms, 180000)
+      const controller = new AbortController()
+      controller.abort(new Error('tool timeout'))
+      return controller.signal
+    }
+    try {
+      assert.equal(
+        await tool('squad_compact').execute({ agent: 'zcode', task_id: b.taskId }, exec),
+        '压缩超时（180 秒）',
+      )
+    } finally {
+      AbortSignal.timeout = originalTimeout
+    }
+    assert.deepEqual([pruneCalls.length, compactInvoked], [prunesBeforeTimeout, invokedBeforeTimeout])
+
+    const settledArgs = { agent: 'zcode', task_id: b.taskId }
+    const cancelled = new AbortController()
+    cancelled.abort()
+    assert.equal(await tool('squad_compact').execute(settledArgs, { ...exec, signal: cancelled.signal }), '已取消压缩')
+    assert.deepEqual([pruneCalls.length, compactInvoked], [prunesBeforeTimeout, invokedBeforeTimeout])
+    const between = new AbortController()
+    const maintenance = liveB.runMaintenance
+    liveB.runMaintenance = async (task) => {
+      await maintenance(task)
+      between.abort()
+    }
+    try {
+      assert.equal(
+        await tool('squad_compact').execute(settledArgs, { ...exec, signal: between.signal }),
+        '已取消压缩\n已修剪=1，请复查',
+      )
+    } finally {
+      liveB.runMaintenance = maintenance
+    }
+    assert.deepEqual([pruneCalls.length, compactInvoked], [prunesBeforeTimeout + 1, invokedBeforeTimeout])
+
+    // Pruner missing / unsafe maintenance: show the note but still summarize.
+    compactImpl = async () => ({ shadowedTokenCount: 1234, shadowedSeqs: [7, 9] })
+    const savedPruner = host.services.toolResultPruner
+    delete host.services.toolResultPruner
+    const noPrunerOut = await tool('squad_compact').execute({ agent: 'zcode', task_id: b.taskId }, exec)
+    assert.match(noPrunerOut, /未修剪：toolResultPruner 不可用/)
+    assert.match(noPrunerOut, /shadowedTokens=1234 shadowedSeqs=\[7,9\]/)
+    host.services.toolResultPruner = savedPruner
+    const savedMaintenance = liveB.runMaintenance
+    liveB.runMaintenance = undefined
+    const noMaintenanceOut = await tool('squad_compact').execute({ agent: 'zcode', task_id: b.taskId }, exec)
+    assert.match(noMaintenanceOut, /未修剪：缺少安全维护能力/)
+    liveB.runMaintenance = savedMaintenance
+    // Maintenance admission failure → busy, no summary.
+    liveB.runMaintenance = () => {
+      throw new Error('agent active')
+    }
+    const invokedBeforeAdmission = compactInvoked
+    assert.equal(
+      await tool('squad_compact').execute({ agent: 'zcode', task_id: b.taskId }, exec),
+      'busy：队友运行中，稍后再试',
+    )
+    assert.equal(compactInvoked, invokedBeforeAdmission)
+    liveB.runMaintenance = savedMaintenance
+    // Pruner throws after entering maintenance → no bad state continues.
+    pruner.pruneSession = () => {
+      throw new Error('prune exploded')
+    }
+    const invokedBeforePruneFail = compactInvoked
+    // TECH-02 tightens this: a throwing pruner may have landed earlier
+    // replacements, so the reply must state the unknown partial write too.
+    assert.equal(
+      await tool('squad_compact').execute({ agent: 'zcode', task_id: b.taskId }, exec),
+      '修剪失败，请复查\n修剪结果未知，请复查',
+    )
+    assert.equal(compactInvoked, invokedBeforePruneFail)
+    pruner.pruneSession = function (session) {
+      order.push('prune')
+      pruneCalls.push(session)
+      return { pruned: [{ originalSeq: 1 }], charsRemoved: 10 }
+    }
+
+    // No history, cross-tree, external, invalid inputs, cold and done never
+    // enter the host compaction/prune operations.
+    const deniedCounts = [pruneCalls.length, compactInvoked]
+    const savedRoot = liveB.__root
+    try {
+      liveB.__root = { id: 'other-lead' }
+      assert.equal(await tool('squad_compact').execute(settledArgs, exec), '目标不属于本任务的小队')
+    } finally {
+      liveB.__root = savedRoot
+    }
+    const noHistoryOut = await tool('squad_compact').execute({ agent: 'qoder' }, exec)
+    assert.equal(noHistoryOut, '队友尚无本任务会话')
+
+    // External one-shot target refuses; never picks up stale member records.
+    await writeFile(join(workspace, '.agent-squad', a.taskId, 'PLAN.md'), '# PLAN A\n', 'utf8')
+    await tool('squad_dispatch').execute({ agent: 'codex', message: 'design', phase: 'design' }, exec)
+    assert.equal(
+      await tool('squad_compact').execute({ agent: 'codex' }, exec),
+      'external：一次性执行者不可人工压缩',
+    )
+
+    // Authorization and input boundaries.
+    await assert.rejects(
+      tool('squad_compact').execute({ agent: 'zcode', task_id: b.taskId }, { agent: { id: 'lead-x' }, signal: undefined }),
+      /仅允许已启用小队的 Lead 调用/,
+    )
+    await assert.rejects(tool('squad_compact').execute({ agent: 'lead' }, exec), /固定成员 id/)
+    await assert.rejects(
+      tool('squad_compact').execute({ agent: 'zcode', extra: 1 }, exec),
+      /不接受参数 "extra"/,
+    )
+    await assert.rejects(
+      tool('squad_compact').execute({ agent: 'zcode', task_id: '   ' }, exec),
+      /task_id 必须是非空字符串/,
+    )
+    await assert.rejects(
+      tool('squad_compact').execute({ agent: 'zcode', task_id: 't-missing' }, exec),
+      /未知小队任务/,
+    )
+    {
+      const originalRootOf = host.subagents.rootOf
+      host.subagents.rootOf = () => ({ id: 'not-lead' })
+      try {
+        await assert.rejects(
+          tool('squad_compact').execute({ agent: 'zcode', task_id: b.taskId }, exec),
+          /仅允许 Lead 调用/,
+        )
+      } finally {
+        host.subagents.rootOf = originalRootOf
+      }
+    }
+    // Cold: the record exists but no live Agent; never wake or fake it.
+    host.agentsById.delete(memberId)
+    const coldOut = await tool('squad_compact').execute({ agent: 'zcode', task_id: b.taskId }, exec)
+    assert.equal(coldOut, 'cold：会话未驻留，不能人工压缩')
+    // Finished task is refused.
+    const doneStatePath = join(workspace, '.agent-squad', b.taskId, 'STATE.json')
+    const doneState = JSON.parse(await readFile(doneStatePath, 'utf8'))
+    doneState.phase = 'done'
+    await writeFile(doneStatePath, JSON.stringify(doneState, null, 2), 'utf8')
+    await assert.rejects(
+      tool('squad_compact').execute({ agent: 'zcode', task_id: b.taskId }, exec),
+      /已经收尾/,
+    )
+    assert.deepEqual([pruneCalls.length, compactInvoked], deniedCounts)
+  })
+
+  // showUsage:false suppresses automatic lines but manual compaction still reads.
+  await withSquadHost(
+    { services: { tokenMeter: meter, toolResultPruner: pruner, compaction: compactionService }, config: { contextPolicy: { showUsage: false } } },
+    async ({ tool, exec, host }) => {
+      await tool('squad_enable').execute({}, exec)
+      const { taskId } = await startContextTask(tool, exec, { agents: ['zcode'] })
+      await tool('squad_dispatch').execute({ agent: 'zcode', message: 'impl', phase: 'implement' }, exec)
+      const childId = host.activations.at(-1).childId
+      const live = host.makeAgent(childId, undefined, {
+        header: { config: { provider: 'qoder', model: 'qmodel_latest' } },
+      })
+      live.__root = { id: 'lead-1' }
+      host.members.push({ id: childId, status: 'inactive' })
+      // Re-enable the lead record for the executed step guard.
+      const out = await tool('squad_compact').execute({ agent: 'zcode' }, exec)
+      assert.match(out, /压缩前 context: model=qoder\/qmodel_latest window=200000 used=172000/)
+      assert.match(out, /压缩后 context:/)
+      assert.ok(taskId)
+    },
+  )
+
+  await t.test('maintenance cancellation and partial pruning stop before summary', async () => {
+    const calls = { prune: 0, compact: 0 }
+    const meter = {
+      contextPressure: () => ({ contextWindow: 200000, pressureTokens: 150000 }),
+      measure: () => ({ totalTokens: 172000 }),
+    }
+    const pruner = {
+      pruneSession: () => {
+        calls.prune += 1
+        return { pruned: [{ originalSeq: 1 }], charsRemoved: 1 }
+      },
+    }
+    const compaction = {
+      config: { auto: true },
+      compactNow: async () => {
+        calls.compact += 1
+        return null
+      },
+    }
+    await withSquadHost(
+      { services: { tokenMeter: meter, toolResultPruner: pruner, compaction } },
+      async ({ host, tool, exec, lead }) => {
+        await tool('squad_enable').execute({}, exec)
+        await startContextTask(tool, exec, { agents: ['zcode'] })
+        await tool('squad_dispatch').execute({ agent: 'zcode', message: 'impl', phase: 'implement' }, exec)
+        const childId = host.activations.at(-1).childId
+        const live = host.makeAgent(childId, undefined, {
+          header: { config: { provider: 'p', model: 'm1' } },
+        })
+        live.__root = lead
+        host.members.push({ id: childId, status: 'inactive' })
+
+        // The short maintenance signal alone is cancelled before pruning:
+        // compactNow must never run.
+        live.runMaintenance = async (task) => {
+          const controller = new AbortController()
+          controller.abort()
+          return task(controller.signal)
+        }
+        assert.equal(await tool('squad_compact').execute({ agent: 'zcode' }, exec), '已取消压缩')
+        assert.deepEqual(calls, { prune: 0, compact: 0 })
+        live.runMaintenance = async (task) => task(new AbortController().signal)
+
+        // Caller cancel first, tool budget later: the combined signal's first
+        // reason keeps it a cancellation, not a timeout.
+        const user = new AbortController()
+        const timeout = new AbortController()
+        const originalTimeout = AbortSignal.timeout
+        AbortSignal.timeout = () => timeout.signal
+        try {
+          const pending = tool('squad_compact').execute(
+            { agent: 'zcode' },
+            { agent: exec.agent, signal: user.signal },
+          )
+          user.abort(new Error('user cancelled'))
+          timeout.abort(new Error('tool budget'))
+          assert.equal(await pending, '已取消压缩')
+          assert.deepEqual(calls, { prune: 0, compact: 0 })
+        } finally {
+          AbortSignal.timeout = originalTimeout
+        }
+
+        // Tool budget first, caller cancel later: timeout classification wins.
+        const userLate = new AbortController()
+        const timeoutFirst = new AbortController()
+        AbortSignal.timeout = () => timeoutFirst.signal
+        try {
+          const pending = tool('squad_compact').execute(
+            { agent: 'zcode' },
+            { agent: exec.agent, signal: userLate.signal },
+          )
+          timeoutFirst.abort(new Error('tool budget first'))
+          const out = await pending
+          userLate.abort(new Error('user cancelled later'))
+          assert.equal(out, '压缩超时（180 秒）')
+          assert.deepEqual(calls, { prune: 0, compact: 0 })
+        } finally {
+          AbortSignal.timeout = originalTimeout
+        }
+
+        // A prune that throws after it may have written replacements is
+        // reported as unknown partial pruning; no summary follows.
+        live.runMaintenance = async (task) => task(new AbortController().signal)
+        pruner.pruneSession = () => {
+          calls.prune += 1
+          throw new Error('partial write exploded')
+        }
+        assert.equal(
+          await tool('squad_compact').execute({ agent: 'zcode' }, exec),
+          '修剪失败，请复查\n修剪结果未知，请复查',
+        )
+        assert.deepEqual(calls, { prune: 1, compact: 0 })
+
+        // TR-11: pruning schedules a microtask that cancels the maintenance
+        // signal after the callback returns but before it releases. The
+        // summary must not start, and the known prune count is preserved.
+        const maintenanceController = new AbortController()
+        live.runMaintenance = async (task) => {
+          const result = await task(maintenanceController.signal)
+          await Promise.resolve()
+          return result
+        }
+        pruner.pruneSession = () => {
+          calls.prune += 1
+          queueMicrotask(() => maintenanceController.abort())
+          return { pruned: [{ originalSeq: 1 }], charsRemoved: 1 }
+        }
+        assert.equal(
+          await tool('squad_compact').execute({ agent: 'zcode' }, exec),
+          '已取消压缩\n已修剪=1，请复查',
+        )
+        assert.deepEqual(calls, { prune: 2, compact: 0 })
+
+        // TR-12: caller cancellation arrives from inside the throwing prune;
+        // the first line is the termination reason, the appended line is the
+        // unfinished-prune unknown, and no summary starts.
+        live.runMaintenance = async (task) => task(new AbortController().signal)
+        const userInPrune = new AbortController()
+        pruner.pruneSession = () => {
+          calls.prune += 1
+          userInPrune.abort(new Error('cancel during prune'))
+          throw new Error('throw after cancel')
+        }
+        assert.equal(
+          await tool('squad_compact').execute(
+            { agent: 'zcode' },
+            { agent: exec.agent, signal: userInPrune.signal },
+          ),
+          '已取消压缩\n修剪结果未知，请复查',
+        )
+        assert.deepEqual(calls, { prune: 3, compact: 0 })
+
+        // Same concurrency with the tool budget as the abort source.
+        const timeoutInPrune = new AbortController()
+        const originalTimeoutInPrune = AbortSignal.timeout
+        AbortSignal.timeout = () => timeoutInPrune.signal
+        try {
+          pruner.pruneSession = () => {
+            calls.prune += 1
+            timeoutInPrune.abort(new Error('timeout during prune'))
+            throw new Error('throw after timeout')
+          }
+          assert.equal(
+            await tool('squad_compact').execute({ agent: 'zcode' }, exec),
+            '压缩超时（180 秒）\n修剪结果未知，请复查',
+          )
+        } finally {
+          AbortSignal.timeout = originalTimeoutInPrune
+        }
+        assert.deepEqual(calls, { prune: 4, compact: 0 })
+
+        // TR-15: maintenance-only cancellation concurrent with a throwing
+        // prune. The caller is not cancelled, so the saved maintenance signal
+        // must own the first line; the prune state owns the appended unknown.
+        const maintenanceThrow = new AbortController()
+        live.runMaintenance = async (task) => task(maintenanceThrow.signal)
+        pruner.pruneSession = () => {
+          calls.prune += 1
+          maintenanceThrow.abort(new Error('maintenance cancelled during prune'))
+          throw new Error('prune failed after maintenance cancel')
+        }
+        assert.equal(
+          await tool('squad_compact').execute({ agent: 'zcode' }, exec),
+          '已取消压缩\n修剪结果未知，请复查',
+        )
+        assert.deepEqual(calls, { prune: 5, compact: 0 })
+      },
+    )
+  })
+})
+
+/** T24 — dispatch scope: new-task sections, rework defect packs, BRIEF bounds. */
+test('T24 dispatch scope', async (t) => {
+  await withSquadHost({ overrides: { opencode: { executor: 'external' } } }, async ({ workspace, host, tool, exec }) => {
+    await tool('squad_enable').execute({}, exec)
+    const taskA = await startContextTask(tool, exec, {
+      agents: ['codex', 'gpt', 'zcode', 'qoder', 'opencode'],
+    })
+    const dirA = join(workspace, '.agent-squad', taskA.taskId)
+    const promptOf = (activation) =>
+      activation.prompt.map((block) => block.text).join('')
+    const sentText = () => host.sent.at(-1).content.map((block) => block.text).join('')
+    const readsLine = (text) => text.split('\n').find((line) => line.startsWith('必读：')) ?? ''
+
+    // New task: complete TASK sections + stage reads, 50-line message keeps a
+    // bounded BRIEF, and the S/E/M contract is untouched.
+    await writeFile(join(dirA, 'PLAN.md'), '# PLAN A\n', 'utf8')
+    const longMessage = Array.from({ length: 50 }, (_, index) => `第 ${index + 1} 行交办`).join('\n')
+    await tool('squad_dispatch').execute({
+      agent: 'codex',
+      message: longMessage,
+      phase: 'design',
+      task_id: taskA.taskId,
+    }, exec)
+    const designPrompt = promptOf(host.activations.at(-1))
+    assert.ok(designPrompt.includes('目标：TASK.md#目标；验收：TASK.md#验收标准；约束：TASK.md#约束'))
+    assert.ok(designPrompt.includes('完整读取这三节'))
+    assert.ok(designPrompt.includes('PLAN.md（已有方案；存在时）'))
+    assert.ok(designPrompt.includes(longMessage), 'actual prompt preserves the full assignment')
+    assert.ok(!designPrompt.includes('JOURNAL.md 最后 80 行'))
+    assertSEM(designPrompt)
+    await assertBrief(dirA)
+    const designBrief = await readFile(join(dirA, 'BRIEF.md'), 'utf8')
+    assert.ok(designBrief.includes('TASK.md#验收标准'))
+    assert.ok(!designBrief.includes('第 50 行交办'), 'BRIEF never carries the task message body')
+
+    // Implement reads the approved plan and the published spec.
+    await tool('squad_approve_plan').execute({ task_id: taskA.taskId }, exec)
+    await writeFile(join(dirA, 'SPEC.md'), '# SPEC A\n', 'utf8')
+    await tool('squad_dispatch').execute({
+      agent: 'codex',
+      message: 'spec',
+      phase: 'spec',
+      task_id: taskA.taskId,
+    }, exec)
+    await tool('squad_dispatch').execute({
+      agent: 'zcode',
+      message: 'impl',
+      phase: 'implement',
+      task_id: taskA.taskId,
+    }, exec)
+    const implPrompt = promptOf(host.activations.at(-1))
+    assert.ok(readsLine(implPrompt).includes('PLAN-APPROVED.md'))
+    assert.ok(readsLine(implPrompt).includes('SPEC.md（技术规格）'))
+    assert.ok(!implPrompt.includes('JOURNAL.md 最后 80 行'))
+    assertSEM(implPrompt)
+    await assertBrief(dirA)
+    // Team activation receives the same strategy block.
+    await tool('squad_dispatch').execute({
+      agent: 'qoder',
+      message: 'impl team',
+      phase: 'implement',
+      task_id: taskA.taskId,
+    }, exec)
+    const teamPrompt = promptOf(host.activations.at(-1))
+    assert.ok(teamPrompt.includes('目标：TASK.md#目标；验收：TASK.md#验收标准；约束：TASK.md#约束'))
+    assert.ok(readsLine(teamPrompt).includes('PLAN-APPROVED.md'))
+    assert.ok(readsLine(teamPrompt).includes('SPEC.md（技术规格）'))
+    assertSEM(teamPrompt)
+    await assertBrief(dirA)
+
+    // Rework: defect package only, five-field message preserved, no full read.
+    await tool('squad_dispatch').execute({
+      agent: 'gpt',
+      message: 'review tests',
+      phase: 'test-review',
+      task_id: taskA.taskId,
+    }, exec)
+    await writeFile(
+      join(dirA, 'TEST-REVIEW.md'),
+      '# TEST-REVIEW\n失败项 D2\nVERDICT: CHANGES_REQUESTED\n',
+      'utf8',
+    )
+    const reworkMessage = 'D2 / AC3 / src/a.js:9 / 改边界 / node --test'
+    const reworkOut = await tool('squad_dispatch').execute({
+      agent: 'zcode',
+      message: reworkMessage,
+      phase: 'rework',
+    }, exec)
+    assert.match(reworkOut, /已续跑本地子代理 zcode/)
+    const reworkPrompt = sentText()
+    assert.ok(reworkPrompt.includes(REWORK_SCOPE_TEXT))
+    for (const field of ['D2', 'AC3', 'src/a.js:9', '改边界', 'node --test']) {
+      assert.ok(reworkPrompt.includes(field), `rework message keeps ${field}`)
+    }
+    assert.ok(reworkPrompt.includes('TASK.md 中受影响 AC 与约束（按编号定位，不整读）'))
+    assert.ok(reworkPrompt.includes('PLAN-APPROVED.md 中对应 AC（按编号定位）'))
+    assert.ok(reworkPrompt.includes('SPEC.md 中对应实现段与验证用例（按编号定位）'))
+    assert.ok(reworkPrompt.includes('TEST-REVIEW.md 的失败/缺陷段（按编号定位）'))
+    assert.ok(!reworkPrompt.includes('JOURNAL.md 最后 80 行'))
+    assert.ok(!reworkPrompt.includes('目标：TASK.md#目标'), 'rework does not re-read whole TASK sections')
+    assert.ok(reworkPrompt.includes('blocked：<缺陷ID或未给编号> 缺<字段>'))
+    assertSEM(reworkPrompt)
+    await assertBrief(dirA)
+    const reworkBrief = await readFile(join(dirA, 'BRIEF.md'), 'utf8')
+    assert.ok(reworkBrief.includes(REWORK_SCOPE_TEXT))
+    await t.test('rework BRIEF indexes the failed report without demanding full TASK sections', () => {
+      assert.deepEqual({
+        reportIndexed: reworkBrief.includes('TEST-REVIEW.md 的失败/缺陷段'),
+        requestsFullTask: /TASK\.md[^\n]*三节完整读取/.test(reworkBrief),
+        copiesDefectBody: reworkBrief.includes(reworkMessage),
+      }, { reportIndexed: true, requestsFullTask: false, copiesDefectBody: false })
+    })
+    // A message with missing fields is still deliverable (no new refusal gate).
+    await tool('squad_dispatch').execute({
+      agent: 'gpt',
+      message: 'review tests again',
+      phase: 'test-review',
+      task_id: taskA.taskId,
+    }, exec)
+    await writeFile(
+      join(dirA, 'TEST-REVIEW.md'),
+      '# TEST-REVIEW\nVERDICT: CHANGES_REQUESTED\n',
+      'utf8',
+    )
+    const sentBefore = host.sent.length
+    const sparseOut = await tool('squad_dispatch').execute({
+      agent: 'zcode',
+      message: 'D3 只改这个',
+      phase: 'rework',
+    }, exec)
+    assert.match(sparseOut, /已续跑本地子代理 zcode/)
+    assert.equal(host.sent.length, sentBefore + 1)
+    assert.ok(sentText().includes('blocked：<缺陷ID或未给编号> 缺<字段>'))
+    assert.ok(sentText().includes('D3'))
+
+    // Review-family sources differ by phase below.
+    await tool('squad_dispatch').execute({
+      agent: 'gpt',
+      message: 'review tests third',
+      phase: 'test-review',
+      task_id: taskA.taskId,
+    }, exec)
+    await writeFile(join(dirA, 'TEST-REVIEW.md'), '# TEST-REVIEW\nVERDICT: APPROVED\n', 'utf8')
+    await tool('squad_dispatch').execute({
+      agent: 'codex',
+      message: 'tech review',
+      phase: 'tech-review',
+      task_id: taskA.taskId,
+    }, exec)
+    const techPrompt = promptOf(host.activations.at(-1))
+    assert.ok(readsLine(techPrompt).includes('TEST-REVIEW.md（新鲜 APPROVED）'))
+    assert.ok(readsLine(techPrompt).includes('TECH-REVIEW.md（已有；存在时）'))
+    assertSEM(techPrompt)
+    await writeFile(join(dirA, 'TECH-REVIEW.md'), '# TECH-REVIEW\nVERDICT: APPROVED\n', 'utf8')
+    await tool('squad_dispatch').execute({
+      agent: 'codex',
+      message: 'business review',
+      phase: 'review',
+      task_id: taskA.taskId,
+    }, exec)
+    const reviewPrompt = promptOf(host.activations.at(-1))
+    assert.ok(readsLine(reviewPrompt).includes('PLAN-APPROVED.md'))
+    assert.ok(readsLine(reviewPrompt).includes('REPORT.md'))
+    assert.ok(readsLine(reviewPrompt).includes('TECH-REVIEW.md（已有；存在时）'))
+    assert.ok(readsLine(reviewPrompt).includes('TEST-REVIEW.md'))
+    assert.ok(readsLine(reviewPrompt).includes('SPEC.md'))
+    assertSEM(reviewPrompt)
+    await writeFile(join(dirA, 'REVIEW.md'), '# D2\nVERDICT: CHANGES_REQUESTED\n', 'utf8')
+    await tool('squad_dispatch').execute({ agent: 'qoder', message: reworkMessage, phase: 'rework', task_id: taskA.taskId }, exec)
+    assert.ok(readsLine(sentText()).includes('REVIEW.md 的失败/缺陷段'))
+    assert.doesNotMatch(readsLine(sentText()), /(?:TEST|TECH)-REVIEW\.md/)
+    assert.ok(sentText().includes(reworkMessage))
+    assertSEM(sentText())
+    await assertBrief(dirA)
+
+    await tool('squad_dispatch').execute({ agent: 'gpt', message: 'review current', phase: 'test-review', task_id: taskA.taskId }, exec)
+    await writeFile(join(dirA, 'TEST-REVIEW.md'), 'VERDICT: APPROVED\n', 'utf8')
+    await tool('squad_dispatch').execute({ agent: 'codex', message: 'technical check', phase: 'tech-review', task_id: taskA.taskId }, exec)
+    await writeFile(join(dirA, 'TECH-REVIEW.md'), '# D2\nVERDICT: CHANGES_REQUESTED\n', 'utf8')
+    await tool('squad_dispatch').execute({ agent: 'opencode', message: reworkMessage, phase: 'rework', task_id: taskA.taskId }, exec)
+    const externalRework = promptOf(host.activations.at(-1))
+    assert.ok(readsLine(externalRework).includes('TECH-REVIEW.md 的失败/缺陷段'))
+    assert.ok(externalRework.includes(REWORK_SCOPE_TEXT) && externalRework.includes(reworkMessage))
+    assert.doesNotMatch(externalRework, /目标：TASK\.md#目标|JOURNAL\.md 最后 80 行/)
+    assertSEM(externalRework)
+    await assertBrief(dirA)
+
+    // Simple flow: no SPEC requirement is invented.
+    const simple = await startContextTask(tool, exec, {
+      agents: ['zcode'],
+      flow: 'simple',
+    })
+    await tool('squad_dispatch').execute({
+      agent: 'zcode',
+      message: 'impl',
+      phase: 'implement',
+      task_id: simple.taskId,
+    }, exec)
+    const simplePrompt = promptOf(host.activations.at(-1))
+    assert.ok(simplePrompt.includes('PLAN-APPROVED.md（豁免任务可缺；按 TASK.md 与本轮派单）'))
+    assert.ok(!readsLine(simplePrompt).includes('SPEC.md（技术规格）'))
+    assertSEM(simplePrompt)
+    await writeFile(join(workspace, '.agent-squad', simple.taskId, 'REVIEW.md'), 'VERDICT: CHANGES_REQUESTED\n', 'utf8')
+    await tool('squad_dispatch').execute({ agent: 'zcode', message: reworkMessage, phase: 'rework', task_id: simple.taskId }, exec)
+    const simpleRework = readsLine(sentText())
+    await t.test('simple rework points to REVIEW and does not require absent plan/spec', () => {
+      assert.deepEqual({ review: simpleRework.includes('REVIEW.md 的失败/缺陷段'), gatedRead: /PLAN-APPROVED\.md|SPEC\.md/.test(simpleRework) },
+        { review: true, gatedRead: false })
+    })
+
+    // Acceptance mode reads only the authority and acceptance reports.
+    const accepting = await startContextTask(tool, exec, {
+      agents: ['codex', 'gpt', 'zcode'],
+      mode: 'acceptance',
+      authority: '# 权威方案\n逐条检查。',
+    })
+    await tool('squad_dispatch').execute({
+      agent: 'gpt',
+      message: 'technical acceptance',
+      phase: 'acceptance',
+      task_id: accepting.taskId,
+    }, exec)
+    const acceptancePrompt = promptOf(host.activations.at(-1))
+    assert.ok(readsLine(acceptancePrompt).includes('AUTHORITY.md（唯一权威方案）'))
+    assert.ok(readsLine(acceptancePrompt).includes('ACCEPTANCE-REPORT-R1.md'))
+    assert.doesNotMatch(readsLine(acceptancePrompt), /PLAN-APPROVED\.md|SPEC\.md/)
+    assertSEM(acceptancePrompt)
+    const accDir = join(workspace, '.agent-squad', accepting.taskId)
+    await writeFile(join(accDir, 'ACCEPTANCE-REPORT.md'), '# D2\nVERDICT: CHANGES_REQUESTED\n', 'utf8')
+    await tool('squad_dispatch').execute({ agent: 'codex', message: 'business acceptance', phase: 'acceptance', task_id: accepting.taskId }, exec)
+    await tool('squad_dispatch').execute({ agent: 'zcode', message: reworkMessage, phase: 'rework', task_id: accepting.taskId }, exec)
+    const acceptanceRework = promptOf(host.activations.at(-1))
+    assert.ok(acceptanceRework.includes(REWORK_SCOPE_TEXT) && acceptanceRework.includes(reworkMessage))
+    assertSEM(acceptanceRework)
+    await assertBrief(accDir)
+    const accReads = readsLine(acceptanceRework)
+    await t.test('acceptance rework uses AUTHORITY and acceptance defects, not the dev pipeline', () => {
+      assert.deepEqual({
+        authority: accReads.includes('AUTHORITY.md'),
+        acceptanceReport: accReads.includes('ACCEPTANCE-REPORT.md 的问题段'),
+        devRead: /TASK\.md|PLAN-APPROVED\.md|SPEC\.md/.test(accReads),
+      }, { authority: true, acceptanceReport: true, devRead: false })
+    })
+    await t.test('acceptance rework BRIEF says S/E/M cannot replace AUTHORITY', async () => {
+      const qualifier = '开发流程的 S/E/M 不替代 AUTHORITY.md'
+      assert.ok(acceptanceRework.includes(qualifier), 'the actual assignment qualifies S/E/M')
+      const brief = await readFile(join(accDir, 'BRIEF.md'), 'utf8')
+      assertSEM(brief)
+      assert.ok(brief.includes(qualifier), 'the standalone BRIEF must qualify its own S/E/M')
+    })
+  })
+
+  await t.test('multi-repo and substitute keep BRIEF bounded and assignment intact', async () => {
+    await withSquadHost({ config: { workerProbe: true }, overrides: { opencode: { model: 'p/m1' } } },
+      async ({ workspace, host, tool, exec }) => {
+        const repos = [
+          await makeGitRepo(workspace, 'repo A', 'base A', { 'README.md': 'A' }),
+          await makeGitRepo(workspace, 'repo B', 'base B', { 'README.md': 'B' }),
+        ]
+        await startContextTask(tool, exec, { agents: ['zcode', 'opencode'], repos })
+        const { memoryRoot, taskId } = JSON.parse(await readFile(join(workspace, '.agent-squad', 'current.json'), 'utf8'))
+        const originalStart = host.subagents.startActivation
+        host.subagents.startActivation = (spec) => {
+          if (spec.label === 'probe/zcode') throw new Error('HTTP 429 quota exceeded (fixture)')
+          return originalStart(spec)
+        }
+        const message = Array.from({ length: 50 }, (_, index) => `line-${index}`).join('\n')
+        const out = await tool('squad_dispatch').execute({ agent: 'zcode', message, phase: 'implement', task_id: taskId }, exec)
+        assert.match(out, /自动改由 opencode 执行/)
+        const prompt = host.activations.at(-1).prompt[0].text
+        assert.ok(prompt.includes(message))
+        for (const repo of repos) assert.ok(prompt.includes(`仓库：${repo}`))
+        assertSEM(prompt)
+        const dir = join(memoryRoot, taskId)
+        await assertBrief(dir)
+        const brief = await readFile(join(dir, 'BRIEF.md'), 'utf8')
+        assert.match(brief, /^agent=opencode role=worker$/m)
+        assert.ok(!brief.includes('line-49'))
+      },
+    )
+  })
+
+  await t.test('non-rework dispatches keep TASK sections and phase delivery contracts', async () => {
+    await withSquadHost({}, async ({ workspace, host, tool, exec }) => {
+      await tool('squad_enable').execute({}, exec)
+      const promptOf = (activation) => activation.prompt.map((block) => block.text).join('')
+      const acceptsSections = (text) =>
+        text.includes('目标：TASK.md#目标；验收：TASK.md#验收标准；约束：TASK.md#约束')
+
+      // Acceptance first dispatch keeps the TASK entry points and adds the
+      // authority note; the tester delivery contract is short but complete.
+      const accepting = await startContextTask(tool, exec, {
+        agents: ['codex', 'gpt'],
+        mode: 'acceptance',
+        authority: '# 权威方案\n逐条检查。',
+      })
+      await tool('squad_dispatch').execute(
+        { agent: 'gpt', message: 'technical acceptance', phase: 'acceptance', task_id: accepting.taskId },
+        exec,
+      )
+      const accPrompt = promptOf(host.activations.at(-1))
+      assert.ok(acceptsSections(accPrompt))
+      assert.ok(accPrompt.includes('AUTHORITY.md 是唯一判据'))
+      assert.ok(accPrompt.includes('五要素'))
+      assert.ok(accPrompt.includes('你不定稿 VERDICT'))
+      const accDir = join(workspace, '.agent-squad', accepting.taskId)
+      const accBrief = await readFile(join(accDir, 'BRIEF.md'), 'utf8')
+      assert.ok(acceptsSections(accBrief))
+      assert.ok(accBrief.includes('AUTHORITY.md 是唯一判据'))
+      assert.ok(accBrief.includes('五要素'))
+      assert.ok(accBrief.includes('你不定稿 VERDICT'))
+      await assertBrief(accDir)
+
+      // Dev pipeline: test/tech/business keep their machine VERDICT contract in
+      // both the first activation and a resumed send; BRIEF carries the full
+      // read index (not a truncated first-three list).
+      const dev = await startContextTask(tool, exec, { agents: ['codex', 'gpt', 'zcode'] })
+      const dir = join(workspace, '.agent-squad', dev.taskId)
+      await writeFile(join(dir, 'PLAN.md'), '# PLAN\n', 'utf8')
+      await writeFile(join(dir, 'SPEC.md'), '# SPEC\n', 'utf8')
+      await tool('squad_approve_plan').execute({ task_id: dev.taskId }, exec)
+      await tool('squad_dispatch').execute(
+        { agent: 'codex', message: 'spec', phase: 'spec', task_id: dev.taskId },
+        exec,
+      )
+      await tool('squad_dispatch').execute(
+        { agent: 'zcode', message: 'impl', phase: 'implement', task_id: dev.taskId },
+        exec,
+      )
+      await tool('squad_dispatch').execute(
+        { agent: 'gpt', message: 'review tests', phase: 'test-review', task_id: dev.taskId },
+        exec,
+      )
+      const testPrompt = promptOf(host.activations.at(-1))
+      assert.ok(testPrompt.includes('TEST-REVIEW.md'))
+      assert.ok(testPrompt.includes('最后一行 VERDICT'))
+      const testBrief = await readFile(join(dir, 'BRIEF.md'), 'utf8')
+      assert.ok(testBrief.includes('完整索引：'))
+      assert.ok(testBrief.includes('TEST-REVIEW.md（已有；存在时）'))
+      await tool('squad_dispatch').execute(
+        { agent: 'gpt', message: 'review tests again', phase: 'test-review', task_id: dev.taskId },
+        exec,
+      )
+      const testResume = host.sent.at(-1).content.map((block) => block.text).join('')
+      assert.ok(testResume.includes('TEST-REVIEW.md'))
+      assert.ok(testResume.includes('最后一行 VERDICT'))
+
+      await writeFile(join(dir, 'TEST-REVIEW.md'), 'VERDICT: APPROVED\n', 'utf8')
+      await tool('squad_dispatch').execute(
+        { agent: 'codex', message: 'tech review', phase: 'tech-review', task_id: dev.taskId },
+        exec,
+      )
+      const techPrompt = promptOf(host.activations.at(-1))
+      assert.ok(techPrompt.includes('TECH-REVIEW.md'))
+      assert.ok(techPrompt.includes('最后一行 VERDICT'))
+      const techBrief = await readFile(join(dir, 'BRIEF.md'), 'utf8')
+      assert.ok(techBrief.includes('TECH-REVIEW.md（已有；存在时）'))
+
+      await writeFile(join(dir, 'TECH-REVIEW.md'), 'VERDICT: APPROVED\n', 'utf8')
+      await tool('squad_dispatch').execute(
+        { agent: 'codex', message: 'business review', phase: 'review', task_id: dev.taskId },
+        exec,
+      )
+      const reviewPrompt = promptOf(host.activations.at(-1))
+      assert.ok(reviewPrompt.includes('REVIEW.md'))
+      assert.ok(reviewPrompt.includes('最后一行 VERDICT'))
+    })
+  })
+
+  await t.test('plan-exempt full rework indexes the absent archive without demanding it', async () => {
+    await withSquadHost({}, async ({ workspace, host, tool, exec }) => {
+      await tool('squad_enable').execute({}, exec)
+      const sentText = () => host.sent.at(-1).content.map((block) => block.text).join('')
+      const readsLine = (text) => text.split('\n').find((line) => line.startsWith('必读：')) ?? ''
+      const nonExempt = 'PLAN-APPROVED.md 中对应 AC（按编号定位）'
+      const exempt = 'PLAN-APPROVED.md 中对应 AC（存在时；无归档时用 TASK.md 对应 AC 与本轮交办）'
+      const reworkMessage = 'D2 / AC3 / src/a.js:9 / 改边界 / node --test'
+
+      // 1) Full flow with a tester but no brain snapshot: planRequired=false,
+      // specRequired=true, and no PLAN-APPROVED archive exists.
+      const exemptTask = await startContextTask(tool, exec, { agents: ['gpt', 'zcode'] })
+      const exemptDir = join(workspace, '.agent-squad', exemptTask.taskId)
+      const exemptStatePath = join(exemptDir, 'STATE.json')
+      const exemptState = JSON.parse(await readFile(exemptStatePath, 'utf8'))
+      assert.equal(exemptState.planRequired, false)
+      assert.equal(exemptState.specRequired, true)
+      exemptState.specPublished = true
+      exemptState.specVersion = 1
+      await writeFile(exemptStatePath, JSON.stringify(exemptState, null, 2), 'utf8')
+      await writeFile(join(exemptDir, 'SPEC.md'), '# SPEC\n', 'utf8')
+      await tool('squad_dispatch').execute(
+        { agent: 'zcode', message: 'impl', phase: 'implement', task_id: exemptTask.taskId },
+        exec,
+      )
+      await tool('squad_dispatch').execute(
+        { agent: 'gpt', message: 'review tests', phase: 'test-review', task_id: exemptTask.taskId },
+        exec,
+      )
+      await writeFile(
+        join(exemptDir, 'TEST-REVIEW.md'),
+        'VERDICT: CHANGES_REQUESTED\n',
+        'utf8',
+      )
+      await tool('squad_dispatch').execute(
+        { agent: 'zcode', message: reworkMessage, phase: 'rework', task_id: exemptTask.taskId },
+        exec,
+      )
+      const exemptReads = readsLine(sentText())
+      assert.ok(exemptReads.includes(exempt), 'exempt rework marks the archive as optional')
+      assert.ok(!exemptReads.includes(nonExempt), 'exempt rework does not demand an absent archive')
+      assert.ok(exemptReads.includes('SPEC.md 中对应实现段与验证用例（按编号定位）'))
+      assert.ok(exemptReads.includes('TEST-REVIEW.md 的失败/缺陷段（按编号定位）'))
+      assert.ok(sentText().includes(reworkMessage))
+      assertSEM(sentText())
+      const exemptBrief = await readFile(join(exemptDir, 'BRIEF.md'), 'utf8')
+      assert.ok(exemptBrief.includes(exempt))
+      assert.ok(!exemptBrief.includes(nonExempt))
+      const authorityLabel =
+        'PLAN-APPROVED.md（业务方案；实现、返工与验收；豁免且无归档时按 TASK.md 与本轮派单）'
+      assert.ok(exemptBrief.includes(authorityLabel), 'fixed authority label is retained')
+
+      // 2) Normal full task with an approved archive keeps the required form.
+      const normal = await startContextTask(tool, exec, { agents: ['codex', 'gpt', 'zcode'] })
+      const normalDir = join(workspace, '.agent-squad', normal.taskId)
+      await writeFile(join(normalDir, 'PLAN.md'), '# PLAN\n', 'utf8')
+      await tool('squad_approve_plan').execute({ task_id: normal.taskId }, exec)
+      await writeFile(join(normalDir, 'SPEC.md'), '# SPEC\n', 'utf8')
+      await tool('squad_dispatch').execute(
+        { agent: 'codex', message: 'spec', phase: 'spec', task_id: normal.taskId },
+        exec,
+      )
+      await tool('squad_dispatch').execute(
+        { agent: 'zcode', message: 'impl', phase: 'implement', task_id: normal.taskId },
+        exec,
+      )
+      await tool('squad_dispatch').execute(
+        { agent: 'gpt', message: 'review tests', phase: 'test-review', task_id: normal.taskId },
+        exec,
+      )
+      await writeFile(
+        join(normalDir, 'TEST-REVIEW.md'),
+        'VERDICT: CHANGES_REQUESTED\n',
+        'utf8',
+      )
+      await tool('squad_dispatch').execute(
+        { agent: 'zcode', message: reworkMessage, phase: 'rework' },
+        exec,
+      )
+      const normalReads = readsLine(sentText())
+      assert.ok(normalReads.includes(nonExempt), 'approved plan keeps the required archive read')
+      assert.ok(!normalReads.includes(exempt))
+      assertSEM(sentText())
+      const normalBrief = await readFile(join(normalDir, 'BRIEF.md'), 'utf8')
+      assert.ok(normalBrief.includes(nonExempt))
+      assert.ok(!normalBrief.includes('存在时；无归档时用 TASK.md'))
+    })
+  })
+})
+
+/** T25 — context usage display: exact line, report/dispatch/status, fallbacks. */
+test('T25 context display', async (t) => {
+  let hostRef
+  const usageAfterTask = (receipt) => {
+    const lines = receipt.split('\n')
+    const task = lines.findIndex((line) => line.startsWith('task='))
+    assert.ok(task >= 0)
+    return lines[task + 1]
+  }
+  const unknown = 'context: model=unknown window=unknown used=unknown ratio=unknown threshold=0.86'
+  const meter = {
+    window: 200000,
+    used: 172000,
+    pressureUsed: 120000,
+    throwMeasure: false,
+    throwPressure: false,
+    calls: [],
+    contextPressure(session) {
+      this.calls.push({ kind: 'pressure', session })
+      if (this.throwPressure) throw new Error('pressure down')
+      return { contextWindow: this.window, pressureTokens: this.pressureUsed }
+    },
+    measure(session) {
+      this.calls.push({ kind: 'measure', session, sent: hostRef.sent.length })
+      if (this.throwMeasure) throw new Error('measure down')
+      return { totalTokens: this.used }
+    },
+  }
+  const compaction = {
+    config: {
+      thresholdRatio: 0.86,
+      headroomTokens: 4096,
+      retainRatio: 0.12,
+      modelPolicies: [
+        {
+          provider: 'qoder',
+          model: 'qmodel_latest',
+          thresholdRatio: 0.86,
+          headroomTokens: 4096,
+          retainRatio: 0.12,
+          maxTokens: 8192,
+        },
+      ],
+    },
+  }
+  const header = { config: { provider: 'qoder', model: 'qmodel_latest', maxTokens: 16384 } }
+
+  await withSquadHost({ services: { tokenMeter: meter, compaction } }, async ({ workspace, host, tool, lead, exec }) => {
+    hostRef = host
+    await tool('squad_enable').execute({}, exec)
+    const task = await startContextTask(tool, exec, { agents: ['zcode', 'qoder'] })
+    const dir = join(workspace, '.agent-squad', task.taskId)
+    const reportLine = async (agent) => {
+      const receipt = await tool('squad_report').execute(
+        { status: 'done', summary: 'ok' },
+        { agent, signal: undefined },
+      )
+      return receipt.split('\n').at(-1)
+    }
+
+    // A new child never reads the meter and shows numeric unknowns.
+    const newChildOut = await tool('squad_dispatch').execute(
+      { agent: 'zcode', message: 'impl', phase: 'implement' },
+      exec,
+    )
+    assert.equal(usageAfterTask(newChildOut), `${unknown}（新建/暂无用量）`)
+    assert.equal(meter.calls.length, 0, 'new child does not sample the meter')
+
+    // Resume: sample live before send and print the exact fixed line.
+    const childId = host.activations.at(-1).childId
+    const live = host.makeAgent(childId, undefined, { header })
+    live.__root = lead
+    host.members.push({ id: childId, status: 'inactive' })
+    meter.calls.length = 0
+    const sentBefore = host.sent.length
+    const resumeOut = await tool('squad_dispatch').execute(
+      { agent: 'zcode', message: 'resume', phase: 'implement' },
+      exec,
+    )
+    assert.equal(usageAfterTask(resumeOut), USAGE_SAMPLE_LINE)
+    const measureCall = meter.calls.find((call) => call.kind === 'measure')
+    assert.ok(measureCall)
+    assert.equal(measureCall.sent, sentBefore, 'sample happens before sendMessage')
+
+    // Report: identical line to the Lead message and the caller receipt.
+    const receiptLine = await reportLine(live)
+    assert.equal(receiptLine, USAGE_SAMPLE_LINE)
+    const forwarded = host.sent.filter((item) => item.targetId === lead.id).at(-1).content[0].text
+    assert.ok(forwarded.endsWith(USAGE_SAMPLE_LINE))
+
+    // A team child also reads before resuming, without recreating activation.
+    const spawned = await tool('squad_dispatch').execute({ agent: 'qoder', message: 'impl', phase: 'implement' }, exec)
+    assert.equal(usageAfterTask(spawned), `${unknown}（新建/暂无用量）`)
+    const teamId = host.activations.at(-1).childId
+    const team = host.agentsById.get(teamId)
+    team.session.requestHeader = () => header
+    meter.calls.length = 0
+    const teamSentBefore = host.sent.length
+    const activationCount = host.activations.length
+    const teamResume = await tool('squad_dispatch').execute({ agent: 'qoder', message: 'resume team', phase: 'implement' }, exec)
+    assert.equal(usageAfterTask(teamResume), USAGE_SAMPLE_LINE)
+    assert.equal(meter.calls.find((call) => call.kind === 'measure').sent, teamSentBefore)
+    assert.equal(host.sent.at(-1).targetId, teamId)
+    assert.equal(host.activations.length, activationCount)
+
+    // Status: exact matching row in each distinct block; no match across blocks.
+    await writeFile(join(dir, 'PLAN.md'), '# PLAN\n', 'utf8')
+    const external = await tool('squad_dispatch').execute({ agent: 'codex', message: 'design', phase: 'design' }, exec)
+    assert.equal(usageAfterTask(external), `${unknown}（external）`)
+    const status = (await tool('squad_status').execute({}, exec)).split('\n')
+    const localBlock = status.indexOf('本地子代理：')
+    const teamRow = status.slice(status.indexOf('成员：') + 1, localBlock).find((line) => line.startsWith(`- ${team.__name} [`))
+    assert.ok(teamRow?.endsWith(` | ${USAGE_SAMPLE_LINE}`))
+    const localRow = status.slice(localBlock + 1).find((line) => line.startsWith(`- zcode → ${childId} `))
+    assert.ok(localRow?.endsWith(` | ${USAGE_SAMPLE_LINE}`))
+    const externalRow = status.slice(status.indexOf('最近派单：') + 1).find((line) => /phase=design round=1 external \|/.test(line))
+    assert.ok(externalRow?.endsWith(` | ${unknown}（external）`))
+
+    // Cold child falls back to the exact last report snapshot.
+    host.agentsById.delete(childId)
+    const coldOut = await tool('squad_dispatch').execute(
+      { agent: 'zcode', message: 'cold resume', phase: 'implement' },
+      exec,
+    )
+    assert.ok(
+      coldOut.includes(
+        'context: model=qoder/qmodel_latest window=200000 used=172000 ratio=86.0% threshold=0.86（上次汇报）',
+      ),
+    )
+
+    // Cross-task / different-id cache misses degrade to cold, never to another
+    // task's numbers.
+    const other = await startContextTask(tool, exec, { agents: ['zcode'] })
+    const otherStatePath = join(workspace, '.agent-squad', other.taskId, 'STATE.json')
+    const setOtherChild = async (id) => {
+      const otherState = JSON.parse(await readFile(otherStatePath, 'utf8'))
+      otherState.children = { zcode: { id, model: 'p/m1', status: 'active' } }
+      await writeFile(otherStatePath, JSON.stringify(otherState, null, 2), 'utf8')
+    }
+    await setOtherChild('child-dead-other')
+    const crossTaskOut = await tool('squad_dispatch').execute(
+      { agent: 'zcode', message: 'cross', phase: 'implement', task_id: other.taskId },
+      exec,
+    )
+    assert.ok(crossTaskOut.includes('（cold）'))
+    // Same id but a different task id is also a miss.
+    await setOtherChild(childId)
+    const crossSameId = await tool('squad_dispatch').execute(
+      { agent: 'zcode', message: 'cross same id', phase: 'implement', task_id: other.taskId },
+      exec,
+    )
+    assert.ok(crossSameId.includes('（cold）'))
+
+    // Measurement fallbacks: pressureTokens, measure, both missing, edge ratios.
+    const liveAgain = host.makeAgent(childId, undefined, { header })
+    liveAgain.__root = lead
+    meter.throwMeasure = true
+    meter.window = 200000
+    meter.pressureUsed = 50000
+    assert.ok((await reportLine(liveAgain)).includes('used=50000 ratio=25.0%'))
+    meter.throwMeasure = false
+    meter.throwPressure = true
+    meter.used = 20000
+    // Without pressure there is no window, so only `used` survives.
+    assert.ok((await reportLine(liveAgain)).includes('window=unknown used=20000 ratio=unknown'))
+    meter.throwPressure = true
+    meter.throwMeasure = true
+    meter.window = 200000
+    meter.used = 0
+    const bothBad = await reportLine(liveAgain)
+    assert.ok(bothBad.includes('window=unknown used=unknown ratio=unknown'))
+    meter.throwPressure = false
+    meter.throwMeasure = false
+    meter.used = 0
+    assert.ok((await reportLine(liveAgain)).includes('used=0 ratio=0.0%'))
+    meter.used = 200001
+    assert.ok((await reportLine(liveAgain)).includes('ratio=100.0%'))
+    meter.used = 220000
+    assert.ok((await reportLine(liveAgain)).includes('ratio=110.0%'))
+    meter.window = 0
+    meter.used = 10
+    assert.ok((await reportLine(liveAgain)).includes('window=unknown'))
+    // A header without maxTokens leaves O unprovable: never fabricate it.
+    const noCap = host.makeAgent(childId, undefined, {
+      header: { config: { provider: 'qoder', model: 'qmodel_latest' } },
+    })
+    noCap.__root = lead
+    assert.ok((await reportLine(noCap)).includes('实际阈值未知'))
+    // S2 small-window protection: W=131072, O=16384, H=4096 → T=110592.
+    meter.window = 131072
+    meter.used = 60000
+    const smallWindow = host.makeAgent(childId, undefined, { header })
+    smallWindow.__root = lead
+    assert.ok(
+      (await reportLine(smallWindow)).includes('实际阈值=110592 tokens'),
+      'effective threshold is reported instead of claiming 0.86',
+    )
+
+    await t.test('native ratio, inherited retainTokens and cold snapshot preserve threshold accuracy', async () => {
+      meter.window = 200000
+      meter.used = 172000
+      const native = compaction.config
+      const row = native.modelPolicies[0]
+      const { retainRatio: _rowRetention, ...override } = row
+      try {
+        native.modelPolicies[0] = { ...override, thresholdRatio: 0.8 }
+        const liveLine = await reportLine(team)
+        assert.equal(liveLine, `${USAGE_SAMPLE_LINE} 实际阈值=160000 tokens`)
+        host.agentsById.delete(teamId)
+        const coldReceipt = await tool('squad_dispatch').execute({ agent: 'qoder', message: 'cold team', phase: 'implement', task_id: task.taskId }, exec)
+        host.agentsById.set(teamId, team)
+        native.retainTokens = 180000
+        const invalidRetentionLine = await reportLine(team)
+        assert.deepEqual({
+          cold: usageAfterTask(coldReceipt),
+          invalidRetentionHasUnknown: /保留[^\n]*实际阈值未知/.test(invalidRetentionLine),
+          invalidRetentionClaimsThreshold: invalidRetentionLine.includes('实际阈值=160000 tokens'),
+        }, {
+          cold: `${USAGE_SAMPLE_LINE}（上次汇报） 实际阈值=160000 tokens`,
+          invalidRetentionHasUnknown: true,
+          invalidRetentionClaimsThreshold: false,
+        })
+      } finally {
+        host.agentsById.set(teamId, team)
+        native.modelPolicies[0] = row
+        delete native.retainTokens
+      }
+    })
+
+    await t.test('a failing compaction config getter preserves other usage fields', async () => {
+      meter.window = 200000
+      meter.used = 172000
+      const original = Object.getOwnPropertyDescriptor(compaction, 'config')
+      Object.defineProperty(compaction, 'config', { get: () => { throw new Error('compaction config unavailable') } })
+      try {
+        const report = await reportLine(team)
+        const result = await tool('squad_status').execute({}, exec).then(
+          (text) => ({ status: 'fulfilled', text }),
+          (error) => ({ status: 'rejected', text: error.message }),
+        )
+        assert.deepEqual({
+          reportPreservesUsage: report.startsWith(USAGE_SAMPLE_LINE),
+          status: result.status,
+          statusPreservesUsage: result.text.includes(USAGE_SAMPLE_LINE),
+        }, { reportPreservesUsage: true, status: 'fulfilled', statusPreservesUsage: true })
+      } finally {
+        Object.defineProperty(compaction, 'config', original)
+      }
+    })
+
+    await t.test('throwing tokenMeter getters do not discard independent fields or reject tools', async () => {
+      meter.window = 200000
+      meter.used = 172000
+      meter.pressureUsed = 150000
+      const fail = () => { throw new Error('optional meter getter unavailable') }
+      const pressureFallback = 'context: model=qoder/qmodel_latest window=200000 used=150000 ratio=75.0% threshold=0.86'
+      const measureFallback = 'context: model=qoder/qmodel_latest window=unknown used=172000 ratio=unknown threshold=0.86'
+      const variants = [
+        ['measure accessor', { get measure() { return fail() } }, pressureFallback],
+        ['contextPressure accessor', { get contextPressure() { return fail() } }, measureFallback],
+        ['result.totalTokens accessor', { measure() { return { get totalTokens() { return fail() } } } }, pressureFallback],
+        ['result.contextWindow accessor', { contextPressure() { return { get contextWindow() { return fail() }, pressureTokens: 150000 } } }, measureFallback],
+      ]
+      const actual = {}
+      try {
+        for (const [name, overrides, expected] of variants) {
+          host.services.tokenMeter = Object.create(meter, Object.getOwnPropertyDescriptors(overrides))
+          const report = await reportLine(team)
+          const status = await tool('squad_status').execute({}, exec).catch((error) => `rejected: ${error.message}`)
+          const resume = await tool('squad_dispatch').execute(
+            { agent: 'qoder', message: 'resume with a degraded meter', phase: 'implement', task_id: task.taskId }, exec,
+          ).catch((error) => `rejected: ${error.message}`)
+          actual[name] = {
+            report: report.startsWith(expected),
+            status: status.startsWith('rejected: ') ? status : status.includes(expected),
+            resume: resume.startsWith('rejected: ') ? resume : usageAfterTask(resume).startsWith(expected),
+          }
+        }
+      } finally {
+        host.services.tokenMeter = meter
+      }
+      assert.deepEqual(actual, Object.fromEntries(variants.map(([name]) => [name, { report: true, status: true, resume: true }])))
+    })
+
+    await t.test('missing tokenMeter and a known native ratio stay independently visible', async () => {
+      const native = compaction.config
+      const row = native.modelPolicies[0]
+      const savedMeter = host.services.tokenMeter
+      try {
+        host.services.tokenMeter = undefined
+        native.modelPolicies[0] = { ...row, thresholdRatio: 0.8 }
+        const report = await reportLine(team)
+        assert.match(report, /（tokenMeter 不可用）/)
+        assert.match(report, /原生比例=0\.8；实际阈值未知/)
+        const status = await tool('squad_status').execute({}, exec)
+        const memberLine = status
+          .split('\n')
+          .find((line) => line.includes(team.__name) && line.includes('context:'))
+        assert.ok(memberLine?.includes('（tokenMeter 不可用）'))
+        assert.ok(memberLine?.includes('原生比例=0.8；实际阈值未知'))
+        const sentBefore = host.sent.length
+        const resume = await tool('squad_dispatch').execute(
+          { agent: 'qoder', message: 'degraded meter', phase: 'implement', task_id: task.taskId },
+          exec,
+        )
+        assert.equal(host.sent.length, sentBefore + 1)
+        const resumeLine = usageAfterTask(resume)
+        assert.ok(resumeLine.includes('（tokenMeter 不可用）'))
+        assert.ok(resumeLine.includes('原生比例=0.8；实际阈值未知'))
+      } finally {
+        host.services.tokenMeter = savedMeter
+        native.modelPolicies[0] = row
+      }
+    })
+  })
+
+  // S6.4: report snapshots are bounded at 128; the oldest entry is evicted.
+  await withSquadHost({ services: { tokenMeter: meter, compaction } }, async ({ workspace, host, tool, exec }) => {
+    hostRef = host
+    await tool('squad_enable').execute({}, exec)
+    const task = await startContextTask(tool, exec, { agents: ['zcode'] })
+    meter.calls.length = 0
+    meter.throwMeasure = false
+    meter.throwPressure = false
+    meter.window = 200000
+    meter.used = 172000
+    for (let index = 0; index < 129; index += 1) {
+      const agent = host.makeAgent(`cache-${index}`, { role: 'teammate', name: 'zcode' })
+      await tool('squad_report').execute(
+        { status: 'done', summary: `report ${index}` },
+        { agent, signal: undefined },
+      )
+    }
+    // Reporting agents are only snapshots: remove the live objects so the
+    // dispatch path has to rely on the cache.
+    for (let index = 0; index < 129; index += 1) host.agentsById.delete(`cache-${index}`)
+    const statePath = join(workspace, '.agent-squad', task.taskId, 'STATE.json')
+    const setChild = async (id) => {
+      const state = JSON.parse(await readFile(statePath, 'utf8'))
+      state.children = { zcode: { id, model: 'p/m1', status: 'active' } }
+      await writeFile(statePath, JSON.stringify(state, null, 2), 'utf8')
+    }
+    await setChild('cache-0')
+    const evicted = await tool('squad_dispatch').execute(
+      { agent: 'zcode', message: 'old', phase: 'implement' },
+      exec,
+    )
+    assert.ok(evicted.includes('（cold）'), 'oldest snapshot evicted')
+    await setChild('cache-128')
+    const kept = await tool('squad_dispatch').execute(
+      { agent: 'zcode', message: 'new', phase: 'implement' },
+      exec,
+    )
+    assert.ok(kept.includes('（上次汇报）'), 'newest snapshot still cached')
+  })
+
+  // showUsage:false suppresses automatic sampling and lines everywhere.
+  await withSquadHost(
+    {
+      services: { tokenMeter: meter, compaction },
+      config: { contextPolicy: { showUsage: false } },
+    },
+    async ({ host, tool, exec }) => {
+      hostRef = host
+      await tool('squad_enable').execute({}, exec)
+      await startContextTask(tool, exec, { agents: ['zcode'] })
+      meter.calls.length = 0
+      meter.throwMeasure = false
+      meter.throwPressure = false
+      const out = await tool('squad_dispatch').execute(
+        { agent: 'zcode', message: 'impl', phase: 'implement' },
+        exec,
+      )
+      assert.ok(!out.includes('context:'))
+      assert.equal(meter.calls.length, 0)
+      const childId = host.activations.at(-1).childId
+      const live = host.makeAgent(childId, undefined, { header })
+      live.__root = { id: 'lead-1' }
+      host.members.push({ id: childId, status: 'inactive' })
+      const receipt = await tool('squad_report').execute(
+        { status: 'done', summary: 'ok' },
+        { agent: live, signal: undefined },
+      )
+      assert.ok(!receipt.includes('context:'))
+      assert.equal(meter.calls.length, 0, 'no automatic sampling with showUsage:false')
+      const status = await tool('squad_status').execute({}, exec)
+      assert.ok(!status.includes('context:'))
+      assert.equal(meter.calls.length, 0, 'status also does not touch the meter')
+    },
+  )
+
+  await withSquadHost({ externalDelayMs: 40 }, async ({ host, tool, exec }) => {
+    await startContextTask(tool, exec, { agents: ['codex'] })
+    const out = await tool('squad_dispatch').execute({ agent: 'codex', message: 'background context', phase: 'design' }, exec)
+    assert.equal(host.activations.at(-1).delivery, 'parent')
+    assert.equal(usageAfterTask(out), `${unknown}（external）`)
+    const status = await tool('squad_status').execute({}, exec)
+    assert.ok(status.includes(`external-background | ${unknown}（external）`))
+  })
+})
+
+/** T26 — context discipline: system/first/local/external/BRIEF, resume short. */
+test('T26 context discipline', async () => {
+  await withSquadHost({}, async ({ workspace, host, tool, exec }) => {
+    await tool('squad_enable').execute({}, exec)
+    const localTask = await startContextTask(tool, exec, { agents: ['zcode', 'qoder'] })
+    const localDir = join(workspace, '.agent-squad', localTask.taskId)
+    const promptOf = (activation) => activation.prompt.map((block) => block.text).join('')
+    const sentText = () => host.sent.at(-1).content.map((block) => block.text).join('')
+
+    // Local first dispatch: full discipline in the message and the BRIEF.
+    await tool('squad_dispatch').execute({ agent: 'zcode', message: 'impl', phase: 'implement' }, exec)
+    const localPrompt = promptOf(host.activations.at(-1))
+    assert.ok(localPrompt.includes(CONTEXT_DISCIPLINE_TEXT))
+    assert.ok(localPrompt.includes('并行默认'))
+    assertSEM(localPrompt)
+    const brief = await readFile(join(localDir, 'BRIEF.md'), 'utf8')
+    assert.ok(brief.includes(CONTEXT_DISCIPLINE_TEXT))
+    await assertBrief(localDir)
+
+    // Team first dispatch: full discipline and the same text in the installed
+    // teammate system section.
+    await tool('squad_dispatch').execute({ agent: 'qoder', message: 'impl', phase: 'implement' }, exec)
+    const teamPrompt = promptOf(host.activations.at(-1))
+    assert.ok(teamPrompt.includes(CONTEXT_DISCIPLINE_TEXT))
+    assertSEM(teamPrompt)
+    const systemSection = host.sections.find((section) => section.includes(CONTEXT_DISCIPLINE_TEXT))
+    assert.ok(systemSection, 'teammate system prompt carries the discipline text')
+    assertSEM(systemSection)
+    await tool('squad_dispatch').execute({ agent: 'qoder', message: 'impl again team', phase: 'implement' }, exec)
+    const teamResume = sentText()
+    assert.ok(teamResume.includes('按 BRIEF 的上下文纪律'))
+    assert.ok(!teamResume.includes(CONTEXT_DISCIPLINE_TEXT) && !teamResume.includes(WORKER_ITEMS[1]))
+    assert.doesNotMatch(teamResume, /角色章程：/)
+    assertSEM(teamResume)
+
+    // External every time: role, self-contained assignment and full discipline.
+    const externalTask = await startContextTask(tool, exec, { agents: ['codex'] })
+    const externalDir = join(workspace, '.agent-squad', externalTask.taskId)
+    await writeFile(join(externalDir, 'PLAN.md'), '# PLAN\n', 'utf8')
+    await tool('squad_dispatch').execute({
+      agent: 'codex',
+      message: 'design one',
+      phase: 'design',
+      task_id: externalTask.taskId,
+    }, exec)
+    const externalOne = promptOf(host.activations.at(-1))
+    assert.ok(externalOne.includes(CONTEXT_DISCIPLINE_TEXT))
+    assert.ok(externalOne.includes('角色章程：'))
+    assert.ok(!externalOne.includes('调用 squad_report'))
+    await tool('squad_dispatch').execute({
+      agent: 'codex',
+      message: 'design two',
+      phase: 'design',
+      task_id: externalTask.taskId,
+    }, exec)
+    const externalTwo = promptOf(host.activations.at(-1))
+    assert.ok(externalTwo.includes(CONTEXT_DISCIPLINE_TEXT))
+    assert.ok(externalTwo.includes('角色章程：'), 'external is always a first dispatch')
+    assertSEM(externalTwo)
+
+    // Resume of the same local child: no charter, no full discipline, only the
+    // short BRIEF reminder plus this round's strategy.
+    await tool('squad_dispatch').execute({
+      agent: 'zcode',
+      message: 'impl again',
+      phase: 'implement',
+      task_id: localTask.taskId,
+    }, exec)
+    const resumeText = sentText()
+    assert.ok(resumeText.includes('按 BRIEF 的上下文纪律'))
+    assert.ok(!resumeText.includes(CONTEXT_DISCIPLINE_TEXT), 'no full discipline on resume')
+    assert.ok(!resumeText.includes('角色章程：'))
+    assert.ok(!resumeText.includes('你是小队里的执行者'))
+    assert.ok(resumeText.includes('TASK.md#目标'))
+    assertSEM(resumeText)
+    // Rework always states the defect-only scope.
+    await tool('squad_dispatch').execute({
+      agent: 'zcode',
+      message: 'D9 只改这个',
+      phase: 'rework',
+      task_id: localTask.taskId,
+    }, exec)
+    const reworkText = sentText()
+    assert.ok(reworkText.includes(REWORK_SCOPE_TEXT))
+    assert.ok(reworkText.includes('只处理编号缺陷'))
+    assert.ok(!reworkText.includes('目标：TASK.md#目标'))
+    assertSEM(reworkText)
+  })
+
+  // contextPolicy:false keeps the legacy prompts/tools/feedback AND the
+  // baseline teammate identity section (no new discipline on spawn/rebind).
+  await withSquadHost({ config: { contextPolicy: false } }, async ({ workspace, host, tool, exec }) => {
+    await tool('squad_enable').execute({}, exec)
+    const task = await startContextTask(tool, exec, { agents: ['zcode', 'qoder'] })
+    const out = await tool('squad_dispatch').execute(
+      { agent: 'zcode', message: 'impl', phase: 'implement' },
+      exec,
+    )
+    const prompt = host.activations.at(-1).prompt.map((block) => block.text).join('')
+    assert.ok(!prompt.includes(CONTEXT_DISCIPLINE_TEXT))
+    assert.ok(!out.includes('context:'))
+    assert.equal(tool('squad_compact'), undefined)
+    const baselineIdentity = '先读 TASK.md；PLAN.md、SPEC.md'
+    // Team spawn installs the baseline identity section.
+    const teamOut = await tool('squad_dispatch').execute(
+      { agent: 'qoder', message: 'team impl', phase: 'implement' },
+      exec,
+    )
+    const teamPrompt = host.activations.at(-1).prompt.map((block) => block.text).join('')
+    assert.ok(!teamPrompt.includes(CONTEXT_DISCIPLINE_TEXT))
+    assert.ok(teamPrompt.includes('先读 TASK.md；设计轮读取 PLAN.md'))
+    const spawnSection = host.sections.at(-1)
+    assert.ok(!spawnSection.includes(CONTEXT_DISCIPLINE_TEXT), 'no new discipline on spawn')
+    assert.ok(spawnSection.includes(baselineIdentity), 'baseline shared-memory text on spawn')
+    assert.ok(!teamOut.includes('context:'))
+    // Resume/rebind the same id keeps the baseline too.
+    await tool('squad_dispatch').execute(
+      { agent: 'qoder', message: 'team impl again', phase: 'implement' },
+      exec,
+    )
+    const reboundSection = host.sections.at(-1)
+    assert.ok(!reboundSection.includes(CONTEXT_DISCIPLINE_TEXT), 'no new discipline on rebind')
+    assert.ok(reboundSection.includes(baselineIdentity), 'baseline shared-memory text on rebind')
+    const rebindMessage = host.sent.at(-1).content.map((block) => block.text).join('')
+    assert.ok(!rebindMessage.includes(CONTEXT_DISCIPLINE_TEXT))
+    assert.ok(!rebindMessage.includes('上下文纪律'))
+    const brief = await readFile(join(workspace, '.agent-squad', task.taskId, 'BRIEF.md'), 'utf8')
+    assert.ok(!brief.includes(CONTEXT_DISCIPLINE_TEXT))
+    await assertBrief(join(workspace, '.agent-squad', task.taskId))
+  })
+})
+
+/** T27 — context docs: README contract for policy/0.86/manual/rollback + suites. */
+test('T27 context docs', async () => {
+  const readme = await readFile(new URL('../README.md', import.meta.url), 'utf8')
+  for (const field of ['thresholdRatio', 'maxOutputTokens', 'autoCompact', 'showUsage']) {
+    assert.ok(readme.includes(field), `README documents ${field}`)
+  }
+  // Manual examples and the two caps.
+  assert.ok(readme.includes('squad_compact({ agent: "zcode" })'))
+  assert.ok(readme.includes('squad_compact({ agent: "qoder", task_id: "t-example" })'))
+  assert.ok(readme.includes('8192'), 'summary generation cap')
+  assert.ok(readme.includes('16384'), 'request output cap')
+  // The formula and the small-window counterexample.
+  assert.ok(readme.includes('T = floor(min(W * r, W - O - H))'))
+  assert.ok(readme.includes('W - O - H'))
+  assert.ok(readme.includes('110592'))
+  assert.ok(readme.includes('实际阈值=110592 tokens'))
+  // Exact line format and the four status tags.
+  assert.ok(
+    readme.includes(
+      'context: model=qoder/qmodel_latest window=200000 used=172000 ratio=86.0% threshold=0.86',
+    ),
+  )
+  for (const tag of ['（新建/暂无用量）', '（external）', '（cold）', '（上次汇报）']) {
+    assert.ok(readme.includes(tag), `README tag ${tag}`)
+  }
+  // Manual compaction semantics.
+  for (const text of [
+    'external：一次性执行者不可人工压缩',
+    'cold：会话未驻留，不能人工压缩',
+    'busy：队友运行中，稍后再试',
+    '不可用：缺少 compaction.compactNow',
+    'shadowedSeqs',
+    '/compact',
+  ]) {
+    assert.ok(readme.includes(text), `README manual compact: ${text}`)
+  }
+  // Same-route impact on non-squad sessions and the rollback order.
+  assert.ok(readme.includes('非小队会话'))
+  assert.ok(readme.includes('contextPolicy: false'))
+  assert.ok(readme.includes('自动阈值') || readme.includes('实际阈值'))
+  assert.ok(readme.includes('compaction-basic.config.modelPolicies'))
+  assert.ok(readme.includes('modelPolicies'))
+  assert.ok(readme.includes('完整 config'))
+  // TECH-06: per-row values win over the global ratio; a missing row falls
+  // back to the host default instead of erroring.
+  assert.ok(readme.includes('调整六路必须更新各行的显式值'))
+  assert.ok(readme.includes('只改全局 `thresholdRatio` 不会覆盖已有行值'))
+  assert.ok(readme.includes('没有匹配行时宿主回退其全局默认策略'))
+  assert.ok(readme.includes('不是报错'))
+  assert.ok(!readme.includes('没有匹配行时，宿主会报配置原因'))
+  assert.ok(!readme.includes('（或全局 `thresholdRatio`）'))
+  // TECH-09: external identity/discipline is always resent, but only a
+  // non-rework dispatch gets the full task entry; rework is defect-indexed.
+  assert.ok(readme.includes('每次 external 派发都重发身份'))
+  assert.ok(readme.includes('只有**非返工**新任务给完整任务入口'))
+  assert.ok(readme.includes('返工**只给编号缺陷'))
+  assert.ok(readme.includes('按编号定位，不重读整份任务'))
+  assert.ok(!readme.includes('返工同样重发'))
+  assert.ok(!readme.includes('每轮派单都会重发完整任务'))
+  assert.ok(!readme.includes('返工必须重发 BRIEF + 编号缺陷'))
+  // 8192 is the generation cap; summaries are not guaranteed complete.
+  assert.ok(readme.includes('8192 是生成上限，不保证摘要完整'))
+  assert.ok(readme.includes('原始约束、编号缺陷与证据仍以任务文件为准'))
+  const contextDocs = /^## 上下文管理[^\n]*\n([\s\S]*?)(?=^## 工具)/m.exec(readme)?.[1]
+  assert.ok(contextDocs)
+  for (const route of ['openai/gpt-6.2-sol', 'openai-codex/gpt-6.2-sol', 'openai-codex/gpt-6.2-astra', 'zai-coding-cn/glm-5.3', 'qoder/qmodel_latest', 'dsh-opencode-go/deepseek-v4.1-flash']) {
+    assert.ok(contextDocs.includes(`| \`${route}\` |`), `README lists ${route}`)
+  }
+  const rollback = contextDocs.split('回退顺序')[1]
+  assert.ok(rollback)
+  for (const step of ['showUsage: false', 'autoCompact: false', 'maxOutputTokens: null', 'contextPolicy: false', '完整 config', '三行原启用状态', 'squad_enable', '不可逆']) {
+    assert.ok(rollback.includes(step), `README rollback: ${step}`)
+  }
+  // All 27 top-level tests exist in this file.
+  const suite = await readFile(new URL('./settings.test.js', import.meta.url), 'utf8')
+  const names = [...suite.matchAll(/^test\('(T\d\d) /gm)].map((match) => match[1])
+  for (let index = 1; index <= 27; index += 1) {
+    assert.ok(names.includes(`T${String(index).padStart(2, '0')}`), `T${index} exists`)
+  }
+  assert.equal(names.length, 27)
 })

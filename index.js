@@ -75,7 +75,40 @@ const MAX_TECH_REWORK_ROUNDS = 3
 const MAX_BUSINESS_REWORK_ROUNDS = 3
 
 /** Liveness marker surfaced by squad_status; changes whenever behavior changes. */
-const PLUGIN_MARKER = 'agent-squad/zh-v11'
+const PLUGIN_MARKER = 'agent-squad/zh-v12'
+
+/** Defaults for the opt-in context policy (S1); `false` keeps the legacy path. */
+const CONTEXT_POLICY_DEFAULTS = Object.freeze({
+  thresholdRatio: 0.86,
+  maxOutputTokens: 16384,
+  autoCompact: true,
+  showUsage: true,
+})
+
+/** Fields the context policy accepts; unknown keys are configuration faults. */
+const CONTEXT_POLICY_KEYS = new Set([
+  'thresholdRatio',
+  'maxOutputTokens',
+  'autoCompact',
+  'showUsage',
+])
+
+/** Verbatim context discipline shared by prompts and every BRIEF version (S8). */
+const CONTEXT_DISCIPLINE =
+  '先 grep 定位，再 read 指定行段；不 cat 大文件。测试/构建输出重定向到文件，只读摘要；长日志不回贴。只回复 ≤150 字摘要 + 文件路径；返工只改编号缺陷。'
+
+/** Verbatim rework scope line (S7); rework never re-reads passed work. */
+const REWORK_SCOPE =
+  '只处理编号缺陷；不要重做已通过部分；只读相关文件段落，不要通读无关文件。'
+
+/** Budget for one manual compaction (S5); forwarded to host discovery/compaction. */
+const COMPACT_TIMEOUT_MS = 180000
+
+/** Fixed roster ids accepted by squad_compact (S5). */
+const MEMBER_IDS = new Set(['codex', 'gpt', 'zcode', 'qoder', 'opencode'])
+
+/** In-memory bound for report usage snapshots (S6); reload starts empty. */
+const USAGE_CACHE_LIMIT = 128
 
 /**
  * Plan-gate snapshot for one STATE. New tasks persist all four fields at
@@ -307,6 +340,112 @@ function defineTool(definition) {
   return definition
 }
 
+/** True when `value` is a plain, non-array configuration object. */
+function isPolicyObject(value) {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+/**
+ * Resolve and strictly validate the opt-in context policy (S1).
+ *
+ * Returns `false` for the explicit compatibility switch, otherwise a detached
+ * object with all four fields filled. Omitted fields take the 0.86/16384/true
+ * defaults; explicit `null` maxOutputTokens survives as "no request cap".
+ * Validation is by original type — no Number()/truthiness coercion.
+ *
+ * @param {unknown} value raw `contextPolicy` input.
+ * @returns {false | {thresholdRatio: number, maxOutputTokens: number|null, autoCompact: boolean, showUsage: boolean}}
+ * @throws {TypeError} with the full field path for an invalid field.
+ */
+function resolveContextPolicy(value) {
+  if (value === false) return false
+  const input = value === undefined ? {} : value
+  if (!isPolicyObject(input)) throw new TypeError('contextPolicy 必须是对象或 false')
+  for (const key of Object.keys(input)) {
+    if (!CONTEXT_POLICY_KEYS.has(key)) throw new TypeError(`contextPolicy.${key} 未知字段`)
+  }
+  let thresholdRatio = CONTEXT_POLICY_DEFAULTS.thresholdRatio
+  if (Object.hasOwn(input, 'thresholdRatio')) {
+    const ratio = input.thresholdRatio
+    if (typeof ratio !== 'number' || !Number.isFinite(ratio) || ratio <= 0.12 || ratio > 1) {
+      throw new TypeError('contextPolicy.thresholdRatio 必须是 (0.12,1] 的有限数')
+    }
+    thresholdRatio = ratio
+  }
+  let maxOutputTokens = CONTEXT_POLICY_DEFAULTS.maxOutputTokens
+  if (Object.hasOwn(input, 'maxOutputTokens')) {
+    const cap = input.maxOutputTokens
+    if (cap !== null && !(Number.isSafeInteger(cap) && cap > 0)) {
+      throw new TypeError('contextPolicy.maxOutputTokens 必须是正安全整数或 null')
+    }
+    maxOutputTokens = cap
+  }
+  let autoCompact = CONTEXT_POLICY_DEFAULTS.autoCompact
+  if (Object.hasOwn(input, 'autoCompact')) {
+    if (typeof input.autoCompact !== 'boolean') {
+      throw new TypeError('contextPolicy.autoCompact 必须是布尔值')
+    }
+    autoCompact = input.autoCompact
+  }
+  let showUsage = CONTEXT_POLICY_DEFAULTS.showUsage
+  if (Object.hasOwn(input, 'showUsage')) {
+    if (typeof input.showUsage !== 'boolean') {
+      throw new TypeError('contextPolicy.showUsage 必须是布尔值')
+    }
+    showUsage = input.showUsage
+  }
+  return { thresholdRatio, maxOutputTokens, autoCompact, showUsage }
+}
+
+/** Request output cap for a child session (S3); undefined means "not injected". */
+function requestCap(policy, parent) {
+  if (!policy || policy === false || policy.maxOutputTokens === null) return undefined
+  const parentCap = parent?.options?.maxTokens
+  if (Number.isSafeInteger(parentCap) && parentCap > 0) {
+    return Math.min(parentCap, policy.maxOutputTokens)
+  }
+  return policy.maxOutputTokens
+}
+
+/**
+ * Compose the `agentOptions` payload for one activation (S3).
+ *
+ * Pinned local/external-probe routes keep provider/model/reasoningEffort and
+ * add the capped output budget; a team `spawn` adds only `maxTokens` (the host
+ * still inherits the route); a team `fork` adds it only when the host reports
+ * `capabilities.agentOptions`, otherwise the whole payload is omitted.
+ * Non-pinned external CLI/ACP executors receive no options at all.
+ *
+ * @param {object} input activation facts.
+ * @returns {{agentOptions?: object}} spreadable activation field.
+ */
+function activationOptions({ policy, parent, executor, pinned, reasoning, provider, subagents }) {
+  if (executor === 'external' && !pinned) return {}
+  const cap = policy ? requestCap(policy, parent) : undefined
+  const options = {}
+  if (pinned) {
+    options.provider = pinned.provider
+    options.model = pinned.model
+    if (reasoning) options.reasoningEffort = reasoning
+    if (cap !== undefined) options.maxTokens = cap
+  } else if (provider === 'spawn' || provider === 'fork') {
+    if (cap === undefined) return {}
+    if (provider === 'fork') {
+      let supported = false
+      try {
+        supported = subagents?.getProvider?.('fork')?.capabilities?.agentOptions === true
+      } catch {
+        supported = false
+      }
+      if (!supported) return {}
+    }
+    options.maxTokens = cap
+  } else {
+    return {}
+  }
+  return Object.keys(options).length > 0 ? { agentOptions: options } : {}
+}
+
 /** Normalize the patch-row config, applying defaults without a schema dependency. */
 function resolveSettings(input) {
   const config = input && typeof input === 'object' ? input : {}
@@ -320,6 +459,7 @@ function resolveSettings(input) {
     testerCharter: text(config.testerCharter, TESTER_CHARTER),
     workerCharter: text(config.workerCharter, WORKER_CHARTER),
     agents,
+    contextPolicy: resolveContextPolicy(config.contextPolicy),
     worktreeDir: text(config.worktreeDir, '.agents/worktrees'),
     workerProbe: config.workerProbe !== false,
     /** How long a successful availability probe is reused (profile-wide). */
@@ -441,6 +581,231 @@ function sessionDirectory(ctx, agent) {
   if (workingDirectory && agent.session) return workingDirectory.get(agent.session)
   return process.cwd()
 }
+
+/** Run one reader, degrading any throw to a fallback (S6: each read catches alone). */
+function safeRead(read, fallback) {
+  try {
+    return read()
+  } catch {
+    return fallback
+  }
+}
+
+/** A usable `provider/model` route pair, or undefined when either side is blank. */
+function routePair(config) {
+  if (
+    typeof config?.provider === 'string' &&
+    config.provider !== '' &&
+    typeof config?.model === 'string' &&
+    config.model !== ''
+  ) {
+    return `${config.provider}/${config.model}`
+  }
+  return undefined
+}
+
+/**
+ * One lightweight context-usage reading (S6).
+ *
+ * `new`/`external`/`cold` short-circuit without touching an Agent; `last`
+ * replays a report-time snapshot; `live` reads the session header, the
+ * tokenMeter pressure/measurement pair and the resolved compaction policy to
+ * report the configured threshold and, when provable, the effective one.
+ *
+ * @param {object} ctx host context.
+ * @param {{agent?: object, binding?: object, policy?: object|false, kind?: string, snapshot?: object}} input
+ * @returns {{model?: string, window?: number, used?: number, threshold: number, kind: string, effectiveTokens?: number, warning?: string}}
+ */
+function contextUsageOf(ctx, { agent, binding, policy, kind = 'live', snapshot } = {}) {
+  const threshold =
+    policy && policy !== false && Number.isFinite(policy.thresholdRatio)
+      ? policy.thresholdRatio
+      : CONTEXT_POLICY_DEFAULTS.thresholdRatio
+  if (kind === 'new' || kind === 'external' || kind === 'cold') return { threshold, kind }
+  if (kind === 'last') {
+    return snapshot
+      ? { ...snapshot, threshold, kind }
+      : { threshold, kind }
+  }
+  const session = safeRead(() => agent?.session, undefined)
+  const header = session ? safeRead(() => session.requestHeader?.(), undefined) : undefined
+  // Independent read (TR-06): a failing header/config getter only degrades the
+  // model/threshold fields, never window/used/ratio or the whole tool.
+  const headerConfig = safeRead(
+    () => (header && typeof header.config === 'object' ? header.config : undefined),
+    undefined,
+  )
+  let model = 'unknown'
+  const headerRoute = safeRead(() => routePair(headerConfig), undefined)
+  if (headerRoute !== undefined) {
+    model = headerRoute
+  } else {
+    const optionRoute = safeRead(
+      () => routePair(safeRead(() => agent?.options, undefined)),
+      undefined,
+    )
+    if (optionRoute !== undefined) model = optionRoute
+    else if (typeof binding?.model === 'string' && binding.model.includes('/')) model = binding.model
+  }
+  // TR-07: every meter accessor, call and result-field read is independently
+  // protected, and calls keep their receiver. A throwing optional getter only
+  // drops its own field; report/status/resume never lose the whole line.
+  const meter = safeRead(() => ctx.get('tokenMeter'), undefined)
+  const pressureReader =
+    meter === undefined ? undefined : safeRead(() => meter.contextPressure, undefined)
+  const measurementReader =
+    meter === undefined ? undefined : safeRead(() => meter.measure, undefined)
+  const pressure =
+    session && typeof pressureReader === 'function'
+      ? safeRead(() => pressureReader.call(meter, session), undefined)
+      : undefined
+  const measurement =
+    session && typeof measurementReader === 'function'
+      ? safeRead(() => measurementReader.call(meter, session), undefined)
+      : undefined
+  let window
+  const contextWindow = safeRead(() => pressure?.contextWindow, undefined)
+  if (Number.isSafeInteger(contextWindow) && contextWindow > 0) window = contextWindow
+  let used
+  const totalTokens = safeRead(() => measurement?.totalTokens, undefined)
+  if (Number.isSafeInteger(totalTokens) && totalTokens >= 0) {
+    used = totalTokens
+  } else {
+    const pressureTokens = safeRead(() => pressure?.pressureTokens, undefined)
+    if (Number.isSafeInteger(pressureTokens) && pressureTokens >= 0) used = pressureTokens
+  }
+  const usage = {
+    threshold,
+    kind,
+    ...(model === 'unknown' ? {} : { model }),
+    ...(window === undefined ? {} : { window }),
+    ...(used === undefined ? {} : { used }),
+  }
+  // TECH-05: service-missing and threshold diagnostics are independent; one
+  // must not overwrite the other. The normal sample stays byte-identical when
+  // both are clean.
+  const warnings = []
+  if (meter === undefined) warnings.push('（tokenMeter 不可用）')
+  // Effective threshold: only claim it when the routed route, window and the
+  // durable request output reservation are all provable (S2/S6). Every getter
+  // is read independently (TR-06); a throwing compaction config only loses the
+  // effective-threshold detail.
+  if (model !== 'unknown') {
+    const effective = safeRead(
+      () => effectiveThresholdOf(ctx, { model, headerConfig, window, threshold }),
+      { warning: '（实际阈值未知）' },
+    )
+    if (effective.effectiveTokens !== undefined) usage.effectiveTokens = effective.effectiveTokens
+    else if (effective.warning) warnings.push(effective.warning)
+  }
+  if (warnings.length > 0) usage.warning = warnings.join('')
+  return usage
+}
+
+/**
+ * Compute the host's effective pressure threshold for one exact route (S6.3).
+ *
+ * Reads the resolved compaction config and its `modelPolicies` independently;
+ * retention follows the host rule — row `retainTokens`, else row `retainRatio`,
+ * else the global `retainTokens`, else the global `retainRatio` — so an
+ * inherited exact retention that is not below T reports an unavailable
+ * retention instead of an incorrect effective threshold (TR-05).
+ *
+ * @param {object} ctx host context.
+ * @param {{model: string, headerConfig?: object, window?: number, threshold: number}} input
+ * @returns {{effectiveTokens?: number, warning?: string}}
+ */
+function effectiveThresholdOf(ctx, { model, headerConfig, window, threshold }) {
+  const basic = safeRead(() => ctx.get('compaction'), undefined)
+  const resolved = safeRead(() => {
+    const config = basic?.config
+    return config && typeof config === 'object' && !Array.isArray(config) ? config : undefined
+  }, undefined)
+  if (resolved === undefined) return { warning: '（compaction 不可用；实际阈值未知）' }
+  const rows = safeRead(
+    () => (Array.isArray(resolved.modelPolicies) ? resolved.modelPolicies : []),
+    [],
+  )
+  const row = rows.find(
+    (item) =>
+      item &&
+      typeof item.provider === 'string' &&
+      typeof item.model === 'string' &&
+      `${item.provider}/${item.model}` === model,
+  )
+  if (row === undefined) return { warning: '（无精确模型策略；实际阈值未知）' }
+  // TECH-05: read the provable native ratio before deciding whether T can be
+  // computed, so a known differing native ratio is still reported.
+  const ratio = safeRead(() => row.thresholdRatio ?? resolved.thresholdRatio, undefined)
+  const headroom = safeRead(() => row.headroomTokens ?? resolved.headroomTokens, undefined)
+  const ratioKnown = Number.isFinite(ratio) && ratio > 0
+  const unknownReason = (detail) =>
+    ratioKnown && ratio !== threshold
+      ? `（原生比例=${ratio}；实际阈值未知）`
+      : `（${detail}；实际阈值未知）`
+  if (window === undefined) return { warning: unknownReason('窗口未知') }
+  const headerO = safeRead(() => headerConfig?.maxTokens, undefined)
+  const hasO = Number.isSafeInteger(headerO) && headerO >= 0
+  if (!hasO) return { warning: unknownReason('实际阈值未知') }
+  const messageBudget = window - headerO
+  const pressureBudget = messageBudget - headroom
+  const headroomKnown = Number.isFinite(headroom) && headroom >= 0
+  if (messageBudget <= 0) return { warning: unknownReason('窗口压力预算不足') }
+  if (!ratioKnown || !headroomKnown) return { warning: '（模型策略不完整；实际阈值未知）' }
+  if (pressureBudget <= 0) return { warning: unknownReason('headroom 超出窗口') }
+  const retain = safeRead(() => {
+    if (row.retainTokens !== undefined) return row.retainTokens
+    if (row.retainRatio !== undefined) return Math.floor(messageBudget * row.retainRatio)
+    if (resolved.retainTokens !== undefined) return resolved.retainTokens
+    return Math.floor(messageBudget * resolved.retainRatio)
+  }, undefined)
+  const effective = Math.floor(Math.min(window * ratio, pressureBudget))
+  const target = Math.floor(window * threshold)
+  if (!Number.isFinite(retain) || retain >= effective) {
+    // Keep the retention-specific diagnosis (S6/S5 wording) while still
+    // surfacing a provable differing native ratio (TECH-05).
+    return {
+      warning:
+        ratioKnown && ratio !== threshold
+          ? `（保留量不可用；原生比例=${ratio}；实际阈值未知）`
+          : '（保留量不可用；实际阈值未知）',
+    }
+  }
+  if (ratio !== threshold || effective < target) return { effectiveTokens: effective }
+  return {}
+}
+
+/** Render one usage reading in the fixed S6 field order. */
+function formatContextUsage(usage) {
+  const model = usage?.model ?? 'unknown'
+  const window = usage?.window === undefined ? 'unknown' : String(usage.window)
+  const used = usage?.used === undefined ? 'unknown' : String(usage.used)
+  const ratio =
+    usage?.window !== undefined && usage?.used !== undefined
+      ? `${((100 * usage.used) / usage.window).toFixed(1)}%`
+      : 'unknown'
+  const threshold = usage?.threshold ?? CONTEXT_POLICY_DEFAULTS.thresholdRatio
+  let line = `context: model=${model} window=${window} used=${used} ratio=${ratio} threshold=${threshold}`
+  if (usage?.kind === 'new') line += '（新建/暂无用量）'
+  else if (usage?.kind === 'external') line += '（external）'
+  else if (usage?.kind === 'cold') line += '（cold）'
+  else if (usage?.kind === 'last') line += '（上次汇报）'
+  if (usage?.effectiveTokens !== undefined) line += ` 实际阈值=${usage.effectiveTokens} tokens`
+  else if (usage?.warning) line += usage.warning
+  return line
+}
+
+/** Pack the small report-time snapshot the status/dispatch fallbacks replay. */
+function usageSnapshotOf(usage) {
+  return {
+    ...(usage?.model === undefined ? {} : { model: usage.model }),
+    ...(usage?.window === undefined ? {} : { window: usage.window }),
+    ...(usage?.used === undefined ? {} : { used: usage.used }),
+    ...(usage?.effectiveTokens === undefined ? {} : { effectiveTokens: usage.effectiveTokens }),
+    ...(usage?.warning === undefined ? {} : { warning: usage.warning }),
+  }
+}
+
 
 /**
  * Shared-memory root for one agent. The pointer file makes the root stable when
@@ -589,11 +954,19 @@ function charterFor(agent, config) {
 }
 
 function teammatePrompt(agent, config) {
+  // TECH-04: `contextPolicy:false` restores the baseline identity section
+  // byte-for-byte; the new discipline paragraph only appears when the policy
+  // is enabled. S/E/M lines are identical in both modes.
+  const sharedMemory =
+    config.contextPolicy === false
+      ? '共享记忆：每次派单都会给出共享目录。先读 TASK.md；PLAN.md、SPEC.md、TECH-REVIEW.md、REVIEW.md、REPORT.md、JOURNAL.md 分别承载业务方案、技术规格、技术验收、业务验收、交付证据与历史。保持这些文件最新，队友才能不靠复述对话协作。'
+      : `共享记忆：每次派单都会给出共享目录。TASK.md、PLAN.md、SPEC.md、TECH-REVIEW.md、REVIEW.md、REPORT.md、JOURNAL.md 分别承载任务、业务方案、技术规格、技术验收、业务验收、交付证据与历史。保持这些文件最新，队友才能不靠复述对话协作。
+上下文纪律：${CONTEXT_DISCIPLINE}`
   return `你是 "${agent.name}"，DSH Agent Squad 里的 ${agent.role} 角色。Team Lead 的代号是 "lead"。
 
 ${charterFor(agent, config)}
 
-共享记忆：每次派单都会给出共享目录。先读 TASK.md；PLAN.md、SPEC.md、TECH-REVIEW.md、REVIEW.md、REPORT.md、JOURNAL.md 分别承载业务方案、技术规格、技术验收、业务验收、交付证据与历史。保持这些文件最新，队友才能不靠复述对话协作。
+${sharedMemory}
 - PLAN-APPROVED.md 是业务方案与业务验收的唯一权威规格；SPEC.md 是技术实现、返工与技术验收的唯一权威规格；PLAN.md 只用于设计，不能覆盖批准归档。
 - 仅任务快照豁免方案门禁且无批准归档时，按 TASK.md 与 Lead 本轮派单执行；仍须逐条 AC 留证。
 - AC 映射：沿用 TASK.md 的 AC 编号；未编号时按条目顺序从 AC1 开始编号。PLAN.md/SPEC.md 为每条 AC 指定改动文件、测试名、验证命令与期望值；REPORT.md/TECH-REVIEW.md/REVIEW.md 按对应规格逐条记录 AC 编号、文件路径、测试名、命令、退出码、关键输出与结论。
@@ -758,7 +1131,180 @@ function deliverableOf(agent, phase) {
   return '写 REPORT.md，按 PLAN-APPROVED.md + SPEC.md 逐条 AC 记录改动、测试名、命令、退出码、关键输出与结论；豁免任务按 TASK.md 与 Lead 本轮派单逐条 AC 留证。'
 }
 
-function renderDispatch({ taskId, taskDir, phase, round, agent, message, includeCharter, config, workspace, worktrees = [] }) {
+/**
+ * One per-round dispatch strategy (S7): the phase decides the material a
+ * teammate needs. Pure: no I/O; callers pass the real phase/flow/target.
+ *
+ * @param {object} input dispatch facts.
+ * @returns {{scopeLine: string, reads: string[], deliveryFile: string, deliveryHint: string, briefHints: string[]}}
+ */
+function makeDispatchStrategy({
+  phase,
+  flow,
+  reworkKind = null,
+  round = 1,
+  target,
+  failedReports = [],
+  planRequired = true,
+}) {
+  const acceptance = flow?.acceptance === true
+  const specRequired = flow?.specRequired === true
+  const taskScope =
+    '目标：TASK.md#目标；验收：TASK.md#验收标准；约束：TASK.md#约束（完整读取这三节；不要用一句摘要替代）'
+  // TECH-03: acceptance ADDS the authority note; it never replaces the three
+  // TASK section entry points on a normal (non-rework) dispatch.
+  const scopeLine =
+    phase === 'acceptance'
+      ? `${taskScope}；另注：AUTHORITY.md 是唯一判据，开发流程的 S/E/M 不替代 AUTHORITY.md。`
+      : taskScope
+  const failureRead = (name) => {
+    if (name === 'TEST-REVIEW.md') return 'TEST-REVIEW.md 的失败/缺陷段（按编号定位）'
+    if (name === 'TECH-REVIEW.md') return 'TECH-REVIEW.md 的失败/缺陷段（按编号定位）'
+    if (name === 'REVIEW.md') return 'REVIEW.md 的失败/缺陷段（按编号定位）'
+    if (name === 'ACCEPTANCE-REPORT.md') return 'ACCEPTANCE-REPORT.md 的问题段（按编号定位）'
+    return `${name}（按编号定位）`
+  }
+  if (phase === 'rework') {
+    // TR-03: the authoritative sources follow the flow, not a fixed dev list.
+    const sources = failedReports.length > 0
+      ? failedReports.map(failureRead)
+      : [
+          acceptance
+            ? 'ACCEPTANCE-REPORT.md 的问题段（按编号定位）'
+            : specRequired
+              ? '本次新鲜失败报告的对应段（按编号定位）'
+              : 'REVIEW.md 的失败/缺陷段（按编号定位）',
+        ]
+    let reads
+    let scopeLine
+    if (acceptance) {
+      // Acceptance tasks never read the dev pipeline (TASK/PLAN/SPEC).
+      reads = ['AUTHORITY.md 中对应条款（按编号定位）', ...sources]
+      scopeLine = `${REWORK_SCOPE} 开发流程的 S/E/M 不替代 AUTHORITY.md：权威只取 AUTHORITY.md 对应条款与 ACCEPTANCE-REPORT.md 问题段。缺陷包按 Lead 本轮消息的“缺陷ID / 受影响AC / 文件:行或章节 / 最小修复建议 / 复验命令”逐项执行；缺项从本次新鲜报告同编号段补齐，仍缺则写 blocked：<缺陷ID或未给编号> 缺<字段>。`
+    } else if (specRequired) {
+      // Full flow: the same gate chose the failing report, so index it. A
+      // plan-exempt task (snapshot planRequired=false) may have no approved
+      // archive; do not demand one that cannot exist (TECH-07).
+      reads = [
+        'TASK.md 中受影响 AC 与约束（按编号定位，不整读）',
+        planRequired
+          ? 'PLAN-APPROVED.md 中对应 AC（按编号定位）'
+          : 'PLAN-APPROVED.md 中对应 AC（存在时；无归档时用 TASK.md 对应 AC 与本轮交办）',
+        'SPEC.md 中对应实现段与验证用例（按编号定位）',
+        ...sources,
+      ]
+      scopeLine = `${REWORK_SCOPE} 缺陷包按 Lead 本轮消息的“缺陷ID / 受影响AC / 文件:行或章节 / 最小修复建议 / 复验命令”逐项执行；缺项从本次新鲜报告同编号段补齐，仍缺则写 blocked：<缺陷ID或未给编号> 缺<字段>。`
+    } else {
+      // Simple/legacy: the business review is the only authority; no absent
+      // PLAN-APPROVED/SPEC is demanded.
+      reads = ['TASK.md 中受影响 AC 与约束（按编号定位，不整读）', ...sources]
+      scopeLine = `${REWORK_SCOPE} 缺陷包按 Lead 本轮消息的“缺陷ID / 受影响AC / 文件:行或章节 / 最小修复建议 / 复验命令”逐项执行；缺项从本次新鲜报告同编号段补齐，仍缺则写 blocked：<缺陷ID或未给编号> 缺<字段>。`
+    }
+    return {
+      scopeLine,
+      reads,
+      deliveryFile: 'REPORT.md',
+      deliveryHint:
+        '交付：更新 REPORT.md，逐项复验并保留原有已通过证据；只回复 ≤150 字摘要 + 文件路径。',
+      briefHints: [
+        `- ${REWORK_SCOPE}`,
+        '- 缺陷包仅以 Lead 本轮消息为准，不把任务正文或历史报告复制进 BRIEF',
+        '- REPORT.md（逐项复验，保留原有已通过证据）',
+      ],
+    }
+  }
+  const stageReads =
+    phase === 'design'
+      ? ['PLAN.md（已有方案；存在时）']
+      : phase === 'spec'
+        ? ['PLAN-APPROVED.md', 'SPEC.md（已有；存在时）']
+        : phase === 'implement'
+          ? [
+              planRequired
+                ? 'PLAN-APPROVED.md（业务方案）'
+                : 'PLAN-APPROVED.md（豁免任务可缺；按 TASK.md 与本轮派单）',
+              ...(specRequired ? ['SPEC.md（技术规格）'] : []),
+            ]
+          : phase === 'test-review'
+            ? ['PLAN-APPROVED.md', 'SPEC.md', 'REPORT.md', 'TEST-REVIEW.md（已有；存在时）']
+            : phase === 'tech-review'
+              ? ['SPEC.md', 'TEST-REVIEW.md（新鲜 APPROVED）', 'REPORT.md', 'TECH-REVIEW.md（已有；存在时）']
+              : phase === 'review'
+                ? [
+                    'PLAN-APPROVED.md',
+                    'REPORT.md',
+                    'TECH-REVIEW.md（已有；存在时）',
+                    ...(specRequired ? ['TEST-REVIEW.md', 'SPEC.md'] : []),
+                  ]
+                : acceptance || phase === 'acceptance'
+                  ? [
+                      'AUTHORITY.md（唯一权威方案）',
+                      'ACCEPTANCE-REPORT.md（存在时）',
+                      `ACCEPTANCE-REPORT-R${Math.max(1, Number(round) - 1)}.md（存在时；核对上一轮修复情况）`,
+                    ]
+                  : []
+  const deliveryFile =
+    phase === 'design'
+      ? 'PLAN.md'
+      : phase === 'spec'
+        ? 'SPEC.md'
+        : phase === 'test-review'
+          ? 'TEST-REVIEW.md'
+          : phase === 'tech-review'
+            ? 'TECH-REVIEW.md'
+            : phase === 'review'
+              ? 'REVIEW.md'
+              : phase === 'acceptance'
+                ? 'ACCEPTANCE-REPORT.md'
+                : 'REPORT.md'
+  // TECH-03: keep each phase's short delivery contract (five elements, a
+  // machine-readable VERDICT, tester-vs-brain duties) rather than replacing it
+  // with one generic line.
+  let deliveryHint
+  if (phase === 'acceptance') {
+    deliveryHint =
+      target?.role === 'tester'
+        ? '交付：技术维度验收写入 ACCEPTANCE-REPORT.md（五要素：① 验收方案与标准 ② 上一轮修复情况 ③ 本轮问题 ④ 修复建议 ⑤ 结论）；你不定稿 VERDICT，由 brain（codex）业务维度完成后定稿。'
+        : '交付：业务维度验收并定稿 ACCEPTANCE-REPORT.md（五要素齐全），最后一行机器可读 VERDICT: APPROVED 或 VERDICT: CHANGES_REQUESTED。'
+  } else if (phase === 'test-review') {
+    deliveryHint =
+      '交付：写 TEST-REVIEW.md（逐条 AC 审核结论、补充用例、完整测试命令/退出码/关键输出），最后一行 VERDICT: APPROVED 或 VERDICT: CHANGES_REQUESTED。'
+  } else if (phase === 'tech-review') {
+    deliveryHint =
+      '交付：写 TECH-REVIEW.md（代码审查、亲自运行验证测试、逐条命令/退出码/关键输出与编号缺陷），最后一行 VERDICT: APPROVED 或 VERDICT: CHANGES_REQUESTED。'
+  } else if (phase === 'review') {
+    deliveryHint =
+      '交付：写 REVIEW.md，逐条 AC 给出验证命令、退出码、关键输出与结论，最后一行 VERDICT: APPROVED 或 VERDICT: CHANGES_REQUESTED。'
+  } else if (phase === 'spec') {
+    deliveryHint =
+      '交付：发布/修订 SPEC.md（代码结构、模块职责、表与迁移、领域模型、接口与错误、验证用例），版本号以派单为准。'
+  } else if (phase === 'design') {
+    deliveryHint = '交付：写 PLAN.md（业务方案 + 编号验收标准 + 可执行验收命令），只回复 ≤150 字摘要 + 文件路径。'
+  } else {
+    deliveryHint = `交付：写 ${deliveryFile}，逐条 AC 记录改动文件、测试名、命令、退出码、关键输出与结论；只回复 ≤150 字摘要 + 文件路径。`
+  }
+  return {
+    scopeLine,
+    reads: stageReads,
+    deliveryFile,
+    deliveryHint,
+    briefHints: [`- ${scopeLine}`, ...stageReads.slice(0, 2).map((item) => `- ${item}`)],
+  }
+}
+
+function renderDispatch({
+  taskId,
+  taskDir,
+  phase,
+  round,
+  agent,
+  message,
+  includeCharter,
+  config,
+  workspace,
+  worktrees = [],
+  strategy = null,
+}) {
   const deliverable = deliverableOf(agent, phase)
   const charter = includeCharter ? `\n角色章程：\n${charterFor(agent, config)}\n` : ''
   const repoBlock = worktrees.length > 1 ? `${repoLines(worktrees).join('\n')}\n` : ''
@@ -766,14 +1312,26 @@ function renderDispatch({ taskId, taskDir, phase, round, agent, message, include
     phase === 'acceptance'
       ? '先读 TASK.md 与 AUTHORITY.md（唯一权威方案）；读取 ACCEPTANCE-REPORT.md 与最近一份 ACCEPTANCE-REPORT-R<n>.md（存在时，核对上一轮修复情况）；读取 REPORT.md/JOURNAL.md 最后 80 行。'
       : phase === 'spec'
-      ? '先读 TASK.md 与 PLAN-APPROVED.md；spec 轮读取既有 SPEC.md（存在时）；读取 JOURNAL.md 最后 80 行。'
-      : phase === 'tech-review'
-        ? '先读 TASK.md；读取 SPEC.md、TEST-REVIEW.md、REPORT.md 与 TECH-REVIEW.md（存在时）；读取 JOURNAL.md 最后 80 行。'
-        : phase === 'test-review'
-          ? '先读 TASK.md；读取 SPEC.md、PLAN-APPROVED.md、REPORT.md 与 TEST-REVIEW.md（存在时）；读取 JOURNAL.md 最后 80 行。'
-          : phase === 'review'
-            ? '先读 TASK.md；读取 PLAN-APPROVED.md、REPORT.md 与 TECH-REVIEW.md（存在时）；读取 JOURNAL.md 最后 80 行。'
-            : '先读 TASK.md；设计轮读取 PLAN.md（存在时）；实现/返工读取 SPEC.md；读取 JOURNAL.md 最后 80 行。'
+        ? '先读 TASK.md 与 PLAN-APPROVED.md；spec 轮读取既有 SPEC.md（存在时）；读取 JOURNAL.md 最后 80 行。'
+        : phase === 'tech-review'
+          ? '先读 TASK.md；读取 SPEC.md、TEST-REVIEW.md、REPORT.md 与 TECH-REVIEW.md（存在时）；读取 JOURNAL.md 最后 80 行。'
+          : phase === 'test-review'
+            ? '先读 TASK.md；读取 SPEC.md、PLAN-APPROVED.md、REPORT.md 与 TEST-REVIEW.md（存在时）；读取 JOURNAL.md 最后 80 行。'
+            : phase === 'review'
+              ? '先读 TASK.md；读取 PLAN-APPROVED.md、REPORT.md 与 TECH-REVIEW.md（存在时）；读取 JOURNAL.md 最后 80 行。'
+              : '先读 TASK.md；设计轮读取 PLAN.md（存在时）；实现/返工读取 SPEC.md；读取 JOURNAL.md 最后 80 行。'
+  const acting =
+    phase === 'tech-review' && agent.role === 'tester'
+      ? '（代签技术验收：brain 已在本任务写代码）'
+      : phase === 'test-review' && agent.role === 'brain'
+        ? '（代行测试验收职责：测试者挂起）'
+        : ''
+  const strategyBlock = strategy
+    ? `本轮范围：${strategy.scopeLine}\n必读：${strategy.reads.join('；')}`
+    : readHint
+  const discipline = includeCharter
+    ? `上下文纪律：${CONTEXT_DISCIPLINE}`
+    : '上下文纪律：按 BRIEF 的上下文纪律。'
   const parallelHint =
     phase === 'implement' || phase === 'rework'
       ? '并行默认：本轮交办包含多个独立文件/模块时，用你的子代理/并行能力同时开发；不独立的部分串行完成；只改规格内文件，逐条 AC 留证。'
@@ -783,7 +1341,7 @@ ${charter}
 共享记忆：${taskDir}
 工作区：${workspace}
 ${repoBlock}（只在工作区内改动；动手前先确认 pwd 与它一致，不要写回源 checkout。）
-${readHint}
+${strategyBlock}${strategy ? `\n${discipline}` : ''}
 - PLAN-APPROVED.md 是业务方案与业务验收的唯一权威规格；SPEC.md 是技术实现、返工与技术验收的唯一权威规格；PLAN.md 只用于设计，不能覆盖批准归档。
 - 仅任务快照豁免方案门禁且无批准归档时，按 TASK.md 与 Lead 本轮派单执行；仍须逐条 AC 留证。
 - AC 映射：沿用 TASK.md 的 AC 编号；未编号时按条目顺序从 AC1 开始编号。PLAN.md/SPEC.md 为每条 AC 指定改动文件、测试名、验证命令与期望值；REPORT.md/TECH-REVIEW.md/REVIEW.md 按对应规格逐条记录 AC 编号、文件路径、测试名、命令、退出码、关键输出与结论。
@@ -791,15 +1349,16 @@ ${readHint}
 Lead 的本轮派单：
 ${message}
 ${parallelHint}
-交付物：${deliverable}
+${strategy ? `${strategy.deliveryHint}${acting ? ` ${acting}` : ''}` : `交付物：${deliverable}`}
 汇报前：更新你的文件，向 JOURNAL.md 追加 2–5 行，然后调用 squad_report（status、简短总结、改动文件）。受阻写进报告，不要在对话里向 Lead 提问。`
 }
 
-function formatMembers(members) {
+function formatMembers(members, usageById) {
   return members
     .map((member) => {
       const detail = member.description ? ` — ${clip(member.description, 100)}` : ''
-      return `- ${member.name} [${member.role}] ${member.status}${detail}`
+      const usage = usageById?.get(member.id)
+      return `- ${member.name} [${member.role}] ${member.status}${detail}${usage ? ` | ${usage}` : ''}`
     })
     .join('\n')
 }
@@ -820,13 +1379,13 @@ async function fileSummary(taskDir) {
 
 
 /** Deterministic one-page brief; the only file an external agent must read first. */
-async function writeBrief({ taskDir, state, agent, phase, round }) {
+async function writeBrief({ taskDir, state, agent, phase, round, strategy = null, config = null }) {
   const budget = budgetOf(state)
   const flow = flowOf(state)
   const reworkLine = flow.specRequired
     ? `rework: tech=${state.techReworkRounds ?? 0}/${budget.techLimit} business=${state.businessReworkRounds ?? 0}/${budget.businessLimit}`
     : `rework=${state.reworkRounds ?? 0}/${budget.reworkLimit}`
-  const lines = [
+  const legacyLines = [
     `# BRIEF · ${state.taskId}`,
     '',
     `phase=${phase} round=${round} ${reworkLine}`,
@@ -853,11 +1412,83 @@ async function writeBrief({ taskDir, state, agent, phase, round }) {
     `- ${deliverableOf(agent, phase)}`,
     '- 只回复 ≤150 字摘要 + 文件路径，不回贴正文',
   ]
-  await writeFile(join(taskDir, 'BRIEF.md'), `${lines.join('\n')}\n`, 'utf8')
+  const authorityLabel =
+    '- PLAN-APPROVED.md（业务方案；实现、返工与验收；豁免且无归档时按 TASK.md 与本轮派单）'
+  const semLines = [
+    '- PLAN-APPROVED.md 是业务方案与业务验收的唯一权威规格；SPEC.md 是技术实现、返工与技术验收的唯一权威规格；PLAN.md 只用于设计，不能覆盖批准归档。',
+    '- 仅任务快照豁免方案门禁且无批准归档时，按 TASK.md 与 Lead 本轮派单执行；仍须逐条 AC 留证。',
+    '- AC 映射：沿用 TASK.md 的 AC 编号；未编号时按条目顺序从 AC1 开始编号。PLAN.md/SPEC.md 为每条 AC 指定改动文件、测试名、验证命令与期望值；REPORT.md/TECH-REVIEW.md/REVIEW.md 按对应规格逐条记录 AC 编号、文件路径、测试名、命令、退出码、关键输出与结论。',
+  ]
+  // TR-04: rework BRIEF indexes this round's actual reports (one merged
+  // line), never demands a full TASK read and never copies defect bodies.
+  const strategyLines = strategy
+    ? phase === 'rework'
+      ? [
+          `# BRIEF · ${state.taskId}`,
+          '',
+          `phase=${phase} round=${round} ${reworkLine}`,
+          `agent=${agent.name} role=${agent.role}`,
+          '',
+          '## 返工范围',
+          `- ${REWORK_SCOPE}`,
+          '- 缺陷包仅以 Lead 本轮派单消息为准（不在 BRIEF 复制缺陷正文）',
+          '',
+          '## 必读（按编号定位）',
+          `- ${strategy.reads.join('；')}`,
+          authorityLabel,
+          ...(flow.acceptance
+            ? ['- 开发流程的 S/E/M 不替代 AUTHORITY.md：权威只取 AUTHORITY.md 对应条款与 ACCEPTANCE-REPORT.md 问题段。']
+            : []),
+          '',
+          ...semLines,
+          '',
+          '## 交付',
+          `- ${strategy.deliveryHint}`,
+          `- 上下文纪律：${CONTEXT_DISCIPLINE}`,
+          '- 只回复 ≤150 字摘要 + 文件路径，不回贴正文',
+        ]
+      : [
+          `# BRIEF · ${state.taskId}`,
+          '',
+          `phase=${phase} round=${round} ${reworkLine}`,
+          `agent=${agent.name} role=${agent.role}`,
+          '',
+          '## 目标 / 验收 / 约束',
+          `- ${strategy.scopeLine}`,
+          '- 本轮 Lead 交办全文以派单消息为准（本文件不复述）',
+          '',
+          '## 必读',
+          '- TASK.md（先读；目标/验收/约束三节完整读取）',
+          `- 完整索引：${strategy.reads.join('；')}`,
+          authorityLabel,
+          '- JOURNAL.md 最后 40 行（仅需要历史时按需读，不整读）',
+          '',
+          ...semLines,
+          '',
+          '## 交付',
+          `- ${strategy.deliveryHint}`,
+          `- 上下文纪律：${CONTEXT_DISCIPLINE}`,
+          '- 只回复 ≤150 字摘要 + 文件路径，不回贴正文',
+        ]
+    : legacyLines
+  await writeFile(join(taskDir, 'BRIEF.md'), `${strategyLines.join('\n')}\n`, 'utf8')
 }
 
 /** Prompt for an external one-shot or a local pinned-model child. */
-function dispatchPrompt({ mode, taskId, taskDir, phase, round, agent, message, workspace, config, includeCharter = true, worktrees = [] }) {
+function dispatchPrompt({
+  mode,
+  taskId,
+  taskDir,
+  phase,
+  round,
+  agent,
+  message,
+  workspace,
+  config,
+  includeCharter = true,
+  worktrees = [],
+  strategy = null,
+}) {
   const charter = includeCharter ? `\n角色章程：\n${charterFor(agent, config)}\n` : ''
   const repoBlock = worktrees.length > 1 ? `${repoLines(worktrees).join('\n')}\n` : ''
   const deliverFile =
@@ -872,6 +1503,12 @@ function dispatchPrompt({ mode, taskId, taskDir, phase, round, agent, message, w
               ? 'REVIEW.md'
               : 'PLAN.md'
             : 'REPORT.md'
+  const readBlock = strategy
+    ? `本轮范围：${strategy.scopeLine}\n必读：${strategy.reads.join('；')}`
+    : '先读 BRIEF.md 与 TASK.md；设计轮读取 PLAN.md（存在时），spec 轮读取 PLAN-APPROVED.md 与既有 SPEC.md，实现、返工与验收读取 PLAN-APPROVED.md + SPEC.md；按需读取 TECH-REVIEW.md / REVIEW.md / REPORT.md。'
+  const discipline = includeCharter
+    ? `上下文纪律：${CONTEXT_DISCIPLINE}`
+    : '上下文纪律：按 BRIEF 的上下文纪律。'
   const actingNote =
     (phase === 'tech-review' && agent.role === 'tester') || (phase === 'test-review' && agent.role === 'brain')
       ? '\n注：本阶段由你代行/代签，按上述规格交付。\n'
@@ -883,7 +1520,7 @@ function dispatchPrompt({ mode, taskId, taskDir, phase, round, agent, message, w
   return `[Agent Squad · ${mode}] task=${taskId} phase=${phase} round=${round} role=${agent.role}
 工作区：${workspace}
 ${repoBlock}共享记忆：${taskDir}
-先读 BRIEF.md 与 TASK.md；设计轮读取 PLAN.md（存在时），spec 轮读取 PLAN-APPROVED.md 与既有 SPEC.md，实现、返工与验收读取 PLAN-APPROVED.md + SPEC.md；按需读取 TECH-REVIEW.md / REVIEW.md / REPORT.md。
+${readBlock}${strategy ? `\n${discipline}` : ''}
 ${charter}
 - PLAN-APPROVED.md 是业务方案与业务验收的唯一权威规格；SPEC.md 是技术实现、返工与技术验收的唯一权威规格；PLAN.md 只用于设计，不能覆盖批准归档。
 - 仅任务快照豁免方案门禁且无批准归档时，按 TASK.md 与 Lead 本轮派单执行；仍须逐条 AC 留证。
@@ -891,7 +1528,7 @@ ${charter}
 本轮交办：
 ${message}
 ${parallelHint}${actingNote}
-交付：把结果写入 ${deliverFile}；只回复 ≤150 字摘要 + 文件路径，不要回贴全文。`
+${strategy ? strategy.deliveryHint : `交付：把结果写入 ${deliverFile}；只回复 ≤150 字摘要 + 文件路径，不要回贴全文。`}`
 }
 
 /** Best-effort Codex token read from the newest session rollout touched after `since`. */
@@ -1294,6 +1931,71 @@ async function resolveTask({ ctx, agent, config, store, explicitTaskId }) {
  * prefixed so two tasks can each own a `zcode` child without colliding in the
  * subagent tree; a single active task keeps the plain roster name.
  */
+/**
+ * Read-only dispatch-busy refusal shared by the pre-probe and final gates
+ * (TR-13/16/17). Priority: this task's own recorded id and its actual row.
+ * Only when that id has no row at all may the original base name act as a
+ * fallback; a name-only row never grants resume/compaction rights.
+ *
+ * @param {{state: object, targetName: string, taskId: string, activeTasks: number, rows: object[]}} input
+ * @returns {{where: string}|null} refusal detail, or null when dispatch may proceed
+ */
+function readOnlyBusyRefusal({ state, targetName, taskId, activeTasks, rows }) {
+  const childRecord = state.children?.[targetName]
+  if (childRecord?.status === 'provisioning') {
+    return { where: `本地子代理 ${childRecord.id}` }
+  }
+  // TR-18: both recorded ids of this task are meaningful. A historical local
+  // record must not mask a running team member (or vice versa); any exact row
+  // that is running refuses, and the presence of exact rows disables the
+  // unrelated base-name fallback.
+  const records = []
+  if (childRecord?.id) records.push({ kind: 'child', id: childRecord.id })
+  const memberRecord = state.members?.[targetName]
+  if (memberRecord?.id) records.push({ kind: 'member', id: memberRecord.id })
+  const exactRows = []
+  for (const record of records) {
+    const row = rows.find((entry) => entry.id === record.id)
+    if (row !== undefined) exactRows.push({ ...record, row })
+  }
+  const runningRow = exactRows.find((entry) => entry.row.activity === 'running')
+  if (runningRow) {
+    return {
+      where:
+        runningRow.kind === 'child'
+          ? `本地子代理 ${runningRow.id}`
+          : `队友 ${runningRow.id}`,
+    }
+  }
+  if (exactRows.length > 0) return null
+  const baseName = childNameFor(taskId, targetName, activeTasks)
+  const nameRow = rows.find((row) => (row.name ?? row.label ?? String(row.id)) === baseName)
+  return nameRow?.activity === 'running' ? { where: `队友（宿主名 ${baseName}）` } : null
+}
+
+/**
+ * TR-09: derive a legal host-side child name that is unique among the Lead's
+ * current children. The fixed roster id stays the logical identity; only the
+ * host name is suffixed when an idle stale child still holds the base name
+ * (the host does not release a name merely because the session is idle).
+ */
+function uniqueChildName(base, taken) {
+  const legal = String(base)
+    .toLowerCase()
+    .replace(/[^a-z0-9-]/g, '-')
+    .replace(/^[^a-z]+/, '')
+  const root = legal === '' ? 'child' : legal
+  if (!taken.has(root)) return root
+  for (let index = 2; index < 10000; index += 1) {
+    const suffix = `-${index}`
+    const room = 32 - suffix.length
+    if (room < 1) break
+    const candidate = `${root.slice(0, room)}${suffix}`
+    if (!taken.has(candidate)) return candidate
+  }
+  return root.slice(0, 32)
+}
+
 function childNameFor(taskId, name, activeTasks) {
   if (activeTasks <= 1) return name
   // The subagent runtime only accepts 1-32 lower-case letters, digits or
@@ -1310,8 +2012,41 @@ function childNameFor(taskId, name, activeTasks) {
   if (room < 1) return safeName.slice(0, 32)
   return `${safeTask.slice(0, room)}-${safeName}`
 }
-/** Build the six model-facing tools. */
+/** Build the model-facing tools. */
 function createTools(ctx, config, runtime, store) {
+  // S6: one bounded in-memory cache of successful report snapshots. Keys are
+  // [taskId, sessionId]; a rewrite deletes then re-inserts (LRU-ish), and the
+  // oldest entry falls out at 128. Reload clears it.
+  const usagePolicy = config.contextPolicy
+  const autoUsage = usagePolicy !== false && usagePolicy.showUsage === true
+  const usageCache = new Map()
+  const usageKey = (taskId, sessionId) => JSON.stringify([String(taskId), String(sessionId)])
+  const rememberUsage = (taskId, sessionId, usage) => {
+    if (!autoUsage || !usage) return
+    const key = usageKey(taskId, sessionId)
+    usageCache.delete(key)
+    usageCache.set(key, usageSnapshotOf(usage))
+    while (usageCache.size > USAGE_CACHE_LIMIT) {
+      usageCache.delete(usageCache.keys().next().value)
+    }
+  }
+  const lastUsage = (taskId, sessionId) => usageCache.get(usageKey(taskId, sessionId))
+  const usageLineFor = (agent, binding, kind) =>
+    autoUsage
+      ? formatContextUsage(
+          contextUsageOf(ctx, { agent, binding, policy: usagePolicy, kind }),
+        )
+      : null
+  const sessionUsageLine = (taskId, sessionId) => {
+    if (!autoUsage) return null
+    const live = ctx.agents.get(sessionId)
+    if (live) return usageLineFor(live, runtime.bindingOf(sessionId), 'live')
+    const snapshot = lastUsage(taskId, sessionId)
+    return snapshot
+      ? formatContextUsage(contextUsageOf(ctx, { policy: usagePolicy, kind: 'last', snapshot }))
+      : formatContextUsage(contextUsageOf(ctx, { policy: usagePolicy, kind: 'cold' }))
+  }
+
   const start = defineTool({
     name: 'squad_start',
     description:
@@ -1844,15 +2579,15 @@ function createTools(ctx, config, runtime, store) {
     try {
       const activation = await subagents.startActivation({
         provider: target.executor === 'external' && !pinned ? target.model : 'spawn',
-        ...(pinned
-          ? {
-              agentOptions: {
-                provider: pinned.provider,
-                model: pinned.model,
-                ...(target.reasoning ? { reasoningEffort: target.reasoning } : {}),
-              },
-            }
-          : {}),
+        ...activationOptions({
+          policy: config.contextPolicy,
+          parent: lead,
+          executor: target.executor,
+          pinned,
+          reasoning: target.reasoning,
+          provider: target.executor === 'external' && !pinned ? target.model : 'spawn',
+          subagents,
+        }),
         label: `probe/${target.name}`,
         prompt: [{ type: 'text', text: '可用性探测：这是自动门禁的临时探测请求，只回复 OK，不要做其他事。' }],
         parent: lead,
@@ -2000,18 +2735,20 @@ function createTools(ctx, config, runtime, store) {
       const flow = flowOf(state)
       const treeRows = await treeRowsOf(ctx, lead, exec.signal)
       const activeTasks = await activeTaskCount(store).catch(() => 1)
-      const spawnName = childNameFor(taskId, target.name, activeTasks)
-      const recordedChildId =
-        state.children?.[target.name]?.id ?? state.members?.[target.name]?.id
-      const existing =
-        (recordedChildId ? treeRows.find((row) => row.id === recordedChildId) : undefined) ??
-        treeRows.find((row) => (row.name ?? row.label ?? String(row.id)) === spawnName)
+      // Snapshot for the *originally requested* target only. The availability
+      // gate may substitute another worker, so every identity/session/route
+      // fact is re-derived from the actual target after that point (TR-01);
+      // these first snapshots only feed the pre-probe refusal gates.
+      const initialTargetName = target.name
       const priorRework = Number(state.reworkRounds ?? 0)
       const budget = budgetOf(state)
       // Full-flow rework: resolve which acceptance the defects come from and
       // check that quota; legacy tasks keep the single implement quota. All
       // refusals happen before any shared file or state mutation.
       let reworkKind = null
+      // Fresh failing report names recorded at gate time (S7): the rework
+      // strategy points at these instead of re-reading the whole history.
+      const failedReports = []
       if (phase === 'rework' && flow.acceptance) {
         // Acceptance-mode fixes ride the tech rework budget; a fresh
         // CHANGES_REQUESTED acceptance report is the only valid trigger.
@@ -2023,6 +2760,7 @@ function createTools(ctx, config, runtime, store) {
           )
         }
         reworkKind = 'tech'
+        failedReports.push('ACCEPTANCE-REPORT.md')
         if (budget.techUsed >= budget.techLimit) {
           throw new Error(
             `验收返工已达上限 ${budget.techLimit} 轮（已用 ${budget.techUsed}）。先向用户说明阻塞点与已完成部分并等待决策；用户同意后调用 squad_extend(kind="tech", confirmed=true, reason="用户批准的追加理由") 追加轮次，再派 rework；用户拒绝或未回复时保持暂停，不得自动续跑。`,
@@ -2058,6 +2796,16 @@ function createTools(ctx, config, runtime, store) {
           throw new Error(
             '没有待返工的验收结论：先派 test-review/tech-review/review 得到 CHANGES_REQUESTED，或确认验收结论未因后续代码/规格变动失效。',
           )
+        }
+        if (reworkKind === 'business') {
+          failedReports.push('REVIEW.md')
+        } else {
+          if (bindingFresh(state.testReview, state) && testVerdict === 'CHANGES_REQUESTED') {
+            failedReports.push('TEST-REVIEW.md')
+          }
+          if (bindingFresh(state.techReview, state) && techVerdict === 'CHANGES_REQUESTED') {
+            failedReports.push('TECH-REVIEW.md')
+          }
         }
         const used = reworkKind === 'business' ? budget.businessUsed : budget.techUsed
         const limit = reworkKind === 'business' ? budget.businessLimit : budget.techLimit
@@ -2111,43 +2859,20 @@ function createTools(ctx, config, runtime, store) {
         } catch {}
       }
 
-      const includeCharter = !existing || !runtime.isInstalled(existing.id)
-      const message = renderDispatch({
-        taskId,
-        taskDir,
-        phase,
-        round,
-        agent: target,
-        message: String(args.message).trim(),
-        includeCharter,
-        config,
-        workspace,
-        worktrees: repoRows,
-      })
-
-      const executor = target.executor
-      const slash = executor === 'local' || executor === 'external'
-        ? target.model.indexOf('/')
-        : -1
-      const pinned =
-        slash > 0
-          ? { provider: target.model.slice(0, slash), model: target.model.slice(slash + 1) }
-          : undefined
-      const external = executor === 'external'
-
       // Unified activity guard (R07): refuse re-dispatch while the target's
       // current binding — local child or team member — is running/provisioning,
       // regardless of executor or model changes. Checked BEFORE any shared
       // file (BRIEF) or state mutation so a refusal leaves them untouched.
-      const recordedChild = state.children?.[target.name]
-      const childBusy =
-        recordedChild !== undefined &&
-        (recordedChild.status === 'provisioning' || isRowRunning(treeRows, recordedChild.id))
-      const memberBusy = existing !== undefined && existing.activity === 'running'
-      if (childBusy || memberBusy) {
-        const where = childBusy ? `本地子代理 ${recordedChild.id}` : `队友 ${existing.id}`
+      const initialRefusal = readOnlyBusyRefusal({
+        state,
+        targetName: target.name,
+        taskId,
+        activeTasks,
+        rows: treeRows,
+      })
+      if (initialRefusal) {
         throw new Error(
-          `目标 ${target.name} 仍在运行或创建中（${where}）。等它完成后再派单，不能并行重派或切换执行方式。`,
+          `目标 ${target.name} 仍在运行或创建中（${initialRefusal.where}）。等它完成后再派单，不能并行重派或切换执行方式。`,
         )
       }
       // R07 (cross-task): a child bound to this agent in ANY task of the same
@@ -2187,9 +2912,10 @@ function createTools(ctx, config, runtime, store) {
       // pending, so the Lead's turn ends instead of hanging for minutes on a
       // codex design/review. Fast runs (tests, instant providers) settle within
       // a tick and are handled inline exactly like a blocking dispatch.
-      // background:false restores the old synchronous call.
-      const background = external && args.background !== false
-      if (args.background === true && !external) {
+      // background:false restores the old synchronous call. This gate keeps
+      // refusing the originally requested target; the actual target's
+      // background legality is re-checked after substitution below.
+      if (args.background === true && target.executor !== 'external') {
         throw new Error('background 仅支持 external 执行者（一次性外部 provider）；local/team 执行者本就不阻塞。')
       }
       // Mode exclusivity: the dev pipeline phases do not exist in acceptance
@@ -2376,8 +3102,30 @@ function createTools(ctx, config, runtime, store) {
           (args.probe !== false && runtime.probeFresh(target.name) !== false
             ? false
             : state.probes?.[target.name]?.ok !== true)
+        // TR-16: the dispatch-entry snapshot only describes the primary. When
+        // a quota failure substitutes another worker, refresh the tree before
+        // judging/probing the substitute; never cache its eligibility from the
+        // initial rows. The final pre-start gate below refreshes again.
+        let probeRows = treeRows
+        let probeRowsFor = initialTargetName
         while (needProbe && workerCapable(target) && target.executor !== 'team' && !tried.has(target.name)) {
           tried.add(target.name)
+          if (target.name !== probeRowsFor) {
+            probeRows = await treeRowsOf(ctx, lead, exec.signal)
+            probeRowsFor = target.name
+          }
+          const probeRefusal = readOnlyBusyRefusal({
+            state,
+            targetName: target.name,
+            taskId,
+            activeTasks,
+            rows: probeRows,
+          })
+          if (probeRefusal) {
+            throw new Error(
+              `目标 ${target.name} 仍在运行或创建中（${probeRefusal.where}）。等它完成后再派单，不能并行重派或切换执行方式。`,
+            )
+          }
           const probe = await probeWorker(target, workspace, lead, exec.signal)
           if (probe.ok) {
             state.probes = { ...(state.probes ?? {}), [target.name]: { at: new Date().toISOString(), ok: true } }
@@ -2398,12 +3146,129 @@ function createTools(ctx, config, runtime, store) {
           needProbe = state.probes?.[target.name]?.ok !== true
         }
       }
-      await writeBrief({ taskDir, state, agent: target, phase, round })
+      // S3/TR-01: the availability gate may have handed the round to another
+      // worker. Identity, bound session, busy state, route, background
+      // legality, strategy and rendered prompt must all describe the actual
+      // target; the primary's snapshots are never reused for the backup.
+      const recordedChildId = state.children?.[target.name]?.id ?? state.members?.[target.name]?.id
+      const finalRows = target.name === initialTargetName
+        ? treeRows
+        : await treeRowsOf(ctx, lead, exec.signal)
+      // TR-13: the read-only busy refusal must look at the actual substitute's
+      // original base name (or its recorded id), never at a derived free name.
+      const baseSpawnName = childNameFor(taskId, target.name, activeTasks)
+      // TECH-01/TR-17: a tree row can prove activity for the refusal guard,
+      // but by itself (name-only legacy row) it never grants a resumable
+      // binding or usage. Only STATE records of this task, selected by the
+      // actual executor, are binding facts; the exact id wins over any
+      // same-base-name legacy row.
+      const recordedChild = state.children?.[target.name]
+      const recordedMember = state.members?.[target.name]
+      const childBusy =
+        recordedChild !== undefined &&
+        (recordedChild.status === 'provisioning' || isRowRunning(finalRows, recordedChild.id))
+      const finalRefusal = readOnlyBusyRefusal({
+        state,
+        targetName: target.name,
+        taskId,
+        activeTasks,
+        rows: finalRows,
+      })
+      if (target.name !== initialTargetName && finalRefusal) {
+        throw new Error(
+          `目标 ${target.name} 仍在运行或创建中（${finalRefusal.where}）。等它完成后再派单，不能并行重派或切换执行方式。`,
+        )
+      }
+      if (target.name !== initialTargetName) {
+        // Cross-task activity guard also follows the actual target.
+        const otherEntries = await readdir(directory).catch(() => [])
+        for (const name of otherEntries) {
+          const other = await readJson(join(directory, name, 'STATE.json'))
+          const otherChild = other?.children?.[target.name]
+          if (!otherChild) continue
+          if (otherChild.status === 'provisioning' || isRowRunning(finalRows, otherChild.id)) {
+            throw new Error(
+              `目标 ${target.name} 在任务 ${name} 中仍有运行中的本地子代理（${otherChild.id}）。等它完成后再派单。`,
+            )
+          }
+        }
+      }
+      const executor = target.executor
+      const slash = executor === 'local' || executor === 'external'
+        ? target.model.indexOf('/')
+        : -1
+      const pinned =
+        slash > 0
+          ? { provider: target.model.slice(0, slash), model: target.model.slice(slash + 1) }
+          : undefined
+      const external = executor === 'external'
+      const background = external && args.background !== false
+      if (args.background === true && !external) {
+        throw new Error('background 仅支持 external 执行者（一次性外部 provider）；local/team 执行者本就不阻塞。')
+      }
+      // TR-13: derive a free legal host name only now that the refusal gates
+      // passed and a new child may actually be created. Taking a name never
+      // grants a resumable/compaction binding.
+      const takenChildNames = new Set()
+      for (const row of finalRows) {
+        if (typeof row?.name === 'string' && row.name !== '') takenChildNames.add(row.name)
+      }
+      for (const pendingName of runtime.pendingNames?.() ?? []) takenChildNames.add(pendingName)
+      const spawnName = uniqueChildName(baseSpawnName, takenChildNames)
+      // TECH-01: select the binding that the actual executor may continue.
+      // Switching executors spawns a fresh child of the new kind instead of
+      // resuming the other kind's id; a model change also needs a new child.
+      const childBinding =
+        executor === 'local' &&
+        recordedChild !== undefined &&
+        recordedChild.status !== 'provisioning' &&
+        recordedChild.model === target.model
+          ? recordedChild
+          : undefined
+      const memberBinding =
+        executor === 'team' && recordedMember?.id ? recordedMember : undefined
+      // S7: one strategy per round, computed from the worker that actually
+      // runs; `contextPolicy:false` keeps the legacy renderers byte-for-byte.
+      const strategy = config.contextPolicy === false ? null : makeDispatchStrategy({
+        phase,
+        flow,
+        reworkKind,
+        round,
+        target,
+        failedReports,
+        planRequired: planGateOf(state).planRequired,
+      })
+      // S8: a new local/team child gets the full charter; reusing the same id
+      // only gets this round's strategy (system-section refresh is separate).
+      const includeCharter =
+        executor === 'local'
+          ? childBinding === undefined
+          : executor === 'team'
+            ? memberBinding === undefined
+            : true
+      const message = renderDispatch({
+        taskId,
+        taskDir,
+        phase,
+        round,
+        agent: target,
+        message: String(args.message).trim(),
+        includeCharter,
+        config,
+        workspace,
+        worktrees: repoRows,
+        ...(strategy ? { strategy } : {}),
+      })
+      await writeBrief({ taskDir, state, agent: target, phase, round, ...(strategy ? { strategy } : {}) })
 
       let mode
       let sessionId
       let externalText = ''
       let tokens
+      /** S6 automatic context line for this dispatch receipt, when enabled. */
+      let usageLine = null
+      /** S3 fork capability fallback surfaced in the receipt. */
+      let forkCapFallback = false
       // local + `provider/model` = continuable pinned child; the same form on
       // an external executor falls through to the one-shot branch below.
       if (pinned && !external) {
@@ -2411,9 +3276,7 @@ function createTools(ctx, config, runtime, store) {
         if (!subagents) {
           throw new Error('本地固定模型子代理需要宿主 subagents 服务，但当前不可用。')
         }
-        const recorded = state.children?.[target.name]
-        const bindingChanged = recorded !== undefined && recorded.model !== target.model
-        const existingChild = bindingChanged ? undefined : recorded
+        const existingChild = childBinding
         const prompt = dispatchPrompt({
           mode: 'local',
           taskId,
@@ -2426,8 +3289,11 @@ function createTools(ctx, config, runtime, store) {
           config,
           includeCharter: existingChild === undefined,
           worktrees: repoRows,
+          ...(strategy ? { strategy } : {}),
         })
         if (existingChild === undefined) {
+          usageLine = usageLineFor(undefined, undefined, 'new')
+          const previousChildRecord = state.children?.[target.name]
           const childId = randomUUID()
           runtime.registerBinding(childId, { ...target, taskId })
           // Persist the provisional binding BEFORE creating the child so an
@@ -2445,11 +3311,15 @@ function createTools(ctx, config, runtime, store) {
               label: `${taskId}/${phase}/${target.name}`,
               prompt: [{ type: 'text', text: prompt }],
               parent: lead,
-              agentOptions: {
-                provider: pinned.provider,
-                model: pinned.model,
-                ...(target.reasoning ? { reasoningEffort: target.reasoning } : {}),
-              },
+              ...activationOptions({
+                policy: config.contextPolicy,
+                parent: lead,
+                executor: 'local',
+                pinned,
+                reasoning: target.reasoning,
+                provider: 'spawn',
+                subagents,
+              }),
               ...(hasWorkspace ? { cwd: workspace } : {}),
               signal: exec.signal,
               delivery: 'parent',
@@ -2458,13 +3328,23 @@ function createTools(ctx, config, runtime, store) {
             state.children[target.name] = { id: childId, model: target.model, status: 'active' }
             mode = 'local'
           } catch (error) {
-            delete state.children[target.name]
+            // TR-14: roll back only this round's provisional id and restore the
+            // previously proven record, so status/compact keep targeting it.
+            runtime.unregisterBinding(childId)
+            if (previousChildRecord !== undefined) {
+              state.children[target.name] = previousChildRecord
+            } else {
+              delete state.children[target.name]
+            }
             await writeJson(join(taskDir, 'STATE.json'), state).catch(() => {})
             throw error
           }
         } else {
           runtime.rebind(existingChild.id, { ...target, taskId })
           await moveTeammate(existingChild.id)
+          // S6: sample the resumed child before the message is delivered, so a
+          // live Agent gives live numbers and a cold id replays its last report.
+          usageLine = sessionUsageLine(taskId, existingChild.id)
           await subagents.sendMessage(lead, existingChild.id, [{ type: 'text', text: prompt }], {
             signal: exec.signal,
           })
@@ -2492,7 +3372,9 @@ function createTools(ctx, config, runtime, store) {
           workspace,
           config,
           worktrees: repoRows,
+          ...(strategy ? { strategy } : {}),
         })
+        usageLine = usageLineFor(undefined, undefined, 'external')
         const startedAt = Date.now()
         const tokensBefore =
           ['codex', 'codex-cli'].includes(target.model)
@@ -2501,16 +3383,17 @@ function createTools(ctx, config, runtime, store) {
         // An external `provider/model` form runs a ONE-SHOT pinned child:
         // fresh context on every dispatch, no name/binding, no children
         // entry — the continuable path is the local/team executors.
-        const pinnedOptions = pinned
-          ? {
-              provider: pinned.provider,
-              model: pinned.model,
-              ...(target.reasoning ? { reasoningEffort: target.reasoning } : {}),
-            }
-          : undefined
         const activation = await subagents.startActivation({
           provider: pinned ? 'spawn' : target.model,
-          ...(pinned ? { agentOptions: pinnedOptions } : {}),
+          ...activationOptions({
+            policy: config.contextPolicy,
+            parent: lead,
+            executor: 'external',
+            pinned,
+            reasoning: target.reasoning,
+            provider: pinned ? 'spawn' : target.model,
+            subagents,
+          }),
           label: `${taskId}/${phase}/${target.name}`,
           prompt: [{ type: 'text', text: prompt }],
           parent: lead,
@@ -2592,11 +3475,14 @@ function createTools(ctx, config, runtime, store) {
         }
         // An external dispatch obsoletes any stale continuable binding for
         // this name — the activity guard above proved it idle before we got
-        // here, so drop the record instead of resuming a dead child later.
+        // here, so drop both records instead of resuming a dead child later.
         if (state.children?.[target.name] !== undefined) {
           delete state.children[target.name]
         }
-      } else if (!existing) {
+        if (state.members?.[target.name] !== undefined) {
+          delete state.members[target.name]
+        }
+      } else if (!memberBinding) {
         // Team executor: a named continuable child on the Lead's subagent
         // tree (the 0.2.x replacement for agentTeams.spawnTeammate).
         const subagents = ctx.get('subagents')
@@ -2604,9 +3490,28 @@ function createTools(ctx, config, runtime, store) {
           throw new Error('team 执行者需要宿主 subagents 服务，但当前不可用。')
         }
         const provider = target.context === 'fork' ? 'fork' : 'spawn'
+        // S3: team spawn only caps the request; a fork also needs the host to
+        // declare agentOptions support, otherwise fork semantics stay as-is.
+        const teamOptions = activationOptions({
+          policy: config.contextPolicy,
+          parent: lead,
+          executor: 'team',
+          pinned: undefined,
+          reasoning: target.reasoning,
+          provider,
+          subagents,
+        })
+        forkCapFallback =
+          provider === 'fork' &&
+          config.contextPolicy !== false &&
+          requestCap(config.contextPolicy, lead) !== undefined &&
+          teamOptions.agentOptions === undefined
         const childId = randomUUID()
         // Publish this round's snapshots before spawning so an agent/created
-        // fired mid-spawn already installs the dispatched identity (R08).
+        // fired mid-spawn already installs the dispatched identity (R08); the
+        // reserved child id gets the same task binding as a local child so the
+        // automatic fallback can verify it before acting.
+        runtime.registerBinding(childId, { ...target, taskId })
         runtime.setPending(spawnName, { ...target, taskId })
         let activation
         try {
@@ -2617,14 +3522,21 @@ function createTools(ctx, config, runtime, store) {
             label: `${taskId}/${phase}/${target.name}`,
             prompt: [{ type: 'text', text: message }],
             parent: lead,
+            ...teamOptions,
             ...(hasWorkspace ? { cwd: workspace } : {}),
             signal: exec.signal,
             delivery: 'parent',
           })
+        } catch (error) {
+          // Withdraw exactly this reserved id and clear the pending persona.
+          runtime.unregisterBinding(childId)
+          runtime.clearPending(spawnName)
+          throw error
         } finally {
-          runtime.clearPending(target.name)
+          runtime.clearPending(spawnName)
         }
         mode = 'spawned'
+        usageLine = usageLineFor(undefined, undefined, 'new')
         sessionId = activation.childId
         state.members = { ...(state.members ?? {}), [target.name]: { id: sessionId } }
         await moveTeammate(sessionId)
@@ -2636,20 +3548,38 @@ function createTools(ctx, config, runtime, store) {
         if (!subagents) {
           throw new Error('team 执行者需要宿主 subagents 服务，但当前不可用。')
         }
-        await moveTeammate(existing.id)
+        await moveTeammate(memberBinding.id)
         // Idle resume: refresh the binding and identity section to this
-        // round's snapshot before the message is delivered (R08).
-        runtime.rebind(existing.id, { ...target, taskId })
+        // round's snapshot before the message is delivered (R08). The task
+        // record is kept as the single team binding for this member.
+        runtime.rebind(memberBinding.id, { ...target, taskId })
+        state.members = { ...(state.members ?? {}), [target.name]: { id: memberBinding.id } }
+        // S6: sample before delivery (live Agent) or replay the last report.
+        usageLine = sessionUsageLine(taskId, memberBinding.id)
         await subagents.sendMessage(
           lead,
-          existing.id,
+          memberBinding.id,
           [{ type: 'text', text: message }],
           { signal: exec.signal },
         )
         mode = 'resumed'
-        sessionId = existing.id
+        sessionId = memberBinding.id
       }
 
+      // TR-10: the round succeeded. Withdraw the runtime compression binding
+      // of every superseded id so its pre-step can no longer fall back into
+      // the squad's automatic compaction; the active id keeps its binding.
+      {
+        const activeBindingId =
+          mode === 'local' || mode === 'local-resumed' || mode === 'spawned' || mode === 'resumed'
+            ? sessionId
+            : undefined
+        for (const oldRecord of [recordedChild, recordedMember]) {
+          if (oldRecord?.id && oldRecord.id !== activeBindingId) {
+            runtime.unregisterBinding(oldRecord.id)
+          }
+        }
+      }
       if (phase === 'review') {
         // Full flow: bind the business acceptance to the code/spec version it
         // examined (recorded at dispatch, also for background rounds); a later
@@ -2809,10 +3739,14 @@ function createTools(ctx, config, runtime, store) {
           state.reworkRounds = priorRework + 1
         }
       }
-      // Executor switched away from local: drop the idle stale child record so
-      // one agent never keeps two live bindings (R07).
+      // TECH-01: after a successful (re)dispatch exactly one binding kind may
+      // remain for this member. Withdraw the idle stale record of the other
+      // executor so status/compact never see a mixed identity (R07).
       if (executor !== 'local' && state.children?.[target.name] && !childBusy) {
         delete state.children[target.name]
+      }
+      if (executor !== 'team' && state.members?.[target.name]) {
+        delete state.members[target.name]
       }
       state.dispatches.push({
         at: new Date().toISOString(),
@@ -2880,6 +3814,8 @@ function createTools(ctx, config, runtime, store) {
         return [
           `${mode === 'local' ? '已创建' : '已续跑'}本地子代理 ${target.name} [${target.role}] model=${target.model} session=${sessionId}`,
           `task=${taskId} phase=${phase} round=${round} ${reworkLine}`,
+          ...(usageLine ? [usageLine] : []),
+          ...(forkCapFallback ? ['fork 继承输出预留：宿主未声明 agentOptions 能力，本轮未注入 maxTokens；保留 fork 语义。'] : []),
           ...gateLines,
           ...phaseLines,
           ...actingLine,
@@ -2891,6 +3827,8 @@ function createTools(ctx, config, runtime, store) {
         return [
           `已后台派发 ${target.displayName} (${target.name}) [${target.role}] provider=${target.model}（不阻塞，可继续派其他队友）`,
           `task=${taskId} phase=${phase} round=${round} ${reworkLine}`,
+          ...(usageLine ? [usageLine] : []),
+          ...(forkCapFallback ? ['fork 继承输出预留：宿主未声明 agentOptions 能力，本轮未注入 maxTokens；保留 fork 语义。'] : []),
           ...gateLines,
           ...phaseLines,
           ...actingLine,
@@ -2906,6 +3844,8 @@ function createTools(ctx, config, runtime, store) {
         return [
           `已外部派发 ${target.displayName} (${target.name}) [${target.role}] provider=${target.model}（一次性，不续跑）`,
           `task=${taskId} phase=${phase} round=${round} tokens=${tokens ?? 'unknown'} totalTokens=${state.tokens ?? 0}`,
+          ...(usageLine ? [usageLine] : []),
+          ...(forkCapFallback ? ['fork 继承输出预留：宿主未声明 agentOptions 能力，本轮未注入 maxTokens；保留 fork 语义。'] : []),
           ...gateLines,
           ...phaseLines,
           ...actingLine,
@@ -2917,6 +3857,8 @@ function createTools(ctx, config, runtime, store) {
       return [
         `${mode === 'spawned' ? '已创建' : '已续跑'} ${target.name} [${target.role}] session=${sessionId}`,
         `task=${taskId} phase=${phase} round=${round} ${reworkLine}`,
+        ...(usageLine ? [usageLine] : []),
+        ...(forkCapFallback ? ['fork 继承输出预留：宿主未声明 agentOptions 能力，本轮未注入 maxTokens；保留 fork 语义。'] : []),
         ...gateLines,
         ...phaseLines,
         ...actingLine,
@@ -3045,6 +3987,22 @@ function createTools(ctx, config, runtime, store) {
           )
         }
       } catch {}
+      // S6: usage for this task's own ids only. Cold members absent from the
+      // tree rows still get their line so the block is complete.
+      const memberUsageById = new Map()
+      const coldMemberLines = []
+      if (autoUsage) {
+        for (const [memberName, record] of Object.entries(state.members ?? {})) {
+          if (!record?.id) continue
+          const memberLine = sessionUsageLine(taskId, record.id)
+          memberUsageById.set(record.id, memberLine)
+          if (!treeRows.some((row) => row.id === record.id)) {
+            const memberRole =
+              state.participantRoles?.[memberName] ?? runtime.bindingOf(record.id)?.role ?? 'teammate'
+            coldMemberLines.push(`- ${memberName} [${memberRole}] cold | ${memberLine}`)
+          }
+        }
+      }
       const lines = [
         `${PLUGIN_MARKER}  task=${taskId}  phase=${state.phase ?? 'unknown'}  round=${state.round ?? '?'}  flow=${flow.flow}  created=${state.createdAt ?? '?'}`,
         ...progressBlock.split('\n'),
@@ -3117,7 +4075,8 @@ function createTools(ctx, config, runtime, store) {
         ...workspaceBlock,
         `共享记忆：${taskDir}`,
         '成员：',
-        formatMembers(memberRows),
+        formatMembers(memberRows, autoUsage ? memberUsageById : undefined),
+        ...(coldMemberLines.length > 0 ? coldMemberLines : []),
         '本地子代理：',
         state.children
           ? Object.entries(state.children)
@@ -3131,7 +4090,8 @@ function createTools(ctx, config, runtime, store) {
                       : row.activity === 'running'
                         ? 'running'
                         : 'inactive'
-                return `- ${name} → ${child.id} (${child.model}) ${status}`
+                const contextLine = autoUsage ? sessionUsageLine(taskId, child.id) : null
+                return `- ${name} → ${child.id} (${child.model}) ${status}${contextLine ? ` | ${contextLine}` : ''}`
               })
               .join('\n')
           : '- （无）',
@@ -3145,12 +4105,286 @@ function createTools(ctx, config, runtime, store) {
       if (recent.length > 0) {
         lines.push('最近派单：')
         for (const item of recent) {
+          const externalRow = item.mode === 'external' || item.mode === 'external-background'
+          const contextLine =
+            autoUsage && externalRow ? usageLineFor(undefined, undefined, 'external') : null
           lines.push(
-            `- ${item.at} ${item.agent} (${item.role}) phase=${item.phase} round=${item.round} ${item.mode}`,
+            `- ${item.at} ${item.agent} (${item.role}) phase=${item.phase} round=${item.round} ${item.mode}${contextLine ? ` | ${contextLine}` : ''}`,
           )
         }
       }
       return lines.join('\n')
+    },
+  })
+
+  const compact = defineTool({
+    name: 'squad_compact',
+    description:
+      '仅 Lead：对单个本任务队友会话做一次人工压缩。默认压缩当前任务的队友；task_id 可指定其它活动任务。local/team 队友走宿主 compaction.compactNow（先按需修剪工具输出，再摘要），返回压缩前后上下文用量与 shadowedTokens/Seqs；队友运行中返回 busy，冷会话不唤醒，external 一次性执行者不可压缩。',
+    parameters: {
+      type: 'object',
+      additionalProperties: false,
+      required: ['agent'],
+      properties: {
+        agent: { type: 'string', enum: ['codex', 'gpt', 'zcode', 'qoder', 'opencode'] },
+        task_id: { type: 'string', minLength: 1 },
+      },
+    },
+    output: {
+      schema: { type: 'string' },
+      render: (_args, value) => [{ type: 'text', text: value }],
+    },
+    async execute(args, exec) {
+      const lead = callingAgent(exec, 'squad_compact')
+      const memberName = typeof args.agent === 'string' ? args.agent.trim() : ''
+      if (!MEMBER_IDS.has(memberName)) {
+        throw new Error(
+          'squad_compact 的 agent 必须是固定成员 id（codex/gpt/zcode/qoder/opencode）；不能压缩 Lead 自身。',
+        )
+      }
+      for (const key of Object.keys(args)) {
+        if (key !== 'agent' && key !== 'task_id') {
+          throw new Error(`squad_compact 不接受参数 "${key}"。`)
+        }
+      }
+      if (
+        args.task_id !== undefined &&
+        (typeof args.task_id !== 'string' || args.task_id.trim() === '')
+      ) {
+        throw new Error('squad_compact 的 task_id 必须是非空字符串。')
+      }
+      if (!runtime.isLeadEnabled(lead.id)) {
+        throw new Error('squad_compact 仅允许已启用小队的 Lead 调用。')
+      }
+      let isRoot = false
+      try {
+        isRoot = ctx.get('subagents')?.rootOf(lead)?.id === lead.id
+      } catch {}
+      if (!isRoot) throw new Error('squad_compact 仅允许 Lead 调用。')
+
+      // One operation budget shared by discovery and compaction (S5).
+      const timeout = AbortSignal.timeout(COMPACT_TIMEOUT_MS)
+      const signal = exec.signal ? AbortSignal.any([exec.signal, timeout]) : timeout
+      // TECH-02: AbortSignal.any keeps the FIRST abort reason. Only a
+      // timeout-originated combined abort is a tool timeout; a caller cancel
+      // that happened before the budget stays a cancellation.
+      const abortedResult = () => {
+        if (!signal.aborted) return null
+        if (timeout.aborted && signal.reason === timeout.reason) return '压缩超时（180 秒）'
+        return '已取消压缩'
+      }
+      const prunedSuffix = (count) => (count > 0 ? `\n已修剪=${count}，请复查` : '')
+
+      const resolved = await resolveTask({
+        ctx,
+        agent: lead,
+        config,
+        store,
+        explicitTaskId: args.task_id === undefined ? undefined : args.task_id.trim(),
+      })
+      const stopAfterResolve = abortedResult()
+      if (stopAfterResolve) return stopAfterResolve
+      const { taskId, taskDir } = resolved
+      if (!taskId) throw new Error('还没有小队任务。先调用 squad_start。')
+      const state = await readJson(join(taskDir, 'STATE.json'))
+      const stopAfterState = abortedResult()
+      if (stopAfterState) return stopAfterState
+      if (!state) throw new Error(`未知小队任务 "${taskId}"。先调用 squad_start。`)
+      if (state.taskId !== undefined && state.taskId !== taskId) {
+        throw new Error(`任务 ${taskId} 的 STATE 记录不一致，未压缩。`)
+      }
+      if (state.phase === 'done') throw new Error(`任务 ${taskId} 已经收尾，不能人工压缩。`)
+      const registry = await readTaskRegistry(store)
+      const stopAfterRegistry = abortedResult()
+      if (stopAfterRegistry) return stopAfterRegistry
+      if (registry.tasks[taskId]?.active === false) {
+        throw new Error(`任务 ${taskId} 已结束，不能人工压缩。`)
+      }
+      const settings = await store.read()
+      const stopAfterSettings = abortedResult()
+      if (stopAfterSettings) return stopAfterSettings
+      const roster = settingsRoster(settings, config)
+      const rosterAgent = roster.find((agent) => agent.name === memberName)
+      if (!rosterAgent) throw new Error(`未知 agent "${memberName}"。`)
+      const dispatches = Array.isArray(state.dispatches) ? state.dispatches : []
+      const last = [...dispatches].reverse().find((item) => item.agent === memberName)
+      if (
+        last?.mode === 'external' ||
+        last?.mode === 'external-background' ||
+        (last === undefined && rosterAgent.executor === 'external')
+      ) {
+        return 'external：一次性执行者不可人工压缩'
+      }
+      let record
+      if (last?.mode === 'local' || last?.mode === 'local-resumed') {
+        record = state.children?.[memberName]
+      } else if (last?.mode === 'spawned' || last?.mode === 'resumed') {
+        record = state.members?.[memberName]
+      } else {
+        const childRecord = state.children?.[memberName]
+        const memberRecord = state.members?.[memberName]
+        if (childRecord?.id && memberRecord?.id && childRecord.id !== memberRecord.id) {
+          return '目标不唯一，未压缩'
+        }
+        record = childRecord ?? memberRecord
+      }
+      if (!record?.id) return '队友尚无本任务会话'
+      if (record.status === 'provisioning') return 'busy：队友运行中，稍后再试'
+
+      const subagents = ctx.get('subagents')
+      let rows = []
+      try {
+        if (subagents && typeof subagents.listDescendants === 'function') {
+          rows = await subagents.listDescendants(lead.id, signal)
+        }
+      } catch {
+        rows = []
+      }
+      const stopAfterTree = abortedResult()
+      if (stopAfterTree) return stopAfterTree
+      const treeRow = rows.find(
+        (entry) =>
+          entry.id === record.id && entry.kind === 'child' && entry.mode === 'continuable',
+      )
+      if (record.id === lead.id) return '目标不属于本任务的小队'
+      const binding = runtime.bindingOf(record.id)
+      if (binding && (binding.taskId !== taskId || binding.name !== memberName)) {
+        return '目标不属于本任务的小队'
+      }
+      const target = ctx.agents.get(record.id)
+      let treeRoot
+      try {
+        treeRoot = subagents?.rootOf(target)
+      } catch {
+        treeRoot = undefined
+      }
+      if (target && treeRoot?.id !== lead.id) return '目标不属于本任务的小队'
+      if (!treeRow) {
+        return target ? '目标不属于本任务的小队' : 'cold：会话未驻留，不能人工压缩'
+      }
+      if (!target) return 'cold：会话未驻留，不能人工压缩'
+      if (target.status === 'running') return 'busy：队友运行中，稍后再试'
+      const compaction = ctx.get('compaction')
+      if (!compaction || typeof compaction.compactNow !== 'function') {
+        return '不可用：缺少 compaction.compactNow'
+      }
+      const policy = config.contextPolicy === false ? CONTEXT_POLICY_DEFAULTS : config.contextPolicy
+      const before = contextUsageOf(ctx, { agent: target, binding, policy, kind: 'live' })
+      const pruner = ctx.get('toolResultPruner')
+      const hasPruner = Boolean(pruner && typeof pruner.pruneSession === 'function')
+      let pruneNote = null
+      if (!hasPruner) pruneNote = '未修剪：toolResultPruner 不可用'
+      else if (typeof target.runMaintenance !== 'function') {
+        pruneNote = '未修剪：缺少安全维护能力'
+      }
+      let pruned = 0
+      // TR-12: prune status is its own axis, independent from the termination
+      // reason: not-started / started-but-unfinished / completed-with-count.
+      let pruneState = 'not-started'
+      if (pruneNote === null) {
+        let entered = false
+        let maintenanceCancelled = false
+        // TR-11: keep the maintenance signal itself, not a snapshot boolean;
+        // it can be aborted between the callback returning and the short
+        // maintenance releasing (e.g. from a microtask scheduled by pruning).
+        let maintenanceSignalRef
+        try {
+          await target.runMaintenance(async (maintenanceSignal) => {
+            entered = true
+            maintenanceSignalRef = maintenanceSignal
+            if (signal.aborted || maintenanceSignal?.aborted) {
+              maintenanceCancelled = true
+              return
+            }
+            pruneState = 'started'
+            const result = pruner.pruneSession(target.session)
+            pruned = Array.isArray(result?.pruned) ? result.pruned.length : 0
+            pruneState = 'completed'
+            if (signal.aborted || maintenanceSignal?.aborted) maintenanceCancelled = true
+          })
+        } catch {
+          // TR-15: the saved maintenance signal also decides the first line
+          // when the callback throws after its own cancellation; a tool
+          // timeout (combined signal) keeps priority. The prune state decides
+          // only the appended evidence line.
+          const stop = abortedResult() ?? (maintenanceSignalRef?.aborted ? '已取消压缩' : null)
+          const partial =
+            pruneState === 'started'
+              ? '\n修剪结果未知，请复查'
+              : prunedSuffix(pruned)
+          if (stop) return `${stop}${partial}`
+          if (!entered) return 'busy：队友运行中，稍后再试'
+          return `修剪失败，请复查${partial}`
+        }
+        // Re-read both signals after the maintenance promise settles: an abort
+        // triggered while unwinding must still prevent compactNow.
+        if (maintenanceSignalRef?.aborted || signal.aborted) maintenanceCancelled = true
+        if (maintenanceCancelled) {
+          const stop = abortedResult() ?? '已取消压缩'
+          return `${stop}${prunedSuffix(pruned)}`
+        }
+        const stopAfterPrune = abortedResult()
+        if (stopAfterPrune) return `${stopAfterPrune}${prunedSuffix(pruned)}`
+        if (target.status === 'running') {
+          return `busy：队友运行中，稍后再试${prunedSuffix(pruned)}`
+        }
+      }
+      // Never call compactNow inside the maintenance callback (compactNow
+      // claims maintenance itself and would report busy).
+      let result
+      try {
+        result = await compaction.compactNow(target, signal)
+      } catch (error) {
+        const stop = abortedResult()
+        if (stop) return `${stop}${prunedSuffix(pruned)}`
+        const code = error?.code
+        // TR-02: pruning already landed and is never rolled back, so every
+        // failure reply after it keeps the classified first line and appends
+        // the known count (unknown partial writes are stated as unknown).
+        if (code === 'busy') return `busy：队友运行中，稍后再试${prunedSuffix(pruned)}`
+        if (code === 'cancelled') return `已取消压缩${prunedSuffix(pruned)}`
+        if (code === 'changed') return `历史已变化，请复查${prunedSuffix(pruned)}`
+        if (code === 'summary') return `摘要失败，请复查${prunedSuffix(pruned)}`
+        if (code === 'commit') return `提交失败，可能已部分生效，请复查${prunedSuffix(pruned)}`
+        if (code === 'persistence') return `压缩完成但保存失败，请复查${prunedSuffix(pruned)}`
+        if (error?.name === 'AbortError' || error?.name === 'TimeoutError') {
+          return `已取消压缩${prunedSuffix(pruned)}`
+        }
+        const detail = clip(
+          firstLine(error instanceof Error ? error.message : String(error ?? '')),
+          150,
+        )
+        return `压缩失败：${detail || '原因未知'}${prunedSuffix(pruned)}`
+      }
+      const stopAfterCompact = abortedResult()
+      if (stopAfterCompact) return `${stopAfterCompact}${prunedSuffix(pruned)}`
+      const after = contextUsageOf(ctx, { agent: target, binding, policy, kind: 'live' })
+      const beforeLine = `压缩前 ${formatContextUsage(before)}`
+      const afterLine = `压缩后 ${formatContextUsage(after)}`
+      const noteLines = pruneNote ? [pruneNote] : []
+      if (result === null) {
+        return [
+          '无安全可压缩范围',
+          beforeLine,
+          afterLine,
+          'shadowedTokens=0 shadowedSeqs=[]',
+          ...noteLines,
+        ].join('\n')
+      }
+      const seqs = Array.isArray(result.shadowedSeqs) ? result.shadowedSeqs : []
+      const shown = seqs.slice(0, 16).join(',')
+      const shadowedSeqs = `[${shown}]${seqs.length > 16 ? `…（共${seqs.length}个）` : ''}`
+      const shadowedTokens =
+        Number.isFinite(result.shadowedTokenCount) && result.shadowedTokenCount >= 0
+          ? result.shadowedTokenCount
+          : 0
+      return [
+        `已压缩 ${memberName}（task=${taskId}）`,
+        beforeLine,
+        afterLine,
+        `shadowedTokens=${shadowedTokens} shadowedSeqs=${shadowedSeqs}`,
+        ...noteLines,
+      ].join('\n')
     },
   })
 
@@ -3296,18 +4530,39 @@ function createTools(ctx, config, runtime, store) {
         }
       }
       const files = Array.isArray(args.files) && args.files.length > 0 ? args.files.join(', ') : '—'
+      // S6: measure the reporter once and append the identical line to both the
+      // outgoing report and the caller's receipt. A measurement failure must
+      // never break delivery, so this whole block degrades silently.
+      let measured
+      let usageLine = null
+      if (autoUsage) {
+        try {
+          measured = contextUsageOf(ctx, {
+            agent: me,
+            binding,
+            policy: usagePolicy,
+            kind: 'live',
+          })
+          usageLine = formatContextUsage(measured)
+        } catch {
+          usageLine = null
+        }
+      }
       const text = `[squad-report] task=${taskId} agent=${name} role=${role} status=${args.status}
 总结：
 ${String(args.summary).trim()}
 文件：${files}
-下一步：${String(args.next ?? '—').trim()}${reportProgress ? `\n进度同步：${reportProgress}` : ''}`
+下一步：${String(args.next ?? '—').trim()}${reportProgress ? `\n进度同步：${reportProgress}` : ''}${usageLine ? `\n${usageLine}` : ''}`
       if (!subagents || (!rootId && !me.__membership)) {
         throw new Error('squad_report 需要 subagents 服务把报告发给 Lead。')
       }
       await subagents.sendMessage(me, root, [{ type: 'text', text }], {
         signal: exec.signal,
       })
-      return `已把报告发给 lead（task=${taskId} status=${args.status}）。`
+      if (usageLine) {
+        rememberUsage(taskId, me.id, measured)
+      }
+      return `已把报告发给 lead（task=${taskId} status=${args.status}）。${usageLine ? `\n${usageLine}` : ''}`
     },
   })
 
@@ -4160,7 +5415,7 @@ ${String(args.summary).trim()}
     },
   })
 
-  return { start, dispatch, status, wait, report, finish, approvePlan, extend, enable, failover, parallelStart, deliver }
+  return { start, dispatch, status, wait, report, finish, approvePlan, extend, enable, failover, parallelStart, deliver, compact }
 }
 
 /** Host plugin entry. */
@@ -4362,8 +5617,10 @@ export function apply(ctx, input) {
     install: installSection,
     isInstalled: (sessionId) => installed.has(sessionId),
     registerBinding: (sessionId, agentConfig) => agentBindings.set(sessionId, agentConfig),
+    unregisterBinding: (sessionId) => agentBindings.delete(sessionId),
     bindingOf: (sessionId) => agentBindings.get(sessionId),
     setPending: (name, agentConfig) => pendingByName.set(name, agentConfig),
+    pendingNames: () => [...pendingByName.keys()],
     clearPending: (name) => pendingByName.delete(name),
     rebind: rebindSection,
     isLeadEnabled: (sessionId) => enabledLeads.has(sessionId),
@@ -4423,7 +5680,7 @@ export function apply(ctx, input) {
 
   // Global registrations are owned by this plugin's context, so a reload removes
   // them atomically; per-agent visibility comes from the step-time condition.
-  for (const [definition, condition] of [
+  const registrations = [
     [tools.start, isLead],
     [tools.dispatch, isLead],
     [tools.approvePlan, isLead],
@@ -4436,8 +5693,64 @@ export function apply(ctx, input) {
     [tools.failover, isLead],
     [tools.parallelStart, isLead],
     [tools.deliver, isLead],
-  ]) {
+  ]
+  // S5: the manual teammate compaction entry exists only with the policy on;
+  // `contextPolicy:false` keeps the old tool set exactly.
+  if (config.contextPolicy !== false) registrations.push([tools.compact, isLead])
+  for (const [definition, condition] of registrations) {
     ctx.tools.register(definition, { when: ({ agent }) => condition(agent) })
+  }
+
+  // S4: the only automatic execution point. Basic's native `auto` owns
+  // pre-step/overflow by default; this fallback runs at most one
+  // `compactIfNeeded('pressure')` for a verifiably bound resident child of an
+  // enabled Lead when (and only when) the host explicitly disabled its auto.
+  if (config.contextPolicy !== false && config.contextPolicy.autoCompact === true) {
+    // WeakMap key is the Agent (no strong retention); the value remembers the
+    // set of already-warned reasons, so A/B/A reports A once (S4.4).
+    const fallbackWarned = new WeakMap()
+    ctx.on('agent/pre-step', async ({ agent, signal }, next) => {
+      try {
+        const service = ctx.get('compaction')
+        const binding = agent ? agentBindings.get(agent.id) : undefined
+        if (
+          agent &&
+          binding?.taskId &&
+          signal &&
+          !signal.aborted &&
+          service &&
+          service.config?.auto === false &&
+          typeof service.compactIfNeeded === 'function'
+        ) {
+          let root
+          try {
+            root = ctx.get('subagents')?.rootOf?.(agent)
+          } catch {
+            root = undefined
+          }
+          if (root && root.id !== agent.id && enabledLeads.has(root.id)) {
+            await service.compactIfNeeded(agent, 'pressure', signal)
+          }
+        }
+      } catch (error) {
+        try {
+          const reason = firstLine(error instanceof Error ? error.message : String(error))
+          const warnedReasons = fallbackWarned.get(agent)
+          if (warnedReasons === undefined) {
+            fallbackWarned.set(agent, new Set([reason]))
+            ctx.logger?.('agent-squad')?.warn?.(
+              `squad 补位压缩失败（${reason}），继续本轮；宿主 native 策略不受影响`,
+            )
+          } else if (!warnedReasons.has(reason)) {
+            warnedReasons.add(reason)
+            ctx.logger?.('agent-squad')?.warn?.(
+              `squad 补位压缩失败（${reason}），继续本轮；宿主 native 策略不受影响`,
+            )
+          }
+        } catch {}
+      }
+      return next()
+    })
   }
 
   // Sections live on each agent's context; tie their disposal to this plugin so

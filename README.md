@@ -23,7 +23,7 @@
 
 | 角色 | 谁 | 职责 | 工具 |
 | --- | --- | --- | --- |
-| `lead` | 当前 DSH 会话（启用后） | 拆解流程、审核并批准业务方案、决定派单顺序、汇总交付；不写业务代码 | `squad_enable` / `squad_start` / `squad_dispatch` / `squad_approve_plan` / `squad_extend` / `squad_status` / `squad_wait` / `squad_finish` |
+| `lead` | 当前 DSH 会话（启用后） | 拆解流程、审核并批准业务方案、决定派单顺序、汇总交付、按需人工压缩单个队友；不写业务代码 | `squad_enable` / `squad_start` / `squad_dispatch` / `squad_approve_plan` / `squad_extend` / `squad_status` / `squad_compact` / `squad_wait` / `squad_finish` |
 | `brain` | codex | 业务方案（PLAN.md）、技术规格（SPEC.md）、技术验收（TECH-REVIEW.md）与业务验收（REVIEW.md）；可澄清方案，改业务行为必须先请用户决策 | `squad_report` |
 | `tester` | gpt（本地固定模型 `openai/gpt-6.2-sol`） | 测试验收（TEST-REVIEW.md）：依据 brain 的技术实现规格与验收方案审核 worker 的测试用例，不合格时补充测试用例并完整测试；brain 本人实现过代码时代签技术验收 | `squad_report` |
 | `worker` | zcode / qoder / opencode | **worker 固定为这三名**。zcode 主力后端（后端任务优先派发，实现后端代码并自测，自测通过后才交付）；opencode 备份后端（zcode 不可用时接手；OpenCode Go 的 DeepSeek V4.1 Flash，max 思考强度，本地可续跑）；qoder 固定前端（页面交互设计、实现与自测，不做后端）。三者都依据 PLAN-APPROVED.md 验收方案 + SPEC.md 技术实现规格开发、编写测试用例并自测，自测通过后才交付 | `squad_report` |
@@ -236,11 +236,12 @@ ASQ_LIVE_QODER=1 node --test --test-name-pattern='^T09 ' dsh-agent-squad/test/se
 `agents[].provider` 非空且不是 `spawn`/`fork` 时，`squad_dispatch` 不再走 Team 队友，而是直接调用宿主 `ctx.subagents.startActivation({ provider, delivery: 'caller' })`：
 
 - Lead 的调用阻塞到外部 agent 返回，结果直接回到 Lead；外部 agent 不进入 Team roster，也不能 `squad_report`、不能续跑；
-- 每次派发前生成 `BRIEF.md`（≤30 行），外部 agent 只读共享文件，返工必须重发 BRIEF + 编号缺陷；实现、返工与验收指向 PLAN-APPROVED.md / SPEC.md，并要求 AC 映射；
+- 每次派发前生成 `BRIEF.md`（≤30 行）；外部 agent 只读共享文件，且每次 external 派发都重发身份/角色、上下文纪律、工作区与共享文件路径（外部每次都是首次）。
+- 只有**非返工**新任务给完整任务入口（TASK 目标/验收/约束三节、本轮交办、阶段必读与交付物）；**返工**只给编号缺陷（缺陷ID/受影响 AC/文件:行或章节/最小修复建议/复验命令）及对应失败报告的相关段落，按编号定位，不重读整份任务；acceptance 任务以 AUTHORITY.md 为唯一判据；
 - 外部 agent 的 cwd 为任务工作区：单仓是 worktree，多仓是包含所有 worktree 的 taskRoot；共享记忆位于该 cwd 下的 `.agent-squad/`（沙箱可写）；
 - 已适配 Codex：`provider: codex`，需先安装 `@deepseek-ai/dsh-subagent-codex`（bundle）；
 - ZCode 需要 `@deepseek-ai/dsh-subagent-acp`（不是 bundle，要单独插入 provider 行）；本 pilot 用直连 ACP 桥测量；
-- **内置 `qoder-cli` 外部 provider**：插件自带适配器，封装已安装的 `qoderclicn`（npm 全局，由宿主 PATH 找到且需已完成登录；可用 `qoderCommand` 指定可执行文件绝对路径）。**headless 审批**：`-p` 一次性运行没有 TTY 应答 CLI 自己的审批提问，未预先放行的动作会被自动拒绝（典型报错 `Error: Allow reading /opt/homebrew/bin/mvn?`、`Allow Bash to run: mvn -v?`）。适配器因此默认追加 `--add-dir`（`/opt/homebrew`、`/usr/local`、`JAVA_HOME`、`/Library/Java/JavaVirtualMachines`、`~/.m2`、`~/.gradle`、`~/.npm`、`~/.pnpm-store`，仅添加实际存在的目录）与 `--allowed-tools`（`Bash(mvn:*)`、`Bash(./mvnw:*)`、`Bash(gradle:*)`、`Bash(./gradlew:*)`、`Bash(java:*)`、`Bash(javac:*)`、`Bash(node:*)`、`Bash(npm:*)`、`Bash(pnpm:*)`、`Bash(npx:*)`、`Bash(git:*)`、`Bash(ls/cat/head/tail:*)`），让构建与测试在无交互环境下可跑；`qoderAddDirs` / `qoderAllowedTools` 可整表覆盖，`qoderPermissionMode` 也可设为 `bypass_permissions` 完全跳过审批（风险自担）。插件不附带二进制本体。每次执行 `qoderclicn -p <prompt> -w <cwd> --permission-mode <mode>`（`qoderModel` 非空时追加 `-m <model>`），stdout 作为一次性结果返回；非 0 退出码按 error 返回 diagnostic，`dispose` 以 SIGTERM（1 秒后升级 SIGKILL）终止子进程。权限模式默认 `accept_edits`（`qoderPermissionMode` 可改写），`qoderModel` 默认空（不传 `-m`）。外部执行**一次性、不可续跑**，也不能 `squad_report`：每轮派单都会重发完整任务与共享文件路径，返工同样重发。
+- **内置 `qoder-cli` 外部 provider**：插件自带适配器，封装已安装的 `qoderclicn`（npm 全局，由宿主 PATH 找到且需已完成登录；可用 `qoderCommand` 指定可执行文件绝对路径）。**headless 审批**：`-p` 一次性运行没有 TTY 应答 CLI 自己的审批提问，未预先放行的动作会被自动拒绝（典型报错 `Error: Allow reading /opt/homebrew/bin/mvn?`、`Allow Bash to run: mvn -v?`）。适配器因此默认追加 `--add-dir`（`/opt/homebrew`、`/usr/local`、`JAVA_HOME`、`/Library/Java/JavaVirtualMachines`、`~/.m2`、`~/.gradle`、`~/.npm`、`~/.pnpm-store`，仅添加实际存在的目录）与 `--allowed-tools`（`Bash(mvn:*)`、`Bash(./mvnw:*)`、`Bash(gradle:*)`、`Bash(./gradlew:*)`、`Bash(java:*)`、`Bash(javac:*)`、`Bash(node:*)`、`Bash(npm:*)`、`Bash(pnpm:*)`、`Bash(npx:*)`、`Bash(git:*)`、`Bash(ls/cat/head/tail:*)`），让构建与测试在无交互环境下可跑；`qoderAddDirs` / `qoderAllowedTools` 可整表覆盖，`qoderPermissionMode` 也可设为 `bypass_permissions` 完全跳过审批（风险自担）。插件不附带二进制本体。每次执行 `qoderclicn -p <prompt> -w <cwd> --permission-mode <mode>`（`qoderModel` 非空时追加 `-m <model>`），stdout 作为一次性结果返回；非 0 退出码按 error 返回 diagnostic，`dispose` 以 SIGTERM（1 秒后升级 SIGKILL）终止子进程。权限模式默认 `accept_edits`（`qoderPermissionMode` 可改写），`qoderModel` 默认空（不传 `-m`）。外部执行**一次性、不可续跑**，也不能 `squad_report`：每次派发都重发身份与纪律，但只有非返工新任务给完整任务入口；返工按编号缺陷与对应报告定位，不重发整套任务。
 
 ### B pilot 实测（2026-11-09）
 
@@ -358,6 +359,11 @@ token：GLM implement 26,295 / rework 26,459（cache 主导）；Codex 设计 + 
   config:
     memoryDir: .agent-squad
     worktreeDir: .agents/worktrees # 首次 seed 的 worktree 目录（此后以设置文件为准）
+    contextPolicy:                # 小队上下文策略；false = 完全回退旧行为
+      thresholdRatio: 0.86        # 窗口占用达到 86% 开始压缩（(0.12,1]）
+      maxOutputTokens: 16384      # 新建小队子会话的请求输出上限；null = 不覆盖
+      autoCompact: true            # 宿主 basic 关闭 auto 时的补位检查
+      showUsage: true              # 自动追加 context 用量行
     worktreeFrom: HEAD             # 从哪个本地提交/分支拉出
     worktreeAutoCommit: true       # squad_finish 时逐仓自动提交脏 worktree
     qoderCommand: qoderclicn       # qoder-cli provider 调用的可执行文件（默认 PATH 上的 qoderclicn，可填绝对路径）
@@ -444,6 +450,108 @@ token：GLM implement 26,295 / rework 26,459（cache 主导）；Codex 设计 + 
 - `squad_dispatch` 返回 `mode=spawned|resumed` 和 `session_id`，可以直接核对返工是否落在同一会话。
 - 同一个姓名在 Team 内永久唯一，所以不要为返工新建 agent——再派一次即可。
 
+## 上下文管理（0.86 自动压缩 + 人工压缩）
+
+小队默认启用上下文策略（`contextPolicy`）：新建的 local/team 子会话带上请求输出上限；DSH 原生压缩引擎 `dsh-compaction-basic` 按精确模型路由把压力阈值调到窗口的 **86%**，压缩前先由 `dsh-compaction-tool-result-pruner` 修剪超大工具输出；Lead 另有人工压缩工具 `squad_compact`。引擎缺失、模型未匹配或窗口未知时只降级提示，不阻断派单。
+
+### 配置字段
+
+`contextPolicy` 放在 bundle 的 `agent-squad.config` 下，也可在更高优先层覆盖（跨层 patch 是整个 config 替换，不是深合并）：
+
+```yaml
+- id: agent-squad
+  name: 'dsh-agent-squad'
+  config:
+    contextPolicy: {thresholdRatio: 0.86, maxOutputTokens: 16384, autoCompact: true, showUsage: true}
+```
+
+| 字段 | 省略时 | 显式允许 | 非法示例（报完整字段路径） |
+| --- | ---: | --- | --- |
+| `thresholdRatio` | `0.86` | `0.12 < r <= 1` 的有限 number | `0.12`、`1.01`、`NaN`、`"0.86"` |
+| `maxOutputTokens` | `16384` | 正安全整数，或 `null` | `0`、`1.5`、`"16384"` |
+| `autoCompact` | `true` | `true` / `false` | `"false"`、`null`、`1` |
+| `showUsage` | `true` | `true` / `false` | `"true"`、`0` |
+
+- 严格按原类型校验，不做 `Number()`/truthy 隐式转换；未知字段直接拒绝（`contextPolicy.<key> 未知字段`）。
+- `maxOutputTokens: null` 表示不覆盖请求输出上限（不是 0，也不是回落到 16384）。
+- `contextPolicy: false` 是旧行为兼容开关：不注入 cap、不追加自动用量行、不注册 `squad_compact`、不做补位检查；宿主 `/compact` 与 basic 不受影响。
+- `showUsage: false` 只关闭自动采集与自动行；`squad_compact` 仍读取压缩前后用量。
+- `autoCompact: false` 只关闭小队的补位检查，**不会**关闭宿主自己启用的 basic `auto`；两者都关时没有自动压缩，人工入口仍可用。
+- `agents[].context: fresh|fork` 只决定 team 的创建方式（`spawn`/`fork`），与模型窗口、压缩策略无关。
+- `thresholdRatio` 是“目标值”。本配置的六条 `modelPolicies` 都带显式 `thresholdRatio`，宿主按精确行值优先；调整六路必须更新各行的显式值（或它们共同引用的 `&squadRatio` 锚）并保留 `compaction-basic` 的完整 config。只改全局 `thresholdRatio` 不会覆盖已有行值；显示会区分“目标”与“实际阈值”，不伪称已达 86%。
+- 请求 cap 只对**新建**子会话生效：续跑沿用创建时的上限，改变 cap 需要新建会话。
+- `context: fork` 的 team 成员只有在宿主声明 `subagents.getProvider('fork').capabilities.agentOptions === true` 时才注入 cap；不支持或不可知时不传整个 `agentOptions`、保留 fork 语义并反馈 `fork 继承输出预留`，不会失败后另造一个 child。
+- 跨步长的单次巨大工具输出可能一次越过阈值，只保证从下一个安全检查点开始压缩；没有合法可压缩范围时不保证缩到目标以下。
+
+### 0.86 阈值如何计算
+
+DSH `0.2.2-rc.5` 的 `compaction-basic` 对每条精确 `provider/model` 路由取：
+
+```text
+T = floor(min(W * r, W - O - H))
+retain = floor((W - O) * retainRatio)   # 必须 < T
+```
+
+- `W`：适配器真实窗口（`llm.resolveModelInfo(...).context.contextWindow`），部署时以真实目录/适配器为准；
+- `O`：最新请求 `header.config.maxTokens ?? adapter.defaultMaxTokens ?? 0`。小队把**新建**子会话的 `O` 限制为至多 16384（父 Agent 已有更小 cap 时取更小值），续跑沿用创建时的上限；
+- `H`：`headroomTokens`，本配置为 4096；`r`：`thresholdRatio`，本配置为 0.86；
+- `maxTokens: 8192` 只是摘要调用的**生成上限**，不是 `O`，也不参与 `W - O - H`。8192 是生成上限，不保证摘要完整；原始约束、编号缺陷与证据仍以任务文件为准。
+
+本配置的六个精确路由（窗口为验证样本，不是生产硬编码）：
+
+| 精确 provider/model | 窗口 W 样本 | W−16384−4096 | T |
+| --- | ---: | ---: | ---: |
+| `openai/gpt-6.2-sol` | 258000 | 237520 | 221880 |
+| `openai-codex/gpt-6.2-sol` | 500000 | 479520 | 430000 |
+| `openai-codex/gpt-6.2-astra` | 272000 | 251520 | 233920 |
+| `zai-coding-cn/glm-5.3` | 1000000 | 979520 | 860000 |
+| `qoder/qmodel_latest` | 200000 | 179520 | 172000 |
+| `dsh-opencode-go/deepseek-v4.1-flash` | 1000000 | 979520 | 860000 |
+
+因为 `O + H <= 20480`，W ≥ 146286 时不会因输出预留提前触发；小窗口仍安全但会更早压缩，例如 W=131072、O=16384、H=4096 时 `T=110592`（不是 `floor(0.86×131072)=112721`）。这一行在展示里会写成 `实际阈值=110592 tokens`。无窗口、`W-O-H<=0`、`retain>=T` 由宿主报配置原因；没有匹配行时宿主回退其全局默认策略（不是报错），所以 squad 不能声称六路专项策略已生效。插件对无法证明的情况只提示“实际阈值未知”/“原生比例=…”，不阻止派单、不虚报成功。
+
+`compaction-basic` 的 `modelPolicies` 只匹配**精确路由**；同 profile 的非小队会话若走相同路由也会继承该 `r/H/保留/摘要` 策略，只是它们的 `O` 不受小队 16384 限制，因此可能比 86% 更早触发。其它路由保持 `basic` 原有压力策略，全局摘要默认 8192。
+
+### 自动 vs 人工
+
+- **自动**：默认由 basic 原生 `agent/pre-step`、模型切换与 context-overflow 接管。正常压力路径是 `measure` → 达 `T` → `toolResultPruner.pruneSession` → 重测 → 仍达 `T` 才摘要；插件不在派单/报告/状态里触发压缩。
+- 只有 basic 显式 `config.auto: false` 且 `autoCompact: true` 时，小队才对一个**可核实的本任务 resident 子代理**（非 Lead、有 dispatch 绑定）在 `agent/pre-step` 调一次 `compactIfNeeded(agent,'pressure',signal)` 再放行；失败只 warn 一次，不改派单/预算/计数。
+- **人工**：Lead 用 `squad_compact`，默认当前任务、可指定 `task_id`；先修剪工具输出（有安全维护能力时），退出维护后再 `compactNow`，返回压缩前后用量。示例：
+
+```text
+squad_compact({ agent: "zcode" })
+squad_compact({ agent: "qoder", task_id: "t-example" })
+```
+
+- `squad_compact` 接受固定成员 id（codex/gpt/zcode/qoder/opencode），拒绝 `lead`、任意 session id 与额外键；目标 external 返回 `external：一次性执行者不可人工压缩`；有记录但无 live Agent 返回 `cold：会话未驻留，不能人工压缩`（不唤醒）；运行中返回 `busy：队友运行中，稍后再试`；缺 `compaction.compactNow` 返回 `不可用：缺少 compaction.compactNow`。整个操作共享 180 秒取消预算，不自动重试。
+- 成功回执含 `压缩前 <context行>`、`压缩后 <context行>`、`shadowedTokens=… shadowedSeqs=[…]`；`shadowedSeqs` 是被遮盖的**原序号**，不是节约的 tokens。超过 16 个时只列前 16 个并以 `…（共N个）` 结尾。
+- `/compact`（`dsh-command-compact`）保持原样：只压缩命令所属会话（即 Lead 自己），没有队友参数；要压队友用 `squad_compact`。
+
+### 用量行与展示位置
+
+固定格式（字段顺序不变，未知字段逐个 `unknown`）：
+
+```text
+context: model=qoder/qmodel_latest window=200000 used=172000 ratio=86.0% threshold=0.86
+```
+
+- `ratio` 用未截断的 `100*used/window` 保留一位小数，可超过 100%；窗口 0/缺失时 `window=unknown ... ratio=unknown`。
+- `model` 先取 `session.requestHeader().config` 的完整 `provider/model`，再取 `agent.options` 的完整对，最后取本次派单绑定的完整 `model`；不跨对象拼接、不借 Lead 模型冒名。
+- 状态标签：`（新建/暂无用量）`、`（external）`、`（cold）`、`（上次汇报）`；多个提示时先状态标签后原因。
+- 出现位置：`squad_report` 给 Lead 的正文与自己的回执各追加同一行；`squad_dispatch` 续跑/新建/external 的 task 行后；`squad_status` 的“成员”“本地子代理”“最近派单（external）”行。
+- 冷对象按精确 `(taskId, sessionId)` 回退到最近一次成功 report 的轻量快照，标记 `（上次汇报）`；缓存只在内存、最多 128 项、重载清空，不写 STATE、不分给其它任务/同名成员。
+- `showUsage: false` 时不采集、不追加这些自动行，不影响人工 `squad_compact` 的前后值。
+
+### 部署检查与回退
+
+部署后检查三点：真实 DSH 里 `compaction-basic` / `command-compact` / `tool-result-pruner` 三行均为 enabled；最终 `compaction-basic.config.modelPolicies` 与本文六路由一致；某条真实会话的 adapter `W` 与会话 header `O` 是否符合预期。用隔离小队长查看 `squad_status`/`squad_compact` 输出，观察 native pruner 与后续是否摘要，并复核手动 before/after 与 `shadowedSeqs`。不要把 mock/单测输出当作真实摘要事件。
+
+回退顺序（配置只在更高优先层覆盖）：
+
+1. 部分降级：`showUsage: false`（关自动展示）、`autoCompact: false`（关小队补位）、`maxOutputTokens: null`（恢复继承）。原生 basic auto 不因关 squad 而停。
+2. 完全回退：设 `contextPolicy: false`（不注入 cap、不加新提示/自动行、不注册 `squad_compact`、不补位），并在更高优先层恢复变更前备份的 `compaction-basic` **完整 config**（原来没有 config 就用 `{}`）以及三行原启用状态。
+3. 热重载后 Lead 需重新 `squad_enable`。已创建 child 的 cap 随原会话，后续新建才生效；已落盘的压缩摘要不可逆。无新增依赖、数据库或迁移。
+
 ## 工具
 
 | 工具 | 调用者 | 作用 |
@@ -454,6 +562,7 @@ token：GLM implement 26,295 / rework 26,459（cache 主导）；Codex 设计 + 
 | `squad_approve_plan` | Lead（仅 Lead 可见） | 审核通过 PLAN.md：补归档当前轮次 `PLAN-R<n>.md`，写 `PLAN-APPROVED.md` 与 `planApproved`/`planApprovedAt`；缺 PLAN、已收尾或已批准时拒绝 |
 | `squad_extend` | Lead（仅 Lead 可见） | 用户决策门禁：仅当对应预算（完整流程 `kind` = design/tech/business；简化/兼容 `kind` = design/implement）已到上限且用户明确同意后调用（`confirmed=true` 必填，`rounds` 正整数默认 3，`reason` 必填），提高该类上限并追加一条扩展记录；未到上限、未确认或非 Lead 一律拒绝；可重复扩展，不自动续跑 |
 | `squad_status` | Lead | 任务、阶段/轮次、流程（flow/specPublished/specVersion/codeEpoch/implementers）、双验收绑定与结论、全部仓库/worktree/分支/基线、PLAN 门禁、各类预算与最近 6 条扩展记录、成员状态、记忆文件、最近派单 |
+| `squad_compact` | Lead（仅 Lead 可见） | 人工压缩单个队友会话（默认当前任务，`task_id` 可指定）：先修剪工具输出再调用宿主 `compactNow`，返回压缩前后 context 行与 `shadowedTokens`/`shadowedSeqs`；运行中 busy、冷会话不唤醒、external 与缺 compaction 服务有明确回执；共享 180 秒取消预算 |
 | `squad_wait` | Lead | 有界阻塞等待团队变化（通常不需要，报告会唤醒 Lead） |
 | `squad_finish` | Lead | 校验无队友运行 + 验收 approved（完整流程需技术+业务双验收且新鲜），逐仓提交并记录结果，切回主仓库源目录，写 FINAL.md 与每仓合并命令；多仓失败可重试 |
 | `squad_parallel_start` | Lead（仅 Lead 可见） | 基础层交付后开启并行阶段：基于 Base 为每个特性创建独立 worktree/分支，供按 feature 并行派单 |

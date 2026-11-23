@@ -49,6 +49,12 @@
         # Repo-relative directory for plugin-created squad worktrees; the
         # settings page stores the live value in ~/.dsh/agent-squad/settings.json.
         worktreeDir: .agents/worktrees
+        # Context policy (0.86 window pressure). The thresholdRatio scalar is
+        # anchored so the compaction-basic rows below share the same value;
+        # maxOutputTokens caps every new squad child request (16384) while
+        # 8192 stays the summarization generation cap. `false` restores the
+        # legacy behavior (no caps, no automatic usage lines, no squad_compact).
+        contextPolicy: {thresholdRatio: &squadRatio 0.86, maxOutputTokens: 16384, autoCompact: true, showUsage: true}
         # Worker is fixed to three members: zcode (primary backend, local
         # GLM-5.3 max), opencode (backup backend) and qoder (frontend-only,
         # local Qwen4-Max xhigh); codex/gpt are brain/architect on local
@@ -94,3 +100,28 @@
             worker: true
             context: fresh
             description: 前端 worker：固定负责前端页面交互设计、实现与自测，不做后端（本地 Qwen4-Max，xhigh）。
+
+# Context compaction (host DSH 0.2.2-rc.5): enable the already-shipped rows by
+# id instead of inserting another engine. 0.86 pressure applies to the exact
+# squad routes; headroomTokens=4096 and retainRatio=0.12 keep the native
+# W-O-H pressure budget above the 86% line for these windows, while
+# maxTokens=8192 only caps the generated summary (never the request reserve O).
+- id: compaction-basic
+  disabled: false
+  config:
+    auto: true
+    maxTokens: 8192
+    modelPolicies:
+      - {provider: openai, model: gpt-6.2-sol, thresholdRatio: *squadRatio, headroomTokens: 4096, retainRatio: 0.12, maxTokens: 8192}
+      - {provider: openai-codex, model: gpt-6.2-sol, thresholdRatio: *squadRatio, headroomTokens: 4096, retainRatio: 0.12, maxTokens: 8192}
+      - {provider: openai-codex, model: gpt-6.2-astra, thresholdRatio: *squadRatio, headroomTokens: 4096, retainRatio: 0.12, maxTokens: 8192}
+      - {provider: zai-coding-cn, model: glm-5.3, thresholdRatio: *squadRatio, headroomTokens: 4096, retainRatio: 0.12, maxTokens: 8192}
+      - {provider: qoder, model: qmodel_latest, thresholdRatio: *squadRatio, headroomTokens: 4096, retainRatio: 0.12, maxTokens: 8192}
+      - {provider: dsh-opencode-go, model: deepseek-v4.1-flash, thresholdRatio: *squadRatio, headroomTokens: 4096, retainRatio: 0.12, maxTokens: 8192}
+# Keep the human /compact command on its own session; the plugin never
+# overrides this definition and adds no teammate argument to it.
+- id: command-compact
+  disabled: false
+# Model-free pruning before summarizing; keep the row's own character budgets.
+- id: tool-result-pruner
+  disabled: false
