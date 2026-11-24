@@ -1,6 +1,10 @@
 # dsh-agent-squad
 
-给 DeepSeek Harness 加一个**按角色分工、显式启用（opt-in）的本地多智能体小队**：Lead 负责组织与分配，brain 负责业务方案、技术规格与双验收，tester 负责测试验收，worker 负责实现与自测；返工复用同一个队友会话，而不是每次新建对话。
+给 DeepSeek Harness 加一个**按角色分工、显式启用（opt-in）的本地多智能体小队**：Lead 负责组织与分配，brain 负责业务方案、技术规格与业务验收，tester 负责测试验收（含技术验收），worker 负责实现与自测；返工复用同一个队友会话，而不是每次新建对话。
+
+**先审方案再实现**：Lead 先审核 brain 的 `PLAN.md` 并用 `squad_approve_plan` 批准，再派 brain 发布 `SPEC.md`；实现后由 tester 做测试验收（技术验收），brain 做业务验收，测试与业务两份验收都通过且仍然新鲜才收尾。
+
+> 当前流程不再有独立的 `tech-review` 阶段，也不再产出 `TECH-REVIEW.md`：技术验收职责已并入 tester 的 `test-review`（代码审查 + 测试验收），业务验收仍由 brain 单独签署。
 
 **默认不启用**：普通会话就是普通会话，看不到任何 squad 工具或章程。只有用户明确说"用小队实现 / 用智能体小队"时，Lead 才调用 `squad_enable` 进入小队；**仅提到队友名字（brain/tester/worker1/front1）不算启用**。插件重载后若会话失去 Lead 身份，再次 `squad_enable` 即可恢复。
 
@@ -16,7 +20,7 @@
 插件本身很薄：它挂在 DSH 0.2.x 内置的标准 **subagent 运行时**（`ctx.subagents`：`startActivation`/`sendMessage`/`listDescendants`/`rootOf`）上，补上 DSH 缺的几件事：
 
 1. **命名 + 角色**：五个固定 teammate（brain / tester / worker1 / front1 / worker2），角色决定系统提示里的职责章程与可见工具；
-2. **共享记忆**：每个任务一个 `.agent-squad/<task>/` 目录，TASK / PLAN / SPEC / TECH-REVIEW / REVIEW / REPORT / JOURNAL 承载任务、业务方案、技术规格、技术验收、业务验收、交付证据与历史，所有成员读写同一份；
+2. **共享记忆**：每个任务一个 `.agent-squad/<task>/` 目录，TASK / PLAN / SPEC / TEST-REVIEW / REVIEW / REPORT / JOURNAL 承载任务、业务方案、技术规格、测试验收（技术验收）、业务验收、交付证据与历史，所有成员读写同一份；
 3. **会话复用**：队友是 Lead 的持久、可续跑子会话；重复 `squad_dispatch` 同一个队友 = 往同一会话追加消息，返工天然复用上一轮上下文。
 
 ## 角色
@@ -24,11 +28,11 @@
 | 角色 | 谁 | 职责 | 工具 |
 | --- | --- | --- | --- |
 | `lead` | 当前 DSH 会话（启用后） | 拆解流程、审核并批准业务方案、决定派单顺序、汇总交付、按需人工压缩单个队友；不写业务代码 | `squad_enable` / `squad_start` / `squad_dispatch` / `squad_approve_plan` / `squad_extend` / `squad_status` / `squad_compact` / `squad_wait` / `squad_finish` |
-| `brain` | 大脑（brain） | 业务方案（PLAN.md）、技术规格（SPEC.md）、技术验收（TECH-REVIEW.md）与业务验收（REVIEW.md）；可澄清方案，改业务行为必须先请用户决策 | `squad_report` |
-| `tester` | 测试者（tester，本地固定模型 `openai/gpt-6.2-sol`） | 测试验收（TEST-REVIEW.md）：依据 brain 的技术实现规格与验收方案审核 worker 的测试用例，不合格时补充测试用例并完整测试；brain 本人实现过代码时代签技术验收 | `squad_report` |
+| `brain` | 大脑（brain） | 业务方案（PLAN.md）、技术规格（SPEC.md）与业务验收（REVIEW.md）；可澄清方案，改业务行为必须先请用户决策 | `squad_report` |
+| `tester` | 测试者（tester，本地固定模型 `openai/gpt-6.2-sol`） | 测试验收（TEST-REVIEW.md，含代码审查/技术验收）：依据 brain 的技术实现规格与验收方案做代码审查并审核 worker 的测试用例，不合格时补充测试用例并完整测试；tester 本人实现过代码时由 brain 代签 | `squad_report` |
 | `worker` | 后端开发者1（worker1）/ 前端开发者1（front1）/ 后端开发者2（worker2） | **worker 固定为这三名**。worker1 主力后端（后端任务优先派发，实现后端代码并自测，自测通过后才交付）；worker2 备份后端（worker1 不可用时接手；OpenCode Go 的 DeepSeek V4.1 Flash，max 思考强度，本地可续跑）；front1 固定前端（页面交互设计、实现与自测，不做后端）。三者都依据 PLAN-APPROVED.md 验收方案 + SPEC.md 技术实现规格开发、编写测试用例并自测，自测通过后才交付 | `squad_report` |
 
-任何角色（含 brain、tester 与 Lead）都保留 `agents[].worker` 与顶层 `leaderWorker`（Lead 默认关）两个运行时开关：开启后该角色可接 implement/rework 派单，实现过代码的角色不能签署自己实现的技术验收。**默认只有 worker1 / worker2 / front1 三名 worker 开启**（brain 与 tester 默认关，须用户同意并显式开启后才能接手实现）。**设置页不再暴露这两个开关**（worker 能力属高级配置，直接编辑 `$DSH_HOME/agent-squad/settings.json` 或经 `PUT /agent-squad/settings` 修改，保存其它字段不会改动已有值）。
+任何角色（含 brain、tester 与 Lead）都保留 `agents[].worker` 与顶层 `leaderWorker`（Lead 默认关）两个运行时开关：开启后该角色可接 implement/rework 派单，实现过代码的角色不能签署自己实现的测试验收（技术验收）。**默认只有 worker1 / worker2 / front1 三名 worker 开启**（brain 与 tester 默认关，须用户同意并显式开启后才能接手实现）。**设置页不再暴露这两个开关**（worker 能力属高级配置，直接编辑 `$DSH_HOME/agent-squad/settings.json` 或经 `PUT /agent-squad/settings` 修改，保存其它字段不会改动已有值）。
 
 角色章程可以在插件配置里整段替换（`brainCharter` / `testerCharter` / `workerCharter`），单个 agent 也可以用 `charter` 覆盖。默认章程为中文；Lead 策略额外要求**面向用户始终使用用户的语言**，章程语言不影响回复语言。
 
@@ -41,7 +45,7 @@
 ### 任务执行效率纪律
 
 - 编码阶段只跑 `compile` + 受影响单测；每轮 `implement`/`rework` 结束只跑一次受影响 IT；不跑全量。
-- 全量只在**测试验收**、**合并 Base（`squad_deliver`）**、**最终交付（`squad_finish`）**三处跑；技术/业务验收优先受影响用例，除非规格/用户明确要求全量。
+- 全量只在**测试验收**、**合并 Base（`squad_deliver`）**、**最终交付（`squad_finish`）**三处跑；测试/业务验收优先受影响用例，除非规格/用户明确要求全量。
 - 返工按批次一次修完再跑全量，禁止“修一条跑一次全量”。
 - 同一 IT 类的正向场景复用同一 JAR 生命周期/Flow，反例再独立启动；保留真实入口，不降低断言。
 - 仅 Base 合并 HEAD 跑一次 `full --require-full-coverage`。
@@ -58,66 +62,41 @@
 - 写完后自检“一个没有上下文的实现者能否只靠 PLAN 拍板技术设计”，把结论写入 PLAN.md；不能时补全方案，或列入“假设与待确认”并标明阻塞项，不得宣称方案可执行。
 - 设计轮（spec）读取已批准的 PLAN-APPROVED.md，把技术规格写入 SPEC.md，至少覆盖适用的：代码结构、文件与模块职责、数据库表与迁移、领域模型及其依赖、对外接口与错误行为、各模块实现、可执行验证用例；对不适用的部分逐项明确说明“不适用”。技术实现可以调整，但不能擅改业务行为；若必须改业务预期，暂停受影响工作并在报告中交 Lead 转用户决策。
 - 规格有问题时按 worker/tester 的上报修订并发布新版本（更新 SPEC.md，版本号以派单为准）；单纯澄清规格不扣返工额度，也不重置已用额度。
-- 技术验收轮（tech-review）以当前 SPEC.md 为唯一权威技术规格：做代码审查、亲自运行验证测试，在 TECH-REVIEW.md 逐条记录需求/AC 编号、命令、退出码、关键输出与可执行的编号缺陷清单；技术验收前必须已有一份仍然新鲜的 APPROVED 测试验收（TEST-REVIEW.md）。
-- 业务验收轮以 PLAN-APPROVED.md 为唯一权威业务规格，逐条核对 AC 并在 REVIEW.md 写明 AC 编号、验证命令、退出码、关键输出与结论；亲自运行或检查，不接受没有证据的声明。测试结论对照 TEST-REVIEW.md，技术结论对照 SPEC.md 与 TECH-REVIEW.md。
-- 当你本人接手实现过代码时，不能再签署自己改动的技术验收：技术验收改由 tester 对照 SPEC.md 代签；你的业务验收仍单独签署，两份验收独立记录。
-- tester 挂起（额度耗尽容错交接）时代行测试验收职责：按 tester 章程写 TEST-REVIEW.md；技术/业务验收仍按本章程单独签署，记录独立。tester 恢复后交还职责。
-
+- 业务验收轮以 PLAN-APPROVED.md 为唯一权威业务规格，逐条核对 AC 并在 REVIEW.md 写明 AC 编号、验证命令、退出码、关键输出与结论；亲自运行或检查，不接受没有证据的声明。技术结论对照 SPEC.md 与 TEST-REVIEW.md（tester 的技术验收结论）。
+- 只有每条标准都有证据通过时才报 "approved"；否则报 "changes_requested"，给出编号缺陷清单和每项的最小修复方案。
+- REVIEW.md 的最后一行必须是机器可读的「VERDICT: APPROVED」或「VERDICT: CHANGES_REQUESTED」（Lead 的收尾门禁只认这一行）。
+- 你本人接手实现过代码时，不得签署测试验收（技术验收）；由未实现代码的 tester 对照 SPEC.md 签署，业务验收仍由你单独签署。
+- tester 挂起（额度耗尽容错交接）时代行测试验收职责：按 tester 章程写 TEST-REVIEW.md（代码审查、审核/补充测试用例并完整测试）；业务验收仍按本章程单独签署，记录独立。tester 恢复后交还职责。
+- 验收模式（acceptance 阶段）：以 AUTHORITY.md 为唯一权威方案做**业务维度**验收——对外行为、用户可见结果、边界场景逐项核对；与技术维度结论汇总**定稿 ACCEPTANCE-REPORT.md**，五要素齐全（验收方案与标准 / 上一轮修复情况 / 本轮问题 / 修复建议 / 结论），最后一行机器可读 VERDICT：两维度均通过才 APPROVED，任一维度有问题即 CHANGES_REQUESTED 并附编号问题与修复建议。你不产出新的设计方案，也不改权威方案。
+- 不写生产代码；一次性探针脚本可以放在 /tmp。
+- 方案要克制：计划正文默认不超过约 80 行，除非任务确实更复杂并在 PLAN.md 里说明理由。
+- 不扩大范围，取满足目标的最小方案。
 ### tester 章程（要点）
 
-- 测试验收轮（test-review）读取 brain 的 SPEC.md（技术实现规格）与 PLAN-APPROVED.md（验收方案），逐条 AC 审核 worker 在 REPORT.md 中提交的测试用例：是否覆盖每条 AC、测试名/输入/期望值是否与规格一致、命令是否可直接执行、证据是否真实完整。
+- 测试验收轮（test-review）读取 brain 的 SPEC.md（技术实现规格）与 PLAN-APPROVED.md（验收方案），逐条 AC 做代码审查并审核 worker 在 REPORT.md 中提交的测试用例：实现是否符合规格、是否覆盖每条 AC、测试名/输入/期望值是否一致、命令是否可直接执行、证据是否真实完整。
 - worker 的测试用例不合格（缺失、覆盖不足、与规格不符、证据不实）时，由你补充测试用例并进行完整测试：补齐缺失用例、亲自运行完整测试套件、记录真实结果，不得只指出问题不补齐。
-- 把测试验收结论写入 TEST-REVIEW.md：逐条 AC 记录审核结论、你补充的测试用例、完整测试的命令/退出码/关键输出；最后一行必须是机器可读的「VERDICT: APPROVED」（用例合格或已补齐且完整测试通过）或「VERDICT: CHANGES_REQUESTED」（存在测试无法覆盖的实现缺陷，给出编号缺陷清单与每项最小修复方案）。
+- 把测试验收（技术验收）结论写入 TEST-REVIEW.md：逐条 AC 记录代码审查结论、你补充的测试用例、完整测试的命令/退出码/关键输出；最后一行必须是机器可读的「VERDICT: APPROVED」（实现符合规格、用例合格或已补齐且完整测试通过）或「VERDICT: CHANGES_REQUESTED」（存在实现缺陷或测试无法覆盖，给出编号缺陷清单与每项最小修复方案）。
 - CHANGES_REQUESTED 的编号缺陷由 Lead 派回 worker 返工；返工后代码变化会使你的结论失效，需要重新测试验收。
-- brain 本人接手实现过代码时，由你对照 SPEC.md 代签技术验收（TECH-REVIEW.md）：代码审查、亲自运行验证测试、逐条记录命令/退出码/关键输出与编号缺陷，最后一行同样是「VERDICT: APPROVED」或「VERDICT: CHANGES_REQUESTED」。
+- 你本人接手实现过代码时不得签署自己的测试验收（技术验收）；由未实现代码的 brain 对照 SPEC.md 代签。
 - 不写生产代码：只补测试用例与测试脚本，不改实现逻辑；发现实现缺陷报 CHANGES_REQUESTED 转 worker 修复，不代改。
 - 规格（SPEC.md/PLAN-APPROVED.md）缺失、矛盾或明显错误时停止审核，报 "blocked" 并引用具体章节与编号；不确定的预期交 Lead 转 brain 澄清，不要猜。
-
+- 验收模式（acceptance 阶段）：以 AUTHORITY.md 为唯一权威方案做**技术维度**验收——亲自运行测试/构建、逐项核对实现与方案的一致性；第 2 轮起先逐条核对上一轮 ACCEPTANCE-REPORT 中编号问题的修复情况（已修复/部分修复/未修复 + 证据）。你只写技术维度结论，不定稿 VERDICT；不定权威标准，一切从 AUTHORITY.md 推导。
 ### worker 章程（要点）
 
-- 动手前先读 TASK.md、PLAN-APPROVED.md（业务方案）与 SPEC.md（技术规格）。PLAN-APPROVED.md 是业务方案与业务验收的唯一权威规格；SPEC.md 是技术实现、返工与技术验收的唯一权威规格；PLAN.md 只用于设计，不能覆盖批准归档。仅任务快照豁免方案门禁且无批准归档时，按 TASK.md 与 Lead 本轮派单执行；仍须逐条 AC 留证。
+- 动手前先读 TASK.md、PLAN-APPROVED.md（业务方案）与 SPEC.md（技术规格）。PLAN-APPROVED.md 是业务方案与业务验收的唯一权威规格；SPEC.md 是技术实现、返工与测试验收（技术验收）的唯一权威规格；PLAN.md 只用于设计，不能覆盖批准归档。仅任务快照豁免方案门禁且无批准归档时，按 TASK.md 与 Lead 本轮派单执行；仍须逐条 AC 留证。
 - 只做规格定义的最小改动；不得引入规格未定义的接口、文件或依赖，不重新设计、不改名、不扩大范围。
 - 规格缺失、矛盾或明显错误时立即停止实现，报 "blocked"，引用 PLAN-APPROVED.md/SPEC.md 的具体章节与编号，并列出缺失项或冲突原文；需要归档而文件缺失时明确引用文件名；豁免任务引用 TASK.md 章节或 Lead 派单条目。规格有问题上报 Lead 转 brain 修订发布，不自行偏离或改用 PLAN.md。
 - 按 SPEC.md 指定的测试名、输入与期望输出写或更新测试，并亲自运行每条 AC 的验收命令；豁免任务按 TASK.md 与 Lead 本轮派单执行。
 - 在 REPORT.md 逐条 AC 给证据：AC 编号、改动文件路径、测试名、实际命令、退出码、关键输出与结论；失败或未执行必须如实标注，不得只写“测试通过”。
-- AC 映射：沿用 TASK.md 的 AC 编号；未编号时按条目顺序从 AC1 开始编号。PLAN.md/SPEC.md 为每条 AC 指定改动文件、测试名、验证命令与期望值；REPORT.md/TECH-REVIEW.md/REVIEW.md 按对应规格逐条记录 AC 编号、文件路径、测试名、命令、退出码、关键输出与结论。
-
-## 调用模式
-
-小队有两种调用模式，在 `squad_start` 时选择：
-
-- **研发模式（默认，`mode="dev"`）**：设计 → 开发 → 验收的完整流程（先审方案再实现），即下文「使用」一节的 1–12 步，行为不变。
-- **验收模式（`mode="acceptance"`）**：不做设计，以**指定的权威方案**为准，做技术与业务双维度验收并交付验收报告；适用于对既有实现按权威方案验收的场景。要求：
-  - `authority`（必填）：权威方案——文件路径（相对会话目录或绝对路径）或方案全文；创建任务时固化为任务记忆里的 `AUTHORITY.md`，之后一切验收标准从它推导，brain 不再产出 PLAN/SPEC，design/spec/implement 等研发阶段被拒绝。
-  - **双验收顺序（强制）**：先派 tester（`phase="acceptance"`，技术维度：亲自运行测试/构建、逐项核对实现与方案一致性），再派 brain（`phase="acceptance"`，业务维度：对外行为与用户可见结果，并**定稿验收报告**）。
-  - **验收报告 `ACCEPTANCE-REPORT.md` 五要素**（缺一不可）：① 验收方案与标准（从 AUTHORITY.md 推导）② 上一轮验收报告修复情况（第 2 轮起逐条核对编号问题：已修复/部分修复/未修复 + 证据）③ 本轮发现的问题（编号、维度、证据、严重度）④ 本轮发现问题的修复建议 ⑤ 结论（最后一行 `VERDICT: APPROVED|CHANGES_REQUESTED`）。每轮归档为 `ACCEPTANCE-REPORT-R<n>.md`。
-  - **修复由 worker 承担**：`CHANGES_REQUESTED` 的编号问题与修复建议由 Lead 以 `phase="rework"` 派给 worker（后端优先 worker1，备份 worker2；前端 front1）；修复计入验收返工预算（默认 3 轮，与技术返工同一额度，扩展用 `squad_extend(kind="tech", …)`）；修复使本轮验收失效，需重走 tester → brain 双验收。
-  - `VERDICT: APPROVED` 且仍然新鲜（修复未再改动代码）→ `squad_finish` 收尾交付。
-
-## 使用
-
-对任意会话说"**用智能体小队把这个需求做掉：……**"。Lead 会先 `squad_enable`，然后按固定流程推进（**先审方案再实现**，完整流程为默认）：
-
-1. `squad_start` 建任务与共享记忆（可选 `flow="simple"` 走简化流程，适合非代码任务）；**默认同时创建 worktree + 新分支，并把会话切过去**；
-2. `squad_dispatch(brain, phase="design")` → brain 写业务方案 `PLAN.md`；
-3. **Lead 审核 `PLAN.md`**：假装自己是没有上下文的实现者，无法只靠 PLAN 拍板技术设计的点一律按 D1 起连续编号，写明章节、缺失或矛盾、最小补全要求，再派回 brain。有问题就把编号缺陷派回 brain（`phase="design"` 返工）；设计预算默认 4 次，未扩展时第 5 次暂停——先向用户说明阻塞点并等待决策，用户同意后用 `squad_extend(kind="design", rounds=3, reason="用户批准的追加理由", confirmed=true)` 追加轮次再派。方案合格后调用 **`squad_approve_plan`** 批准（归档 `PLAN-APPROVED.md`）；
-4. `squad_dispatch(brain, phase="spec")` → brain 发布技术规格 `SPEC.md`（可多轮修订，不占返工额度）；**规格交付后即可派工，不需要 Lead 再审批**；
-5. `squad_dispatch(worker1, phase="implement")` → 后端任务**优先派 worker1**（worker1 不可用自动改派备份 worker2）；前端任务固定派 front1（页面交互设计、实现、自测）。worker 按 PLAN-APPROVED.md + SPEC.md 在 worktree 里实现并自测，写 `REPORT.md`，逐条 AC 给证据，自测全部通过后才交付；
-6. `squad_dispatch(tester, phase="test-review")` → tester 测试验收：依据 brain 的 SPEC.md 与 PLAN-APPROVED.md 审核 worker 的测试用例，不合格由 tester 补充测试用例并完整测试，写 `TEST-REVIEW.md`（`VERDICT: APPROVED|CHANGES_REQUESTED`）；
-7. 测试验收不通过 → 把编号缺陷派回对应 worker（`phase="rework"`，计入技术返工预算）；返工后测试验收失效，重走 test-review；
-8. 测试验收通过 → `squad_dispatch(brain, phase="tech-review")` → brain 技术验收（若 brain 本任务写过代码，改派 tester 代签），写 `TECH-REVIEW.md`（`VERDICT: APPROVED|CHANGES_REQUESTED`）；
-9. 技术验收不通过 → 把编号缺陷派回对应 worker（`phase="rework"`，技术返工预算 3 轮，前后端共享；未扩展时第 4 轮暂停——先向用户说明阻塞点并等待决策，用户同意后用 `squad_extend(kind="tech", rounds=3, reason="用户批准的追加理由", confirmed=true)` 追加轮次再派；
-10. 技术验收通过 → `squad_dispatch(brain, phase="review")` → 业务验收，写 `REVIEW.md`；
-11. 业务验收不通过 → `phase="rework"`（业务返工预算 3 轮，与技术额度独立；**业务返工改了代码后必须重新通过测试验收与技术验收**）；未扩展时第 4 轮暂停——先向用户说明阻塞点并等待决策，用户同意后用 `squad_extend(kind="business", rounds=3, reason="用户批准的追加理由", confirmed=true)` 追加轮次再派；
-12. 三份验收（测试/技术/业务）都 `approved` 且仍然新鲜 → `squad_finish`：逐仓提交 worktree 改动、切回主仓库源目录、给出每仓分支与合并命令。
-
-> 各批准相互独立：`squad_approve_plan`（Lead）批准的是**业务方案**，`TEST-REVIEW.md` 的 `VERDICT: APPROVED`（测试验收）、`TECH-REVIEW.md` 的 `VERDICT: APPROVED`（技术验收）与 `REVIEW.md` 的 `VERDICT: APPROVED`（业务验收）各自独立签署；任何一个不能替代另一个。**测试/技术/业务验收必须对应同一版候选代码、业务方案与技术规格**：任一变化（代码轮次 codeEpoch、规格版本 specVersion 变动）使旧结论失效，不能用旧批准收尾。
-
+- 交付口径：以 PLAN-APPROVED.md 的验收方案与 SPEC.md 的技术实现规格为依据进行功能开发与测试用例编写；每条 AC 自测通过才算完成，自测未通过或未执行不得请求验收、不得标记交付，也不得触发提交/合并（squad_deliver 与收尾提交都必须以自测全部通过为前提）。
+- 并行默认：实现工作包含多个独立文件/模块时，默认用你自己的子代理/并行能力同时开发；不独立的部分串行完成。边界不变：只改规格内文件、逐条 AC 留证、汇总写 REPORT.md。
+- 返工派单仍是在同一段对话里：逐条修复验收提出的编号缺陷，重跑完整相关测试，再次报告。
+- AC 映射：沿用 TASK.md 的 AC 编号；未编号时按条目顺序从 AC1 开始编号。PLAN.md/SPEC.md 为每条 AC 指定改动文件、测试名、验证命令与期望值；REPORT.md/TEST-REVIEW.md/REVIEW.md 按对应规格逐条记录 AC 编号、文件路径、测试名、命令、退出码、关键输出与结论。
 ### 接手实现与代签
 
 - 对应 worker 不可用时，Lead 可以派 tester接手实现（`phase="implement"/"rework"`，须先显式开启其 worker 能力）；
 - 三轮技术返工仍未通过时，Lead 先向用户说明阻塞点并等待决策；用户同意继续后直接派 tester 接手，**不需要再次确认选人**；
-- 实现者不签自己的技术验收：tester 接手写代码后，tech-review 仍由 brain（未写代码时）签署；brain 本人接手实现时，tech-review 改派 tester 对照 SPEC.md 代签，业务验收仍由 brain 按业务方案单独签署，两份验收独立记录。
+- 实现者不签自己的技术验收：tester 接手写代码后，测试验收（技术验收）改由未实现代码的 brain 代签；brain 本人接手实现时，测试验收由 tester 对照 SPEC.md 签署，业务验收仍单独记录。
 
 ### 测试者容错（failover，额度耗尽自动交接）
 
@@ -125,7 +104,7 @@ tester（测试验收者）因**额度耗尽**等原因不可用时，插件把 
 
 - **自动触发**：① 对 tester 的派单失败且错误匹配额度特征（额度/余额/欠费/限流/quota/insufficient/balance/exceeded/429/rate limit）→ 自动挂起，报错附交接指引；② tester 以 `squad_report` 上报 `blocked` 且摘要匹配额度特征 → 自动挂起。
 - **手动触发/恢复**（Lead 工具 `squad_failover`）：挂起 `squad_failover({ agent: "tester", reason: "原因" })`；用户确认额度恢复后 `squad_failover({ agent: "tester", recover: true })` 交还职责。
-- **挂起期间**：对 tester 的任何派单被拒绝（提示改派 brain）；`test-review` 阶段放行 brain（代行测试验收，派单提示注明"代行测试验收职责"）；`spec`/`tech-review` 本就是 brain 的职责。非额度类派单错误**不会**触发挂起。
+- **挂起期间**：对 tester 的任何派单被拒绝（提示改派 brain）；`test-review` 阶段放行 brain（代行测试验收，派单提示注明"代行测试验收职责"）；`spec` 本就是 brain 的职责。非额度类派单错误**不会**触发挂起。
 - **持久化**：挂起状态存 `~/.dsh/agent-squad/failover.json`，插件重载/DSH 重启后仍生效，直到显式恢复；`squad_status` 显示"挂起：tester（自 …；自动/手动；原因 …）"。
 - 代行期间 brain 产出的 TEST-REVIEW.md 是正式记录；验收新鲜度规则不变（代行产生的测试验收同样绑定 codeEpoch/specVersion）。
 
@@ -133,12 +112,12 @@ tester（测试验收者）因**额度耗尽**等原因不可用时，插件把 
 
 - **worker 能力属运行时高级配置**：每个成员有 `agents[].worker`，另有顶层 `leaderWorker`——brain、tester与 Lead 开启后都能作为 Worker 参与并行实现（实现者不参与自签验收）。这两个开关**不在设置页显示**，直接编辑 settings.json 或经 HTTP API 修改。
 - **worker 内部并行（默认）**：ZCode CLI 自带 subagent 体系（Task/Agent 工具），Qoder CLI 亦有 subagent（默认启用的实验设置）与 Workflow parallel/pipeline 编排；ACP/CLI 通道均不过滤工具、权限自动放行。worker 章程与 implement/rework 派单提示内置"并行默认"引导：交办包含多个独立文件/模块时，worker 默认用自己的子代理同时开发；不独立的部分串行完成；边界不变（只改规格内文件、逐条 AC 留证、汇总写 REPORT.md）。
-- **小队级并行（默认）**：external 执行者的 `implement`/`rework` 派单**默认后台派发**（`delivery: 'parent'`）——工具调用立即返回、结果完成时以后台消息送达 Lead，因此 Lead **默认可以连续并发派多个 worker**（如 worker1 后端 + front1 前端同时跑）。需要在本回合同步拿到结果时传 `background: false` 恢复阻塞式；`design/spec/test-review/tech-review/review` 始终同步（需读取交付物）；local/team 执行者本就不阻塞。
+- **小队级并行（默认）**：external 执行者的 `implement`/`rework` 派单**默认后台派发**（`delivery: 'parent'`）——工具调用立即返回、结果完成时以后台消息送达 Lead，因此 Lead **默认可以连续并发派多个 worker**（如 worker1 后端 + front1 前端同时跑）。需要在本回合同步拿到结果时传 `background: false` 恢复阻塞式；`design/spec/test-review/review` 始终同步（需读取交付物）；local/team 执行者本就不阻塞。
 - `squad_status` 显示"后台执行器运行中：N 个"；`squad_finish` 会等所有后台执行器结束。同一队友运行中的重复派单仍受 R07 守卫限制。
 
 ### 不阻塞主会话（所有 external 阶段默认后台）
 
-所有 external 派单——包括 brain 的 `design`/`review`、tester 的 `spec`/`tech-review`、worker 的 `implement`/`rework`——**默认后台派发**（`delivery: 'parent'`）：工具调用立即返回，Lead 结束本回合，用户可继续操作；结果完成时以后台消息送达，下一次工具调用会把待记账结果落盘（design → `PLAN-R<n>.md`；spec → `SPEC-V<n>.md`；review/tech-review → verdict + `REVIEW-R<n>.md`）。验收绑定（codeEpoch/specVersion）在派单时即记录，保证"验收对应哪版代码"不错位。
+所有 external 派单——包括 brain 的 `design`/`review`、tester 的 `spec`/`test-review`、worker 的 `implement`/`rework`——**默认后台派发**（`delivery: 'parent'`）：工具调用立即返回，Lead 结束本回合，用户可继续操作；结果完成时以后台消息送达，下一次工具调用会把待记账结果落盘（design → `PLAN-R<n>.md`；spec → `SPEC-V<n>.md`；review → verdict + `REVIEW-R<n>.md`）。验收绑定（codeEpoch/specVersion）在派单时即记录，保证"验收对应哪版代码"不错位。
 
 - 后台任务在跑时，`squad_approve_plan` / `squad_deliver` / `squad_finish` 会拒绝并提示"后台任务仍在运行：…"，`squad_status` 进度里显示"后台运行中：…"；
 - 需要在本回合同步拿结果（脚本化、必须立刻读交付物）时传 `background: false` 恢复阻塞式；
@@ -191,8 +170,8 @@ tester（测试验收者）因**额度耗尽**等原因不可用时，插件把 
 ### 预算与上限
 
 - **设计预算（默认 4 次）**：初始设计 + 最多 3 轮返工；未扩展时第 5 次暂停。
-- **技术返工预算（默认 3 轮）**：技术验收不通过的返工；**前后端 worker 共享**，不因换人、修订规格而重置。未扩展时第 4 轮暂停。
-- **业务返工预算（默认 3 轮）**：业务验收不通过的返工；与技术额度独立计数。未扩展时第 4 轮暂停。业务返工改动代码后必须重新通过技术验收，再重新业务验收。
+- **测试验收（技术）返工预算（默认 3 轮）**：测试验收不通过的返工；**前后端 worker 共享**，不因换人、修订规格而重置。未扩展时第 4 轮暂停。
+- **业务返工预算（默认 3 轮）**：业务验收不通过的返工；与测试/技术额度独立计数。未扩展时第 4 轮暂停。业务返工改动代码后必须重新通过测试验收，再重新业务验收。
 - **到上限是暂停，不是硬拒绝**：先向用户说明阻塞点及已完成部分并**等待决策**；仅用户明确同意后调用 `squad_extend`（如 `squad_extend(kind="design", rounds=3, reason="用户批准的追加理由", confirmed=true)`）追加轮次再派单。每次扩展都要重新取得用户同意（每次都传 `confirmed=true`），可重复扩展、无插件硬上限，但不得预先充值，也**不自动续跑**；用户拒绝或未回复时保持暂停。
 - **默认值只在插件常量里**：各类上限存 STATE（`designLimit` / `techReworkLimit` / `businessReworkLimit` / `reworkLimit`），由 `squad_extend` 提高。
 - **简化/兼容流程**（`flow="simple"` 或未配置 tester 的任务、旧任务）沿用旧门禁：Lead 批准 PLAN + brain 单一 REVIEW 验收，返工预算用 `kind="implement"` 扩展。
@@ -323,7 +302,7 @@ ASQ_LIVE_QODER=1 node --test --test-name-pattern='^T09 ' dsh-agent-squad/test/se
 
 token：GLM implement 26,295 / rework 26,459（cache 主导）；Codex 设计 + 两轮验收约 3×20k；整轮闭环约 **11.5 万**。同样 5 次调用若走 ZCode 约 560 万。
 
-> 门禁规则：`TECH-REVIEW.md` 与 `REVIEW.md` 最后一行必须是 `VERDICT: APPROVED|CHANGES_REQUESTED`；每轮自动归档为 `TECH-REVIEW-R<round>.md` / `REVIEW-R<round>.md`；`squad_finish` 只认最后一条 VERDICT，且验收绑定必须仍然新鲜（codeEpoch/specVersion 未变）。
+> 门禁规则：`TEST-REVIEW.md` 与 `REVIEW.md` 最后一行必须是 `VERDICT: APPROVED|CHANGES_REQUESTED`；每轮自动归档为 `TEST-REVIEW-R<round>.md` / `REVIEW-R<round>.md`；`squad_finish` 只认最后一条 VERDICT，且验收绑定必须仍然新鲜（codeEpoch/specVersion 未变）。
 
 > 注意：`dsh-tool-subagent` 的 `list_subagent_models` 仍受 `subagent-model-selection` 会话策略限制；本插件直接调 subagent 服务，绕过的是工具层的策略门。若要让 GUI/工具一致，在 `subagent-model-selection-settings` 的 `allowedModels` 里加上 `zai-coding-cn/glm-5.3` 与 `openai/gpt-6.2-sol`。
 
@@ -437,11 +416,9 @@ token：GLM implement 26,295 / rework 26,459（cache 主导）；Codex 设计 + 
     ├── PLAN-APPROVED.md      # 业务方案与业务验收的唯一权威规格（squad_approve_plan 写）
     ├── SPEC.md               # 技术规格（brain 写；当前版本）
     ├── SPEC-V<n>.md          # 第 n 版技术规格归档（external 同步归档）
-    ├── TEST-REVIEW.md        # 测试验收结论 + 证据（tester 写；含补充的测试用例与完整测试结果）
+    ├── TEST-REVIEW.md        # 测试验收（技术验收）结论 + 证据（tester 写；含代码审查、补充用例与完整测试结果）
     ├── AUTHORITY.md          # 验收模式：指定的权威方案（authority 固化；唯一验收依据）
     ├── ACCEPTANCE-REPORT.md  # 验收模式：双维度验收报告（五要素；R<n> 归档历史轮次）
-    ├── TECH-REVIEW.md        # 技术验收结论 + 证据（brain 写；brain 实现代码时由 tester 代签）
-    ├── TECH-REVIEW-R<round>.md  # 每轮技术验收归档
     ├── REVIEW.md             # 业务验收结论 + 证据（brain 写）
     ├── REVIEW-R<round>.md    # 每轮业务验收归档
     ├── REPORT.md             # 逐条 AC 的文件 / 测试 / 命令 / 退出码 / 输出 / 结论
@@ -456,7 +433,7 @@ token：GLM implement 26,295 / rework 26,459（cache 主导）；Codex 设计 + 
 - **local / team 执行者**：design 派单投递成功即计数写 STATE，不逐轮归档；仅在 `squad_approve_plan` 批准时把当前 PLAN.md 补归档为当前轮次 `PLAN-R<n>.md`（已存在的历史归档不改写）。spec 派单投递成功即 `specVersion+1` 并置 `specPublished=true`。
 - **设计预算**：默认初始设计 + 3 轮返工 = 4 次成功 design 派单；未扩展时第 5 次暂停（用户决策门禁，见上），上限存 STATE 的 `designLimit`。PLAN 已批准后 design 一律拒绝（扩展不解除批准门禁）。
 - **实现门禁**：`planRequired`（任务建立时按参与者是否含 brain 快照，之后改角色不生效）且未批准时，implement/rework/spec 在写 BRIEF/STATE/调用执行器之前即被拒绝，错误信息指向 `squad_approve_plan`；无 brain 任务豁免。完整流程（`specRequired`）下，技术规格未发布（`specPublished=false`）时拒绝 implement/rework；规格发布后即可派工，不需要 Lead 再审批。旧 STATE 无这些字段时按验收门禁快照回退（gate 显式 false 才豁免），不按当前 roster 放宽。
-- **验收新鲜度**：每次 tech-review/review 派单把 `codeEpoch`（实现/返工轮次计数）与 `specVersion` 绑定进 STATE；此后任何实现、返工或规格修订都会让旧结论失效。业务验收前技术验收必须新鲜且 APPROVED；`squad_finish` 同样只认新鲜的 APPROVED。业务返工改动代码后必须重新通过技术验收。
+- **验收新鲜度**：每次 test-review/review 派单把 `codeEpoch`（实现/返工轮次计数）与 `specVersion` 绑定进 STATE；此后任何实现、返工或规格修订都会让旧结论失效。业务验收前测试验收（技术验收）必须新鲜且 APPROVED；`squad_finish` 同样只认新鲜的 APPROVED。业务返工改动代码后必须重新通过测试验收。
 
 每次派单的消息只带任务号、阶段、轮次、目录和本轮任务，不复制历史对话；队友先读文件再动手。这样跨 agent 的“共享记忆”是可审计的文件，而不是互相复制的 transcript。
 
@@ -574,7 +551,7 @@ context: model=qoder/qmodel_latest window=200000 used=172000 ratio=86.0% thresho
 | --- | --- | --- |
 | `squad_enable` | 任意会话根（未启用时） | 显式启用小队：仅当用户明确要求"用小队"时调用；仅提到队友名字不算启用。启用后本会话成为 Squad Lead |
 | `squad_start` | Lead | 可选 `repos: string[]`（默认当前仓库，首项为主仓）、`flow: "full"\|"simple"`（研发模式流程，默认 full；无 tester 参与者自动降级为简化规则并警告）、`mode: "dev"\|"acceptance"`（默认 dev 研发模式）与 `authority`（验收模式必填：权威方案路径或全文，固化为 AUTHORITY.md）；建 worktree 集合、写 TASK/JOURNAL/STATE 和门禁快照，最后发布 current |
-| `squad_dispatch` | Lead | 首次创建 / 之后续跑指定队友，推进 phase（研发模式 design/spec/implement/test-review/tech-review/review/rework；验收模式 acceptance/rework）与 round；design 受设计预算与已批准限制，spec 限 brain，implement/rework 受 PLAN 批准与规格交付门禁且 external 执行者默认后台派发（background: false 恢复阻塞），test-review 限 tester（挂起时 brain 代行），tech-review 默认 brain 且要求新鲜的 APPROVED 测试验收、禁止自签，review（完整流程）要求技术验收新鲜通过；验收模式 acceptance 强制 tester（技术维度）→ brain（业务维度）顺序并定稿 ACCEPTANCE-REPORT.md，rework 需要新鲜的 CHANGES_REQUESTED 验收结论；到预算上限时暂停并提示先问用户 |
+| `squad_dispatch` | Lead | 首次创建 / 之后续跑指定队友，推进 phase（研发模式 design/spec/implement/test-review/review/rework；验收模式 acceptance/rework）与 round；design 受设计预算与已批准限制，spec 限 brain，implement/rework 受 PLAN 批准与规格交付门禁且 external 执行者默认后台派发（background: false 恢复阻塞），test-review 是测试验收（技术验收）且限 tester（tester 实现代码或挂起时由 brain 代签），review（完整流程）要求测试验收新鲜 APPROVED 且仅限 brain；验收模式 acceptance 强制 tester（技术维度）→ brain（业务维度）顺序并定稿 ACCEPTANCE-REPORT.md，rework 需要新鲜的 CHANGES_REQUESTED 验收结论；到预算上限时暂停并提示先问用户 |
 | `squad_approve_plan` | Lead（仅 Lead 可见） | 审核通过 PLAN.md：补归档当前轮次 `PLAN-R<n>.md`，写 `PLAN-APPROVED.md` 与 `planApproved`/`planApprovedAt`；缺 PLAN、已收尾或已批准时拒绝 |
 | `squad_extend` | Lead（仅 Lead 可见） | 用户决策门禁：仅当对应预算（完整流程 `kind` = design/tech/business；简化/兼容 `kind` = design/implement）已到上限且用户明确同意后调用（`confirmed=true` 必填，`rounds` 正整数默认 3，`reason` 必填），提高该类上限并追加一条扩展记录；未到上限、未确认或非 Lead 一律拒绝；可重复扩展，不自动续跑 |
 | `squad_status` | Lead | 任务、阶段/轮次、流程（flow/specPublished/specVersion/codeEpoch/implementers）、双验收绑定与结论、全部仓库/worktree/分支/基线、PLAN 门禁、各类预算与最近 6 条扩展记录、成员状态、记忆文件、最近派单 |

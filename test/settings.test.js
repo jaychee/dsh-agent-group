@@ -23,10 +23,10 @@ const BUNDLE_AGENTS = [
 ]
 
 /** Shared S/E/M contract lines and charter items, asserted verbatim (PLAN §2/§3). */
-const S_TEXT = 'PLAN-APPROVED.md 是业务方案与业务验收的唯一权威规格；SPEC.md 是技术实现、返工与技术验收的唯一权威规格；PLAN.md 只用于设计，不能覆盖批准归档。'
+const S_TEXT = 'PLAN-APPROVED.md 是业务方案与业务验收的唯一权威规格；SPEC.md 是技术实现、返工与测试验收（技术验收）的唯一权威规格；PLAN.md 只用于设计，不能覆盖批准归档。'
 const E_TEXT = '仅任务快照豁免方案门禁且无批准归档时，按 TASK.md 与 Lead 本轮派单执行；仍须逐条 AC 留证。'
 const M_TEXT =
-  'AC 映射：沿用 TASK.md 的 AC 编号；未编号时按条目顺序从 AC1 开始编号。PLAN.md/SPEC.md 为每条 AC 指定改动文件、测试名、验证命令与期望值；REPORT.md/TECH-REVIEW.md/REVIEW.md 按对应规格逐条记录 AC 编号、文件路径、测试名、命令、退出码、关键输出与结论。'
+  'AC 映射：沿用 TASK.md 的 AC 编号；未编号时按条目顺序从 AC1 开始编号。PLAN.md/SPEC.md 为每条 AC 指定改动文件、测试名、验证命令与期望值；REPORT.md/TEST-REVIEW.md/REVIEW.md 按对应规格逐条记录 AC 编号、文件路径、测试名、命令、退出码、关键输出与结论。'
 const BRAIN_ITEMS = [
   '把业务目标写成可执行业务方案，存入 PLAN.md：对外行为、用户可见结果、边界场景与编号验收标准（AC）。',
   '涉及对外接口时逐项写明接口契约与错误行为；没有接口变更时明确写“无接口变更”，并列出须保留的对外行为。',
@@ -35,15 +35,14 @@ const BRAIN_ITEMS = [
   '你可以澄清方案；但要改变原有业务功能、对外结果或验收标准，必须先请用户决策，不得擅自变更。',
   '写完后自检“一个没有上下文的实现者能否只靠 PLAN 拍板技术设计”，把结论写入 PLAN.md；不能时补全方案，或列入“假设与待确认”并标明阻塞项，不得宣称方案可执行。',
   '设计轮（spec）读取已批准的 PLAN-APPROVED.md，把技术规格写入 SPEC.md，至少覆盖适用的：代码结构、文件与模块职责、数据库表与迁移、领域模型及其依赖、对外接口与错误行为、各模块实现、可执行验证用例；对不适用的部分逐项明确说明“不适用”。',
-  '技术验收轮（tech-review）以当前 SPEC.md 为唯一权威技术规格：做代码审查、亲自运行验证测试，在 TECH-REVIEW.md 逐条记录需求/AC 编号、命令、退出码、关键输出与可执行的编号缺陷清单；技术验收前必须已有一份仍然新鲜的 APPROVED 测试验收（TEST-REVIEW.md）。',
-  '当你本人接手实现过代码时，不能再签署自己改动的技术验收：技术验收改由 tester 对照 SPEC.md 代签；你的业务验收仍单独签署，两份验收独立记录。',
-  '业务验收轮以 PLAN-APPROVED.md 为唯一权威业务规格，逐条核对 AC 并在 REVIEW.md 写明 AC 编号、验证命令、退出码、关键输出与结论；亲自运行或检查，不接受没有证据的声明。',
+  '你本人接手实现过代码时，不得签署测试验收（技术验收）；由未实现代码的 tester 对照 SPEC.md 签署，业务验收仍由你单独签署。',
+  '业务验收轮以 PLAN-APPROVED.md 为唯一权威业务规格，逐条核对 AC 并在 REVIEW.md 写明 AC 编号、验证命令、退出码、关键输出与结论；亲自运行或检查，不接受没有证据的声明。技术结论对照 SPEC.md 与 TEST-REVIEW.md（tester 的技术验收结论）。',
 ]
 const TESTER_ITEMS = [
-  '测试验收轮（test-review）读取 brain 的 SPEC.md（技术实现规格）与 PLAN-APPROVED.md（验收方案），逐条 AC 审核 worker 在 REPORT.md 中提交的测试用例：是否覆盖每条 AC、测试名/输入/期望值是否与规格一致、命令是否可直接执行、证据是否真实完整。',
+  '测试验收轮（test-review）读取 brain 的 SPEC.md（技术实现规格）与 PLAN-APPROVED.md（验收方案），逐条 AC 做代码审查并审核 worker 在 REPORT.md 中提交的测试用例：实现是否符合规格、是否覆盖每条 AC、测试名/输入/期望值是否一致、命令是否可直接执行、证据是否真实完整。',
   'worker 的测试用例不合格（缺失、覆盖不足、与规格不符、证据不实）时，由你补充测试用例并进行完整测试：补齐缺失用例、亲自运行完整测试套件、记录真实结果，不得只指出问题不补齐。',
-  '把测试验收结论写入 TEST-REVIEW.md：逐条 AC 记录审核结论、你补充的测试用例、完整测试的命令/退出码/关键输出；最后一行必须是机器可读的「VERDICT: APPROVED」（用例合格或已补齐且完整测试通过）或「VERDICT: CHANGES_REQUESTED」（存在测试无法覆盖的实现缺陷，给出编号缺陷清单与每项最小修复方案）。',
-  'brain 本人接手实现过代码时，由你对照 SPEC.md 代签技术验收（TECH-REVIEW.md）：代码审查、亲自运行验证测试、逐条记录命令/退出码/关键输出与编号缺陷，最后一行同样是「VERDICT: APPROVED」或「VERDICT: CHANGES_REQUESTED」。',
+  '把测试验收（技术验收）结论写入 TEST-REVIEW.md：逐条 AC 记录代码审查结论、你补充的测试用例、完整测试的命令/退出码/关键输出；最后一行必须是机器可读的「VERDICT: APPROVED」（实现符合规格、用例合格或已补齐且完整测试通过）或「VERDICT: CHANGES_REQUESTED」（存在实现缺陷或测试无法覆盖，给出编号缺陷清单与每项最小修复方案）。',
+  '你本人接手实现过代码时不得签署自己的测试验收（技术验收）；由未实现代码的 brain 对照 SPEC.md 代签。',
   '不写生产代码：只补测试用例与测试脚本，不改实现逻辑；发现实现缺陷报 CHANGES_REQUESTED 转 worker 修复，不代改。',
 ]
 const WORKER_ITEMS = [
@@ -618,7 +617,7 @@ test('T03 dispatch reads fresh settings and routes external/local/team executors
 
     const startOutput = await tool('squad_start').execute(
       // No architect participant: the task downgrades to the legacy gates, so
-      // T03 keeps exercising pure executor routing (spec/tech-review gates
+      // T03 keeps exercising pure executor routing (spec/test-review gates
       // belong to T11).
       { goal: 'g', acceptance: 'a', agents: ['brain', 'worker1', 'front1'] },
       exec,
@@ -2636,7 +2635,7 @@ test('T09 multi-repository lifecycle, validation, rollback and compatibility', a
 
       try {
         const startOutput = await tool('squad_start').execute(
-          // No architect participant → legacy gates; the spec/tech-review
+          // No architect participant → legacy gates; the spec/test-review
           // pipeline is T11's scope.
           { goal: 'multi', acceptance: 'ok', agents: ['brain', 'worker1', 'front1'], repos: ['a/shared repo', repoB] },
           exec,
@@ -4346,7 +4345,7 @@ test('T10 budget extension requires user confirmation and resumes exhausted budg
 })
 
 /** T11 — architect flow: opt-in squad, spec gate, dual acceptance, takeover & quotas. */
-test('T11 full flow: opt-in gate, spec/tech-review pipeline, dual acceptance, takeover and budgets', async () => {
+test('T11 full flow: opt-in gate, spec/test-review pipeline, dual acceptance, takeover and budgets', async () => {
   const workspace = await tempRoot()
   const dshHome = await tempRoot()
   const restoreDshHome = useFixtureDshHome(dshHome)
@@ -4446,7 +4445,7 @@ test('T11 full flow: opt-in gate, spec/tech-review pipeline, dual acceptance, ta
       assert.deepEqual(state.implementers, [])
       assert.equal(state.techReworkLimit, 3)
       assert.equal(state.businessReworkLimit, 3)
-      assert.match(startF, /full（业务方案 → 技术规格 → 实现 → 测试验收 → 技术验收 → 业务验收）/)
+      assert.match(startF, /full（业务方案 → 技术规格 → 实现 → 测试验收（技术验收）→ 业务验收）/)
     }
 
     // design → PLAN.md (external), spec gated until the Lead approves.
@@ -4490,9 +4489,10 @@ test('T11 full flow: opt-in gate, spec/tech-review pipeline, dual acceptance, ta
     assert.equal(stateG.codeEpoch, 1)
     assert.deepEqual(stateG.implementers, ['worker1'])
 
-    // test-review gates tech-review: a missing/stale TEST-REVIEW refuses it.
-    await assert.rejects(dispatch({ agent: 'brain', message: 'tr', phase: 'tech-review' }), /测试验收未通过或已失效：技术验收前必须先有仍然新鲜的测试验收（TEST-REVIEW\.md 以 VERDICT: APPROVED 结束，且验收后代码\/规格未再变动）。先派 tester phase="test-review"。/)
-    await assert.rejects(dispatch({ agent: 'worker1', message: 'tstr', phase: 'test-review' }), /test-review 只能派 tester；worker1 当前是 worker。/)
+    // Test acceptance is the technical acceptance: business review is
+    // refused until a FRESH APPROVED test-review exists.
+    await assert.rejects(dispatch({ agent: 'brain', message: 'br', phase: 'review' }), /测试验收（技术验收）未通过或已失效.*先派 tester phase="test-review"。/s)
+    await assert.rejects(dispatch({ agent: 'worker1', message: 'tstr', phase: 'test-review' }), /不能签署自己的测试验收（技术验收）/)
     // tester is a pinned local child: the first test-review spawn carries the model options.
     await writeVerdict(taskG, 'TEST-REVIEW.md', 'APPROVED')
     const testOut = await dispatch({ agent: 'tester', message: 'review tests', phase: 'test-review' })
@@ -4500,27 +4500,23 @@ test('T11 full flow: opt-in gate, spec/tech-review pipeline, dual acceptance, ta
     assert.deepEqual(host.activations.at(-1).agentOptions, { provider: 'p', model: 'arch', maxTokens: 16384 })
     assert.match(testOut, /testReview: codeEpoch=1 specVersion=1/)
     assert.ok(await stat(join(dirG, 'TEST-REVIEW-R1.md')))
-    // tech-review: needs implementation; default brain; workers refused.
-    await writeVerdict(taskG, 'TECH-REVIEW.md', 'APPROVED')
-    await assert.rejects(dispatch({ agent: 'worker1', message: 'tr', phase: 'tech-review' }), /tech-review 默认派 brain；brain 已在本任务写代码时改派 tester 代签；worker1 当前是 worker（已在本任务写代码，不能签署自己改动的技术验收）。/)
-    // business review: refused until a FRESH technical approval exists.
-    await assert.rejects(dispatch({ agent: 'brain', message: 'br', phase: 'review' }), /技术验收未通过或已失效.*先派 tech-review。/s)
+    await assert.rejects(dispatch({ agent: 'brain', message: 'legacy tech', phase: 'tech-review' }), /技术验收阶段已移除/)
     // front1 is a worker: the full-flow business review is brain-only.
     await assert.rejects(dispatch({ agent: 'front1', message: 'br', phase: 'review' }), /完整流程的业务验收只能派 brain 角色；front1 当前是 worker。/)
 
-    // --- task F continues: tech failure → rework → fresh gates --------------
+    // --- task F continues: test-acceptance failure → rework → fresh gates ----
     // (current.json now points at G, so every F dispatch passes task_id.)
     await dispatch({ agent: 'worker1', message: 'impl F', phase: 'implement', task_id: taskF })
     await writeVerdict(taskF, 'TEST-REVIEW.md', 'APPROVED')
     await dispatch({ agent: 'tester', message: 'test 1', phase: 'test-review', task_id: taskF })
-    await writeVerdict(taskF, 'TECH-REVIEW.md', 'CHANGES_REQUESTED')
-    await dispatch({ agent: 'brain', message: 'tech 1', phase: 'tech-review', task_id: taskF })
+    await writeVerdict(taskF, 'TEST-REVIEW.md', 'CHANGES_REQUESTED')
+    await dispatch({ agent: 'tester', message: 'test failing', phase: 'test-review', task_id: taskF })
     let stateF = await readState(taskF)
-    assert.equal(stateF.lastTechVerdict, 'CHANGES_REQUESTED')
-    assert.equal(stateF.techReview.codeEpoch, stateF.codeEpoch)
-    assert.ok(await stat(join(dirF, 'TECH-REVIEW-R1.md'))) // round-numbered archive
-    // rework kind inference: fresh failing tech → tech rework (quota shared
-    // across worker1 AND front1).
+    assert.equal(stateF.lastTestVerdict, 'CHANGES_REQUESTED')
+    assert.equal(stateF.testReview.codeEpoch, stateF.codeEpoch)
+    assert.equal(stateF.testReview.reviewer, 'tester')
+    // rework kind inference: fresh failing test/technical acceptance → tech
+    // rework (quota shared across worker1 AND front1).
     const reworkQoder = await dispatch({ agent: 'front1', message: 'fix frontend', phase: 'rework', task_id: taskF })
     assert.match(reworkQoder, /rework: tech=1\/3 business=0\/3/)
     stateF = await readState(taskF)
@@ -4528,15 +4524,13 @@ test('T11 full flow: opt-in gate, spec/tech-review pipeline, dual acceptance, ta
     assert.equal(stateF.codeEpoch, 2) // implement(1) + rework(2)
     assert.deepEqual(stateF.implementers, ['worker1', 'front1'])
     assert.equal(stateF.dispatches.at(-1).reworkKind, 'tech')
-    // business review still refused: the tech binding went stale after rework.
-    await assert.rejects(dispatch({ agent: 'brain', message: 'br', phase: 'review', task_id: taskF }), /旧结论已因代码\/规格变动失效，需重新验收/)
+    // business review still refused: the test/technical binding went stale after rework.
+    await assert.rejects(dispatch({ agent: 'brain', message: 'br', phase: 'review', task_id: taskF }), /旧结论已因代码\/规格变动失效，需重新测试验收/)
     // no pending failing acceptance → rework refused.
     await assert.rejects(dispatch({ agent: 'worker1', message: 'nothing', phase: 'rework', task_id: taskF }), /没有待返工的验收结论/)
-    // fresh tech approval → business review records its own binding.
+    // fresh test/technical approval → business review records its own binding.
     await writeVerdict(taskF, 'TEST-REVIEW.md', 'APPROVED')
     await dispatch({ agent: 'tester', message: 'test 2', phase: 'test-review', task_id: taskF })
-    await writeVerdict(taskF, 'TECH-REVIEW.md', 'APPROVED')
-    await dispatch({ agent: 'brain', message: 'tech 2', phase: 'tech-review', task_id: taskF })
     await writeVerdict(taskF, 'REVIEW.md', 'CHANGES_REQUESTED')
     await dispatch({ agent: 'brain', message: 'business 1', phase: 'review', task_id: taskF })
     stateF = await readState(taskF)
@@ -4549,18 +4543,16 @@ test('T11 full flow: opt-in gate, spec/tech-review pipeline, dual acceptance, ta
     stateF = await readState(taskF)
     assert.equal(stateF.businessReworkRounds, 1)
     assert.equal(stateF.dispatches.at(-1).reworkKind, 'business')
-    // business rework changed code → tech stale again → finish refused.
+    // business rework changed code → test/technical acceptance stale → finish refused.
     await writeVerdict(taskF, 'REVIEW.md', 'APPROVED')
-    await assert.rejects(tool('squad_finish').execute({ summary: 'no', task_id: taskF }, exec), /技术验收结论已失效/)
+    await assert.rejects(tool('squad_finish').execute({ summary: 'no', task_id: taskF }, exec), /测试验收（技术验收）结论已失效/)
     await writeVerdict(taskF, 'TEST-REVIEW.md', 'APPROVED')
     await dispatch({ agent: 'tester', message: 'test 3', phase: 'test-review', task_id: taskF })
-    await writeVerdict(taskF, 'TECH-REVIEW.md', 'APPROVED')
-    await dispatch({ agent: 'brain', message: 'tech 3', phase: 'tech-review', task_id: taskF })
     await dispatch({ agent: 'brain', message: 'business 2', phase: 'review', task_id: taskF })
     stateF = await readState(taskF)
-    assert.equal(stateF.techReview.reviewer, 'brain')
+    assert.equal(stateF.testReview.reviewer, 'tester')
     assert.equal(stateF.businessReview.reviewer, 'brain')
-    assert.equal(stateF.techReview.codeEpoch, stateF.codeEpoch)
+    assert.equal(stateF.testReview.codeEpoch, stateF.codeEpoch)
     assert.equal(stateF.businessReview.codeEpoch, stateF.codeEpoch)
     assert.equal(stateF.techReworkRounds, 1)
     assert.equal(stateF.businessReworkRounds, 1)
@@ -4598,23 +4590,22 @@ test('T11 full flow: opt-in gate, spec/tech-review pipeline, dual acceptance, ta
     assert.equal(stateG.codeEpoch, 1)
     // Self-sign ban: tester (implemented) cannot sign the technical acceptance.
     await writeVerdict(taskH, 'TEST-REVIEW.md', 'APPROVED')
-    await dispatch({ agent: 'tester', message: 'test H', phase: 'test-review' })
-    await writeVerdict(taskH, 'TECH-REVIEW.md', 'APPROVED')
     await assert.rejects(
-      dispatch({ agent: 'tester', message: 'self sign', phase: 'tech-review' }),
-      /tech-review 默认派 brain；brain 已在本任务写代码时改派 tester 代签；tester 当前是 tester（已在本任务写代码，不能签署自己改动的技术验收）。/,
+      dispatch({ agent: 'tester', message: 'self sign', phase: 'test-review' }),
+      /tester 已在本任务中写代码，不能签署自己的测试验收（技术验收）/,
     )
-    // brain signs BOTH acceptances as two independent records.
-    await dispatch({ agent: 'brain', message: 'tech on behalf', phase: 'tech-review' })
+    // Brain (not an implementer) signs the technical acceptance; business
+    // acceptance remains a separate record.
+    await dispatch({ agent: 'brain', message: 'test on behalf', phase: 'test-review' })
     stateG = await readState(taskH)
-    assert.equal(stateG.techReview.reviewer, 'brain')
+    assert.equal(stateG.testReview.reviewer, 'brain')
     await writeVerdict(taskH, 'REVIEW.md', 'APPROVED')
     await dispatch({ agent: 'brain', message: 'business', phase: 'review' })
     // H is the current task: status renders the full-flow state.
     const statusH = await tool('squad_status').execute({}, exec)
     assert.match(statusH, /flow=full/)
     assert.match(statusH, /specPublished=true  specVersion=1/)
-    assert.match(statusH, /技术验收：新鲜  verdict=APPROVED  reviewer=brain（TECH-REVIEW\.md）/)
+    assert.match(statusH, /测试验收（技术验收）：新鲜  verdict=APPROVED  reviewer=brain（TEST-REVIEW\.md）/)
     assert.match(statusH, /业务验收：新鲜  verdict=APPROVED  reviewer=brain（REVIEW\.md）/)
     assert.match(statusH, /tech 上限=3 已用=0 剩余=3；business 上限=3 已用=0 剩余=3/)
     assert.match(statusH, /implementers=tester/)
@@ -4630,18 +4621,14 @@ test('T11 full flow: opt-in gate, spec/tech-review pipeline, dual acceptance, ta
     await dispatch({ agent: 'brain', message: 'spec Q', phase: 'spec' })
     await dispatch({ agent: 'worker1', message: 'impl Q', phase: 'implement' })
     for (let round = 1; round <= 3; round += 1) {
-      await writeVerdict(taskQ, 'TEST-REVIEW.md', 'APPROVED')
+      await writeVerdict(taskQ, 'TEST-REVIEW.md', 'CHANGES_REQUESTED')
       await dispatch({ agent: 'tester', message: `test ${round}`, phase: 'test-review' })
-      await writeVerdict(taskQ, 'TECH-REVIEW.md', 'CHANGES_REQUESTED')
-      await dispatch({ agent: 'brain', message: `tech ${round}`, phase: 'tech-review' })
       const worker = round === 2 ? 'front1' : 'worker1' // quota shared across workers
       await dispatch({ agent: worker, message: `fix ${round}`, phase: 'rework' })
       assert.equal((await readState(taskQ)).techReworkRounds, round)
     }
-    await writeVerdict(taskQ, 'TEST-REVIEW.md', 'APPROVED')
+    await writeVerdict(taskQ, 'TEST-REVIEW.md', 'CHANGES_REQUESTED')
     await dispatch({ agent: 'tester', message: 'test 4', phase: 'test-review' })
-    await writeVerdict(taskQ, 'TECH-REVIEW.md', 'CHANGES_REQUESTED')
-    await dispatch({ agent: 'brain', message: 'tech 4', phase: 'tech-review' })
     const briefBefore = await readFile(join(dirG, 'BRIEF.md'), 'utf8').catch(() => undefined)
     await assert.rejects(
       dispatch({ agent: 'worker1', message: '4th rework', phase: 'rework' }),
@@ -4675,7 +4662,7 @@ test('T11 full flow: opt-in gate, spec/tech-review pipeline, dual acceptance, ta
     await dispatch({ agent: 'brain', message: 'plan S', phase: 'design' })
     await tool('squad_approve_plan').execute({ task_id: taskS }, exec)
     await dispatch({ agent: 'worker1', message: 'impl S', phase: 'implement' })
-    await assert.rejects(dispatch({ agent: 'tester', message: 'no tech', phase: 'tech-review' }), /未启用完整流程/)
+    await assert.rejects(dispatch({ agent: 'tester', message: 'no test review', phase: 'test-review' }), /没有测试验收阶段/)
     await writeVerdict(taskS, 'REVIEW.md', 'APPROVED')
     await dispatch({ agent: 'brain', message: 'review S', phase: 'review' })
     // Simple tasks keep the design/implement extension kinds; tech is refused.
@@ -4776,14 +4763,10 @@ test('T12 failover suspends a quota-exhausted tester and hands its duties to the
     await writeVerdict(taskF, 'TEST-REVIEW.md', 'APPROVED')
     const trOut = await dispatch({ agent: 'brain', message: 'test', phase: 'test-review' })
     assert.match(trOut, /已续跑 brain \[brain\]/)
-    assert.match(trOut, /（代行测试验收职责：测试者挂起，交付 TEST-REVIEW\.md）/)
+    assert.match(trOut, /（代签测试验收\/技术验收：tester 已实现代码或挂起，交付 TEST-REVIEW\.md）/)
     const testPrompt = host.sent.at(-1).content.map((block) => block.text).join('')
-    assert.match(testPrompt, /代行测试验收职责/)
+    assert.match(testPrompt, /代签测试验收\/技术验收/)
     assert.match(testPrompt, /TEST-REVIEW\.md/)
-    // tech-review stays the brain's own duty (no acting marker).
-    await writeVerdict(taskF, 'TECH-REVIEW.md', 'APPROVED')
-    const techOut = await dispatch({ agent: 'brain', message: 'tech', phase: 'tech-review' })
-    assert.ok(!/代行/.test(techOut), 'regular brain tech-review carries no acting marker')
 
     // Recovery restores the tester and closes the acting gate.
     const recoverOut = await failover({ agent: 'tester', recover: true })
@@ -5113,12 +5096,10 @@ test('T14 any role can act as a worker and the Lead has its own worker switch', 
     await writeFile(join(dir, 'TEST-REVIEW.md'), '# TEST\n\nVERDICT: APPROVED\n', 'utf8')
     assert.match(await dispatch({ agent: 'tester', message: 'test', phase: 'test-review' }), /已(创建|续跑) tester \[tester\]/)
     await assert.rejects(
-      dispatch({ agent: 'brain', message: 'self sign', phase: 'tech-review' }),
-      /brain 已在本任务中写代码，不能签署自己改动的技术验收：改派 tester 对照 SPEC\.md 代签技术验收/,
+      dispatch({ agent: 'brain', message: 'self sign', phase: 'test-review' }),
+      /brain 已在本任务中写代码，不能签署自己的测试验收（技术验收）/,
     )
-    assert.match(await dispatch({ agent: 'tester', message: 'tech', phase: 'tech-review' }), /已(创建|续跑) tester \[tester\]/)
-    state = JSON.parse(await readFile(join(dir, 'STATE.json'), 'utf8'))
-    assert.equal(state.techReview.reviewer, 'tester')
+    assert.equal(JSON.parse(await readFile(join(dir, 'STATE.json'), 'utf8')).testReview.reviewer, 'tester')
 
     // Worker-role agents stay unimpeded; front1's charter covers backend too.
     assert.match(await dispatch({ agent: 'front1', message: 'frontend impl', phase: 'implement' }), /已创建本地子代理 front1/)
@@ -5363,13 +5344,11 @@ test('T16 parallel features branch from the Base branch and merge back after del
       /并行阶段前必须先交付通用功能：squad_deliver\(\{ summary \}\) 通过验收并把基础层合并到 Base 分支后，再 squad_parallel_start。/,
     )
     // Delivery requires the acceptance gates.
-    await assert.rejects(tool('squad_deliver').execute({ summary: 'base' }, exec), /TECH-REVIEW\.md/)
+    await assert.rejects(tool('squad_deliver').execute({ summary: 'base' }, exec), /TEST-REVIEW\.md/)
 
     // --- base acceptance, then deliver to Base ------------------------------
     await writeVerdict(task, 'TEST-REVIEW.md', 'APPROVED')
     await dispatch({ agent: 'tester', message: 'test', phase: 'test-review' })
-    await writeVerdict(task, 'TECH-REVIEW.md', 'APPROVED')
-    await dispatch({ agent: 'brain', message: 'tech', phase: 'tech-review' })
     await writeVerdict(task, 'REVIEW.md', 'APPROVED')
     await dispatch({ agent: 'brain', message: 'review', phase: 'review' })
     const baseBefore = (await gitOut(repo, ['rev-parse', 'HEAD'])).trim()
@@ -5465,9 +5444,6 @@ test('T16 parallel features branch from the Base branch and merge back after del
     assert.ok(state.features.every((item) => item.merged))
     await writeVerdict(task, 'TEST-REVIEW.md', 'APPROVED')
     await dispatch({ agent: 'tester', message: 'final test', phase: 'test-review' })
-    await writeVerdict(task, 'TECH-REVIEW.md', 'APPROVED')
-    const finalTech = await dispatch({ agent: 'brain', message: 'final tech', phase: 'tech-review' })
-    assert.match(finalTech, new RegExp(`workspace=${repo.replace(/[.*+?^${}()|[\\]\\]/g, '\\$&')}`)) // reviews run on the merged Base
     await writeVerdict(task, 'REVIEW.md', 'APPROVED')
     await dispatch({ agent: 'brain', message: 'final review', phase: 'review' })
     const statusOut = await tool('squad_status').execute({}, exec)
@@ -5679,20 +5655,9 @@ test('T18 slow external phases return immediately, stay pending, then flush', as
     await delayMs(120)
     await tool('squad_status').execute({}, exec)
     assert.ok(await stat(join(dir, 'TEST-REVIEW-R1.md')))
-    await writeFile(join(dir, 'TECH-REVIEW.md'), '# TECH\n\nVERDICT: APPROVED\n', 'utf8')
-    assert.match(await dispatch({ agent: 'brain', message: 'tech', phase: 'tech-review' }), /已后台派发 brain/)
-    // finish is blocked while the review is still in flight (the generic
-    // running-child guard fires first, the pending gate covers the rest).
-    await assert.rejects(
-      tool('squad_finish').execute({ summary: 'x' }, exec),
-      /仍有队友在运行|后台任务仍在运行/,
-    )
-    await delayMs(120)
-    await tool('squad_status').execute({}, exec)
     state = await readState(task)
-    assert.equal(state.lastTechVerdict, 'APPROVED')
-    assert.ok(await stat(join(dir, 'TECH-REVIEW-R1.md')))
-
+    assert.equal(state.lastTestVerdict, 'APPROVED')
+    // Business review is the remaining gate; it archives as a deferred run.
     await writeFile(join(dir, 'REVIEW.md'), '# REVIEW\n\nVERDICT: APPROVED\n', 'utf8')
     assert.match(await dispatch({ agent: 'brain', message: 'review', phase: 'review' }), /已后台派发 brain/)
     await delayMs(120)
@@ -8036,37 +8001,25 @@ test('T24 dispatch scope', async (t) => {
     assert.ok(sentText().includes('D3'))
 
     // Review-family sources differ by phase below.
+    await writeFile(join(dirA, 'TEST-REVIEW.md'), '# TEST-REVIEW\nVERDICT: APPROVED\n', 'utf8')
     await tool('squad_dispatch').execute({
       agent: 'tester',
       message: 'review tests third',
       phase: 'test-review',
       task_id: taskA.taskId,
     }, exec)
-    await writeFile(join(dirA, 'TEST-REVIEW.md'), '# TEST-REVIEW\nVERDICT: APPROVED\n', 'utf8')
-    await tool('squad_dispatch').execute({
-      agent: 'brain',
-      message: 'tech review',
-      phase: 'tech-review',
-      task_id: taskA.taskId,
-    }, exec)
-    const techPrompt = promptOf(host.activations.at(-1))
-    assert.ok(readsLine(techPrompt).includes('TEST-REVIEW.md（新鲜 APPROVED）'))
-    assert.ok(readsLine(techPrompt).includes('TECH-REVIEW.md（已有；存在时）'))
-    assertSEM(techPrompt)
-    await writeFile(join(dirA, 'TECH-REVIEW.md'), '# TECH-REVIEW\nVERDICT: APPROVED\n', 'utf8')
+    const reviewPrompt = promptOf(host.activations.at(-1))
     await tool('squad_dispatch').execute({
       agent: 'brain',
       message: 'business review',
       phase: 'review',
       task_id: taskA.taskId,
     }, exec)
-    const reviewPrompt = promptOf(host.activations.at(-1))
-    assert.ok(readsLine(reviewPrompt).includes('PLAN-APPROVED.md'))
-    assert.ok(readsLine(reviewPrompt).includes('REPORT.md'))
-    assert.ok(readsLine(reviewPrompt).includes('TECH-REVIEW.md（已有；存在时）'))
-    assert.ok(readsLine(reviewPrompt).includes('TEST-REVIEW.md'))
-    assert.ok(readsLine(reviewPrompt).includes('SPEC.md'))
-    assertSEM(reviewPrompt)
+    const businessPrompt = promptOf(host.activations.at(-1))
+    assert.ok(readsLine(businessPrompt).includes('TEST-REVIEW.md'))
+    assert.ok(readsLine(businessPrompt).includes('SPEC.md'))
+    assert.ok(!readsLine(businessPrompt).includes('TECH-REVIEW.md'))
+    assertSEM(businessPrompt)
     await writeFile(join(dirA, 'REVIEW.md'), '# D2\nVERDICT: CHANGES_REQUESTED\n', 'utf8')
     await tool('squad_dispatch').execute({ agent: 'front1', message: reworkMessage, phase: 'rework', task_id: taskA.taskId }, exec)
     assert.ok(readsLine(sentText()).includes('REVIEW.md 的失败/缺陷段'))
@@ -8076,12 +8029,10 @@ test('T24 dispatch scope', async (t) => {
     await assertBrief(dirA)
 
     await tool('squad_dispatch').execute({ agent: 'tester', message: 'review current', phase: 'test-review', task_id: taskA.taskId }, exec)
-    await writeFile(join(dirA, 'TEST-REVIEW.md'), 'VERDICT: APPROVED\n', 'utf8')
-    await tool('squad_dispatch').execute({ agent: 'brain', message: 'technical check', phase: 'tech-review', task_id: taskA.taskId }, exec)
-    await writeFile(join(dirA, 'TECH-REVIEW.md'), '# D2\nVERDICT: CHANGES_REQUESTED\n', 'utf8')
+    await writeFile(join(dirA, 'TEST-REVIEW.md'), '# D2\nVERDICT: CHANGES_REQUESTED\n', 'utf8')
     await tool('squad_dispatch').execute({ agent: 'worker2', message: reworkMessage, phase: 'rework', task_id: taskA.taskId }, exec)
     const externalRework = promptOf(host.activations.at(-1))
-    assert.ok(readsLine(externalRework).includes('TECH-REVIEW.md 的失败/缺陷段'))
+    assert.ok(readsLine(externalRework).includes('TEST-REVIEW.md 的失败/缺陷段'))
     assert.ok(externalRework.includes(REWORK_SCOPE_TEXT) && externalRework.includes(reworkMessage))
     assert.doesNotMatch(externalRework, /目标：TASK\.md#目标|JOURNAL\.md 最后 80 行/)
     assertSEM(externalRework)
@@ -8248,17 +8199,6 @@ test('T24 dispatch scope', async (t) => {
       assert.ok(testResume.includes('最后一行 VERDICT'))
 
       await writeFile(join(dir, 'TEST-REVIEW.md'), 'VERDICT: APPROVED\n', 'utf8')
-      await tool('squad_dispatch').execute(
-        { agent: 'brain', message: 'tech review', phase: 'tech-review', task_id: dev.taskId },
-        exec,
-      )
-      const techPrompt = promptOf(host.activations.at(-1))
-      assert.ok(techPrompt.includes('TECH-REVIEW.md'))
-      assert.ok(techPrompt.includes('最后一行 VERDICT'))
-      const techBrief = await readFile(join(dir, 'BRIEF.md'), 'utf8')
-      assert.ok(techBrief.includes('TECH-REVIEW.md（已有；存在时）'))
-
-      await writeFile(join(dir, 'TECH-REVIEW.md'), 'VERDICT: APPROVED\n', 'utf8')
       await tool('squad_dispatch').execute(
         { agent: 'brain', message: 'business review', phase: 'review', task_id: dev.taskId },
         exec,
